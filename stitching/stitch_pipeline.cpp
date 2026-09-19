@@ -52,7 +52,12 @@
 //
 // Warp device: the stitching/warp always runs on the CPU (the OpenCL/GPU warp was
 // measured slower - see the note in main). The video ENCODER still uses the GPU
-// (hardware H.264, chooseVideoEncoder). Uses core/imgproc/imgcodecs/videoio; OpenCV 4.x/5.x.
+// (hardware HEVC, chooseVideoEncoder). Uses core/imgproc/imgcodecs/videoio; OpenCV 4.x/5.x.
+//
+// Encoding (changed 2026-09-19): HEVC/H.265 at every size, tagged hvc1, with the
+// bitrate defaulting to "auto" - sized from the output pixel rate at ~0.20 bpp rather
+// than a fixed number, so a crop or a --scale gets a sensible rate by itself.
+// --bitrate 90M still pins an explicit rate. H.264 remains only as a fallback.
 //
 // Build:  cmake -S . -B build && cmake --build build
 
@@ -123,7 +128,26 @@ static int runShell(string cmd);   // forward decl (defined near main); the enco
 // any specific GPU. See chooseVideoEncoder().
 static string g_vencExplicit;      // --venc NAME: force a specific encoder (also parent->child in --jobs)
 static bool   g_forceCpu = false;  // --cpu / --no-hwenc: force software libx264
-static string g_vbitrate  = "25M"; // --bitrate: target video bitrate passed to -b:v
+static string g_vbitrate  = "auto"; // --bitrate: explicit rate (e.g. "90M"), or "auto"
+// "auto" sizes the bitrate from the OUTPUT pixel rate instead of a fixed number, so a
+// crop, a --scale or a different rig all get a sensible rate without being re-tuned.
+// Target bits-per-pixel: Joe's VMAF runs put good H.264 at ~0.26 bpp (25M on the old
+// 2660x1199 pano). HEVC buys ~40% at equal quality, so 0.20 bpp HEVC sits a little
+// ABOVE that validated point - right for a master that gets re-encoded downstream.
+static double bppTarget(const string &venc)
+{
+    bool hevc = venc.find("hevc") != string::npos || venc.find("265") != string::npos;
+    return hevc ? 0.20 : 0.30;
+}
+static string resolveBitrate(const string &venc, int W, int H, double fps)
+{
+    if (g_vbitrate != "auto") return g_vbitrate;
+    if (fps <= 0) fps = 30.0;
+    double bps = (double)W * H * fps * bppTarget(venc);
+    long mbit = lround(bps / 1e6);
+    mbit = max(8L, min(200L, mbit));          // sane floor/ceiling
+    return to_string(mbit) + "M";
+}
 
 struct StitchMaps
 {
@@ -831,20 +855,24 @@ static string chooseVideoEncoder(int w = 64, int h = 64)
 {
     if (!g_vencExplicit.empty()) return g_vencExplicit;
     if (g_forceCpu) return "libx264";
+    // HEVC FIRST, at every size (chosen 2026-09-19). It is the only hardware option
+    // past 4096 wide, it costs ~6% speed against H.264 at equal size (measured:
+    // 88.5 vs 93.7 fps at 4096x1433 on VideoToolbox), and it gives the same quality
+    // in ~40% fewer bits. H.264 stays as a fallback only for machines whose HEVC
+    // block refuses the frame; the panorama is a master that Resolve re-encodes, so
+    // H.264's wider playback support buys nothing here.
     vector<string> cands =
 #ifdef __APPLE__
-        // HEVC handles far larger frames than H.264 on VideoToolbox, so it is the
-        // fallback before giving up on hardware entirely for a wide panorama.
-        {"h264_videotoolbox", "hevc_videotoolbox"};
+        {"hevc_videotoolbox", "h264_videotoolbox"};
 #else
-        {"h264_nvenc", "h264_amf", "h264_qsv", "hevc_nvenc", "hevc_amf", "hevc_qsv"};
+        {"hevc_nvenc", "hevc_amf", "hevc_qsv", "h264_nvenc", "h264_amf", "h264_qsv"};
 #endif
     for (const auto &c : cands)
         if (encoderInitializes(c, w, h))
         {
-            if (c.rfind("hevc", 0) == 0)
-                cout << "note: " << w << "x" << h << " is too large for this machine's "
-                     << "H.264 hardware encoder - using " << c << " (H.265)\n";
+            if (c.rfind("hevc", 0) != 0)
+                cout << "note: this machine's HEVC hardware encoder refused "
+                     << w << "x" << h << " - falling back to " << c << "\n";
             return c;
         }
     cout << "note: no hardware encoder accepts " << w << "x" << h
@@ -852,7 +880,7 @@ static string chooseVideoEncoder(int w = 64, int h = 64)
     return "libx264";
 }
 
-// The exact ffmpeg command that reads raw BGR frames on stdin and writes an H.264 MP4.
+// The exact ffmpeg command that reads raw BGR frames on stdin and writes the MP4.
 static string buildEncodeCmd(const string &venc, int W, int H, double fps, const string &out)
 {
     auto q = [](const string &s) { return "\"" + s + "\""; };
@@ -863,7 +891,12 @@ static string buildEncodeCmd(const string &venc, int W, int H, double fps, const
       // Panorama W/H aren't guaranteed even, but H.264 4:2:0 needs even dims - pad up
       // to the next even size (adds at most a 1px black edge; a no-op when already even).
       << " -vf \"pad=ceil(iw/2)*2:ceil(ih/2)*2\""
-      << " -c:v " << venc << " -b:v " << g_vbitrate;
+      << " -c:v " << venc << " -b:v " << resolveBitrate(venc, W, H, fps);
+    // HEVC in MP4 defaults to the 'hev1' tag, which QuickTime, Safari and some
+    // Resolve builds refuse to open. 'hvc1' is the same bitstream, tagged the way
+    // Apple's stack expects. Verified: hevc_videotoolbox emits hev1 without this.
+    if (venc.find("hevc") != string::npos || venc.find("265") != string::npos)
+        c << " -tag:v hvc1";
     if (venc == "libx264") c << " -preset medium";
     // Pin output format so every encoder tags color the same way (avoids the AMF
     // bt470bg->bt709 drift) and stays broadly playable; faststart for progressive play.
@@ -887,7 +920,7 @@ static string stitchVideoFile(const string &source, StitchMaps &m, double degree
     bool bounded = (e < BIG);
     string out = !outFile.empty() ? outFile : (outDir + "/stitched_video.mp4");
 
-    // Encode via an ffmpeg pipe (hardware H.264 when available, else libx264). ffmpeg
+    // Encode via an ffmpeg pipe (hardware HEVC when available, else libx264). ffmpeg
     // is already required for the default --jobs concat and audio-attach. If it isn't
     // on PATH we fall back to OpenCV's own H.264 writer (avc1) so a bare install still
     // stitches - on macOS that path is itself VideoToolbox-backed.
@@ -897,7 +930,9 @@ static string stitchVideoFile(const string &source, StitchMaps &m, double degree
     VideoWriter writer;
     if (useFfmpeg)
     {
-        cout << "encoder: " << venc << " (ffmpeg pipe, " << g_vbitrate << ")\n";
+        cout << "encoder: " << venc << " (ffmpeg pipe, "
+             << resolveBitrate(venc, m.OW, m.OH, fps)
+             << (g_vbitrate == "auto" ? " auto" : "") << ")\n";
         pipe = popen(buildEncodeCmd(venc, m.OW, m.OH, fps, out).c_str(), PIPE_WMODE);
         if (!pipe) useFfmpeg = false;   // couldn't spawn - fall back below
     }
@@ -2015,7 +2050,9 @@ static int runParallelJobs(const string &source, const string &calibDir,
     // Resolve the encoder ONCE in the parent and pin it for every child via --venc, so
     // all parts share identical codec params (required for the lossless -c copy concat).
     string resolvedEnc = chooseVideoEncoder(panoW, panoH);
-    cout << "jobs: encoder " << resolvedEnc << " @ " << g_vbitrate << " for all parts\n";
+    cout << "jobs: encoder " << resolvedEnc << " @ "
+         << resolveBitrate(resolvedEnc, panoW, panoH, 30.0)
+         << (g_vbitrate == "auto" ? " auto" : "") << " for all parts\n";
 
     fs::path op(outFile);
     string stem = op.stem().string();
@@ -2172,7 +2209,7 @@ int main(int argc, char **argv)
     // parent hands its resolved pick to --jobs children); --bitrate sets -b:v.
     g_forceCpu   = hasArg(argc, argv, "--cpu") || hasArg(argc, argv, "--no-hwenc");
     g_vencExplicit = argVal(argc, argv, "--venc", "");
-    g_vbitrate   = argVal(argc, argv, "--bitrate", "25M");
+    g_vbitrate   = argVal(argc, argv, "--bitrate", "auto");
     // Attach the recording's audio after the stitch (mux from the .sync.json sidecar).
     // --audio auto-finds the sidecar next to --source; --audio-file names it. Never
     // passed to --jobs children, so only the top-level render attaches.
