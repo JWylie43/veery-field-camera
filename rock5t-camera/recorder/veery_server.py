@@ -156,6 +156,30 @@ def umount_usb():
     return {"ok": True, "msg": "unmounted - safe to unplug"}
 
 
+USB_SUBDIR = "rock-recordings"   # folder on the drive that copies land in
+
+
+def usb_dir():
+    """Path of the copies folder on the mounted drive, or None if nothing is
+    mounted. Everything drive-side hangs off this one function."""
+    t = usb_targets()
+    return os.path.join(t[0]["path"], USB_SUBDIR) if t else None
+
+
+def _index_dir(d):
+    """{basename: size} for the .mkv files in d. Empty dict if d is missing, so
+    callers can treat 'no drive' and 'empty drive' the same way."""
+    out = {}
+    if not d or not os.path.isdir(d):
+        return out
+    for f in glob.glob(os.path.join(d, "*.mkv")):
+        try:
+            out[os.path.basename(f)] = os.path.getsize(f)
+        except OSError:
+            pass
+    return out
+
+
 def usb_targets():
     """Mounted removable drives we could offload to (auto-detected, no config)."""
     out = []
@@ -303,11 +327,48 @@ def rec_bytes():
 
 
 def list_takes():
+    """Takes on the Rock, each tagged with whether the drive already has it.
+
+    "synced" here means same name AND same byte count - a size check, not a
+    checksum. That is what the copy itself verifies, and hashing a 25 GB take
+    would take minutes. Enough to answer "did this land?", not a bit-rot audit.
+    """
+    drive = _index_dir(usb_dir())
+    have_drive = usb_dir() is not None
     out = []
     for f in sorted(glob.glob(os.path.join(REC_DIR, "*.mkv")), reverse=True):
         stt = os.stat(f)
-        out.append({"name": os.path.basename(f), "size": human(stt.st_size),
-                    "bytes": stt.st_size,
+        name = os.path.basename(f)
+        if not have_drive:
+            sync = "nodrive"
+        elif name not in drive:
+            sync = "no"
+        elif drive[name] == stt.st_size:
+            sync = "yes"
+        else:
+            sync = "partial"        # present but a different size - bad copy
+        out.append({"name": name, "size": human(stt.st_size),
+                    "bytes": stt.st_size, "sync": sync,
+                    "date": time.strftime("%Y-%m-%d %H:%M", time.localtime(stt.st_mtime))})
+    return out
+
+
+def list_usb_files():
+    """Takes sitting on the mounted drive, tagged with whether the Rock still
+    holds its own copy - so it is obvious what is safe to delete where."""
+    d = usb_dir()
+    if not d or not os.path.isdir(d):
+        return []
+    here = _index_dir(REC_DIR)
+    out = []
+    for f in sorted(glob.glob(os.path.join(d, "*.mkv")), reverse=True):
+        try:
+            stt = os.stat(f)
+        except OSError:
+            continue
+        name = os.path.basename(f)
+        out.append({"name": name, "size": human(stt.st_size), "bytes": stt.st_size,
+                    "on_rock": here.get(name) == stt.st_size,
                     "date": time.strftime("%Y-%m-%d %H:%M", time.localtime(stt.st_mtime))})
     return out
 
@@ -316,7 +377,7 @@ def list_takes():
 
 def _xfer_worker(names, dest):
     try:
-        target = os.path.join(dest, "rock-recordings")
+        target = os.path.join(dest, USB_SUBDIR)
         os.makedirs(target, exist_ok=True)
         srcs = [os.path.join(REC_DIR, n) for n in names
                 if os.path.isfile(os.path.join(REC_DIR, n))]
@@ -361,16 +422,31 @@ def start_transfer(names, dest):
     return {"ok": True, "msg": f"copying {len(names)} file(s)"}
 
 
-def delete_takes(names):
+def delete_takes(names, where="rock"):
+    """Delete takes from the Rock (where="rock") or the mounted drive ("usb").
+
+    Both paths are confined to their own directory: we basename the request and
+    realpath the result, so a crafted name cannot escape upward.
+    """
     if _state["rec"]:
         return {"ok": False, "msg": "not while recording"}
+    if where == "usb":
+        base = usb_dir()
+        if not base or not os.path.isdir(base):
+            return {"ok": False, "msg": "no drive mounted"}
+    else:
+        base = REC_DIR
+    root = os.path.realpath(base)
     n = 0
     for name in names:
-        p = os.path.join(REC_DIR, os.path.basename(name))
-        if os.path.isfile(p) and p.startswith(os.path.realpath(REC_DIR)):
+        p = os.path.realpath(os.path.join(base, os.path.basename(name)))
+        if os.path.isfile(p) and p.startswith(root + os.sep):
             os.remove(p)
             n += 1
-    return {"ok": True, "msg": f"deleted {n} file(s)"}
+    if where == "usb":
+        sh("sync")
+    return {"ok": True, "msg": f"deleted {n} file(s) from "
+                               f"{'the drive' if where == 'usb' else 'the Rock'}"}
 
 
 # --------------------------------------------------------------------- UI
@@ -443,6 +519,15 @@ PAGE = """<!doctype html>
 <script>
 const $ = id => document.getElementById(id);
 const fmt = s => Math.floor(s/60)+':'+String(s%60).padStart(2,'0');
+function uselected(){ return [...document.querySelectorAll('.upick:checked')].map(c=>c.value); }
+function toggleAllUsb(){ document.querySelectorAll('.upick').forEach(c=>c.checked=$('uall').checked); usel(); }
+function usel(){ const n = uselected().length; $('usel').textContent = n ? n+' selected on drive' : 'none selected'; }
+function syncCell(v){
+  if(v==='yes')     return '<span class="ok">&#10003; copied</span>';
+  if(v==='partial') return '<span class="hot">&#9888; size differs</span>';
+  if(v==='no')      return '<span class="warn">not copied</span>';
+  return '<span class="muted">&mdash;</span>';
+}
 function storageHtml(st){
   if(!st) return '';
   const gb = st.free_bytes/1e9, cls = gb<20?'hot':gb<80?'warn':'ok';
@@ -531,11 +616,27 @@ FILES_PAGE = """<!doctype html>
    <table>
      <thead><tr>
        <th><input type="checkbox" id="all" onchange="toggleAll()"></th>
-       <th>Take</th><th class="sz">Size</th><th class="dt">Date</th><th></th>
+       <th>Take</th><th class="sz">Size</th><th class="dt">Date</th>
+       <th>On drive</th><th></th>
      </tr></thead>
      <tbody id="rows"></tbody>
    </table>
    <div id="note" class="muted" style="margin-top:8px"></div>
+ </div>
+
+ <div class="card" id="usbcard" style="display:none">
+   <div style="margin-bottom:8px">&#128189; <b>On the drive</b>
+     <span class="muted" id="usbdirnote"></span></div>
+   <button class="fbtn danger" onclick="delUsb()">&#128465; Delete selected from drive</button>
+   <button class="fbtn ghost" onclick="load()">&#8635; Refresh</button>
+   <div class="muted" id="usel" style="margin-top:8px"></div>
+   <table>
+     <thead><tr>
+       <th><input type="checkbox" id="uall" onchange="toggleAllUsb()"></th>
+       <th>File</th><th class="sz">Size</th><th class="dt">Date</th><th>On Rock</th>
+     </tr></thead>
+     <tbody id="usbrows"></tbody>
+   </table>
  </div>
 </div>
 <script>
@@ -572,9 +673,21 @@ async function load(){
     '<tr><td><input type="checkbox" class="pick" value="'+esc(f.name)+'" onchange="sel()"></td>'
     + '<td class="name">'+esc(f.name)+'</td><td class="sz">'+f.size+'</td>'
     + '<td class="dt">'+f.date+'</td>'
+    + '<td>'+syncCell(f.sync)+'</td>'
     + '<td><a class="dl" href="/dl/'+encodeURIComponent(f.name)+'">download</a></td></tr>').join('')
-    || '<tr><td colspan=5 class="muted">no takes yet</td></tr>';
+    || '<tr><td colspan=6 class="muted">no takes yet</td></tr>';
   $('all').checked = false; sel();
+  const uf = s.usb_files || [];
+  $('usbcard').style.display = s.usb.length ? 'block' : 'none';
+  $('usbdirnote').textContent = s.usb.length ? ('\u2014 ' + s.usb[0].name + ' / rock-recordings') : '';
+  $('usbrows').innerHTML = uf.map(f =>
+    '<tr><td><input type="checkbox" class="upick" value="'+esc(f.name)+'" onchange="usel()"></td>'
+    + '<td class="name">'+esc(f.name)+'</td><td class="sz">'+f.size+'</td>'
+    + '<td class="dt">'+f.date+'</td>'
+    + '<td>'+(f.on_rock ? '<span class="ok">&#10003; yes</span>'
+                        : '<span class="warn">only here</span>')+'</td></tr>').join('')
+    || '<tr><td colspan=5 class="muted">drive folder is empty</td></tr>';
+  $('uall').checked = false; usel();
   const x = s.xfer;
   $('xfercard').style.display = (x.active || (x.done && x.error)) ? 'block' : 'none';
   $('xferpct').textContent = x.pct + '%';
@@ -596,6 +709,12 @@ async function xfer(){
   const names = selected(); if(!names.length) return alert('select some takes first');
   const r = await (await fetch('/api/transfer?dest='+encodeURIComponent(usbPath)
       +'&names='+encodeURIComponent(names.join('|')))).json();
+  $('note').textContent = r.msg || ''; load();
+}
+async function delUsb(){
+  const names = uselected(); if(!names.length) return alert('select some files on the drive first');
+  if(!confirm('Delete '+names.length+' file(s) FROM THE DRIVE? This cannot be undone.')) return;
+  const r = await (await fetch('/api/delete?where=usb&names='+encodeURIComponent(names.join('|')))).json();
   $('note').textContent = r.msg || ''; load();
 }
 async function del(){
@@ -663,6 +782,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/files":
             self._json({"takes": list_takes(), "storage": storage_info(),
                         "usb": usb_targets(), "usb_avail": usb_candidates(),
+                        "usb_files": list_usb_files(),
                         "recording": bool(_state["rec"]), "xfer": _xfer})
         elif path == "/api/mount":
             self._json(mount_usb(q.get("dev", "")))
@@ -674,7 +794,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/delete":
             names = [n for n in q.get("names", "").split("|") if n]
             with _state["lock"]:
-                self._json(delete_takes(names))
+                self._json(delete_takes(names, q.get("where", "rock")))
         elif path.startswith("/dl/"):
             name = os.path.basename(urllib.parse.unquote(path[4:]))
             f = os.path.join(REC_DIR, name)
