@@ -133,7 +133,16 @@ MODULE_PARM_DESC(trigger_mode,
 #define IMX477_GAIN_MIN			0x10	/* 1.0x */
 #define IMX477_GAIN_MAX			356	/* ~22.26x -> reg code 978 */
 #define IMX477_GAIN_STEP		1
-#define IMX477_GAIN_DEFAULT		0x20	/* 2.0x */
+#define IMX477_GAIN_DEFAULT		0x10	/* 1.0x - unity.  Was 0x20 (2.0x):
+						 * this rig is daylight-only and never wants
+						 * amplification, so the power-on default must
+						 * not start a stop hot before rkaiq takes over
+						 * (2026-09-20).  The AE policy itself lives in
+						 * the IQ route (GainDot pinned 1.0), which is
+						 * editable without rebuilding the kernel -
+						 * GAIN_MAX is deliberately left at 22.26x so
+						 * capability stays in the driver and policy
+						 * stays in the IQ file. */
 #define IMX477_ANA_GAIN_CODE_MAX	978
 
 /* Digital gain control: 8.8 fixed point, 0x0100 = 1.0x */
