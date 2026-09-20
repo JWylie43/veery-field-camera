@@ -519,15 +519,6 @@ PAGE = """<!doctype html>
 <script>
 const $ = id => document.getElementById(id);
 const fmt = s => Math.floor(s/60)+':'+String(s%60).padStart(2,'0');
-function uselected(){ return [...document.querySelectorAll('.upick:checked')].map(c=>c.value); }
-function toggleAllUsb(){ document.querySelectorAll('.upick').forEach(c=>c.checked=$('uall').checked); usel(); }
-function usel(){ const n = uselected().length; $('usel').textContent = n ? n+' selected on drive' : 'none selected'; }
-function syncCell(v){
-  if(v==='yes')     return '<span class="ok">&#10003; copied</span>';
-  if(v==='partial') return '<span class="hot">&#9888; size differs</span>';
-  if(v==='no')      return '<span class="warn">not copied</span>';
-  return '<span class="muted">&mdash;</span>';
-}
 function storageHtml(st){
   if(!st) return '';
   const gb = st.free_bytes/1e9, cls = gb<20?'hot':gb<80?'warn':'ok';
@@ -646,6 +637,15 @@ let recording = false, usbPath = '';
 function selected(){ return [...document.querySelectorAll('.pick:checked')].map(c=>c.value); }
 function toggleAll(){ document.querySelectorAll('.pick').forEach(c=>c.checked=$('all').checked); sel(); }
 function sel(){ const n = selected().length; $('sel').textContent = n ? n+' selected' : 'none selected'; }
+function uselected(){ return [...document.querySelectorAll('.upick:checked')].map(c=>c.value); }
+function toggleAllUsb(){ document.querySelectorAll('.upick').forEach(c=>c.checked=$('uall').checked); usel(); }
+function usel(){ const n = uselected().length; $('usel').textContent = n ? n+' selected on drive' : 'none selected'; }
+function syncCell(v){
+  if(v==='yes')     return '<span class="ok">&#10003; copied</span>';
+  if(v==='partial') return '<span class="hot">&#9888; size differs</span>';
+  if(v==='no')      return '<span class="warn">not copied</span>';
+  return '<span class="muted">&mdash;</span>';
+}
 function storageHtml(st){
   if(!st) return '';
   const gb = st.free_bytes/1e9, cls = gb<20?'hot':gb<80?'warn':'ok';
@@ -878,17 +878,18 @@ if __name__ == "__main__":
 
 
 # --- development note ------------------------------------------------------
-# The page scripts are plain strings, so a stray quote silently kills the WHOLE
-# <script> block (symptom: buttons do nothing, status never updates, console
-# says "Can't find variable: <handler>"). An apostrophe in "board's" cost an
-# hour once. After editing PAGE/FILES_PAGE, check them:
+# The page scripts are plain Python strings, so nothing compiles them. Two bugs
+# have shipped from that:
+#   * a stray apostrophe ends the string early and kills the WHOLE <script>
+#     block - buttons dead, status frozen ("board\'s", cost an hour);
+#   * a function added to the wrong page - parses fine, throws ReferenceError at
+#     runtime, and whatever it rendered silently stays EMPTY. syncCell landed on
+#     PAGE instead of FILES_PAGE and the takes table just went blank
+#     ("where did my files go?", 2026-09-20).
 #
-#   python3 - <<'EOF'
-#   import re; src=open('veery_server.py').read(); ns={}
-#   for pat in (r'^CSS = """.*?"""', r'^PAGE = """.*?"""\.replace\("%CSS%", CSS\)',
-#               r'^FILES_PAGE = """.*?"""\.replace\("%CSS%", CSS\)'):
-#       exec(re.search(pat, src, re.S|re.M).group(0), ns)
-#   for name in ('PAGE','FILES_PAGE'):
-#       open(f'/tmp/{name}.js','w').write(ns[name].split('<script>')[1].split('</script>')[0])
-#   EOF
-#   node --check /tmp/PAGE.js && node --check /tmp/FILES_PAGE.js
+# After editing PAGE or FILES_PAGE, run:
+#
+#     python3 check_pages.py
+#
+# It checks both pages for JS syntax, for on*= handlers with no definition, and
+# for bare calls that resolve to nothing. Exits non-zero on any of them.
