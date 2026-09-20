@@ -210,27 +210,35 @@ print('sensor_calib: resolution 4056x3040, CISTimeRegMin 4; gain model kept (lin
 
 # ================================================================ 8. AE route (daylight rig)
 # The rig records outdoors only, and analog gain adds noise without adding
-# light.  Strategy: the shutter does ALL the work up to the frame limit
-# (33ms @30fps); analog gain stays pinned at 1.0 across the whole shutter
-# range and only rises to 2.0 as an absolute last resort at full shutter
-# of black).  ISP digital gain is never used.
+# light.  Strategy (revised 2026-09-20, Joe's call): the shutter does ALL the
+# work, across its FULL hardware range, at unity gain throughout.
 #
-# SPORTS BLUR CEILING: motion blur is the quality metric for game footage,
-# so the shutter is CAPPED AT 8ms -- past that, AE prefers gain 2.0 over
-# more blur, and only once gain is exhausted may the shutter extend to the
-# 33ms frame limit (truly dark scenes: degrade to blurry-but-visible).
-# Adaptation budget: sun ~1ms -> 8ms (3 stops) -> gain 2 (1 stop) = 4 stops,
-# covering sun-to-overcast with blur bounded and noise capped at gain 2.
-# The 8ms number is a taste call -- revisit with real game clips at bring-up.
+# UNITY GAIN: analog gain is pinned at 1.0 (this schema's gain is a linear
+# multiplier, so 1.0 == no amplification == "gain 0" in dB terms). The old
+# route let it reach 2.0 in the darkest scenes; that bought one stop of
+# brightness for a stop of noise, and this rig only shoots lit fields. When
+# 33ms at gain 1.0 is not enough light, the frame is simply dark - that is
+# the accepted trade, and it is the only thing given up here.
+#
+# FLOOR IS THE HARDWARE FLOOR: 4 lines x 13.333us = 53.3us (see the line-time
+# derivation in ROCK5T_CAMERA.md). The previous floor of 500us was never
+# measured - it came from an assumed "sun ~1ms" - and left ~3.2 stops of the
+# sensor's range unreachable, which is how a sunlit field can clip with AE
+# already at its fastest allowed shutter. A shorter shutter cannot add motion
+# blur, so there is nothing to protect by limiting this end.
+#
+# Range is now 53.3us -> 33ms = 9.3 stops of shutter, all noise-free, versus
+# the old 4-stop budget. 8ms is kept as a route waypoint (the blur knee for
+# game footage) but is no longer a ceiling that hands off to gain.
 ae_route = isp['ae_calib']['LinearAeCtrl']['Route']
-ae_route['TimeDot'] = [0, 0.0005, 0.002, 0.008, 0.008, 0.033]
+ae_route['TimeDot'] = [0, 0.0000533, 0.0005, 0.002, 0.008, 0.033]
 ae_route['TimeDot_len'] = 6
-ae_route['GainDot'] = [1, 1, 1, 1, 2, 2]
+ae_route['GainDot'] = [1, 1, 1, 1, 1, 1]
 ae_route['GainDot_len'] = 6
 ae_route['IspDGainDot'] = [1, 1, 1, 1, 1, 1]
 ae_route['IspDGainDot_len'] = 6
-print('AE route: daylight sports strategy -- shutter capped 8ms, then gain '
-      'to 2.0, 33ms only as last resort; ISP dgain off')
+print('AE route: shutter-only, unity gain throughout -- 53.3us (4-line hw '
+      'floor) to 33ms, 9.3 stops; analog gain pinned 1.0; ISP dgain off')
 
 # ============================================ 8b. AE brightness setpoint raise
 # Midday measurement (2026-09-13): the imx577 skeleton's DySetpoint sits at
