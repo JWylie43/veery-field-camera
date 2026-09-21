@@ -7,10 +7,12 @@
 # STILL for the ~4 seconds this takes - captures are sequential, and a static
 # board needs no genlock.
 #
-# Afterwards pull to the Mac and solve (from the repo's calibration/ dir):
-#     scp -r rock:~/calib images-rock
-#     python3 calibrate.py --left-glob 'images-rock/cam0_*.png' \
-#                          --right-glob 'images-rock/cam1_*.png'
+# Afterwards pull to the Mac and solve (from the repo's calibration/ dir).
+# These ARE simultaneous pairs, so they are what the EXTRINSICS need:
+#     scp -r radxa@veery.local:~/calib images-pairs
+#     python3 calibrate.py --use-intrinsics rock-rig --out rock-rig \
+#                          --cam0-glob 'images-pairs/cam0_*.png' \
+#                          --cam1-glob 'images-pairs/cam1_*.png'
 set -euo pipefail
 
 OUT=${OUT:-$HOME/calib}

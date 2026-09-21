@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # NOT IN USE (2026-09-18). Joe chose the USB SSD shuttle instead - mount the
-# drive from the recorder panel, copy, eject, carry it. This script and
-# usb-gadget.sh were built, measured and then reverted on purpose; they are
-# kept only as a documented fallback. Measured at the time: SMB gave ~63 MB/s
-# where the USB-C gadget link did 275, and macOS's SMB client was the ceiling.
+# drive from the recorder panel, copy, eject, carry it. This script was built,
+# measured and then reverted on purpose; it is kept only as a documented
+# fallback. Measured at the time: SMB gave ~63 MB/s, with macOS's SMB client
+# as the ceiling.
 #
 # smb-share.sh - share ~/recordings over SMB so macOS Finder can mount it and
 # drag-and-drop takes (Finder speaks SMB natively; no macFUSE/sshfs needed).
@@ -12,8 +12,7 @@
 #   sudo GUEST=0 ./smb-share.sh      # password-protected (prompts to set one)
 #
 # Then on the Mac: Finder > Go > Connect to Server (Cmd-K) >
-#   smb://10.55.0.1/recordings        (USB-C gadget link, fastest)
-#   smb://<lan-ip>/recordings         (wifi, slower - same share)
+#   smb://<lan-ip>/recordings         (over wifi or wired LAN)
 # ...and click "Guest" when asked (or use the radxa account with GUEST=0).
 #
 # Open share = anyone who can reach the board can read/delete takes. That is
@@ -137,5 +136,4 @@ systemctl restart smbd
 echo
 echo "Share ready - $MODE"
 echo "In Finder press Cmd-K and connect to:"
-echo "   smb://10.55.0.1/recordings                        (USB-C cable)"
 echo "   smb://$(hostname -I | awk '{print $1}')/recordings   (network)"

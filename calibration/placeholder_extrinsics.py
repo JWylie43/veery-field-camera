@@ -33,9 +33,9 @@ ap.add_argument("--baseline-mm", type=float, default=60.0,
 ap.add_argument("--out", default="rock-rig", help="output directory")
 args = ap.parse_args()
 
-# Sign matched to the working Orin calibration, whose solved yaw_toe_y was
-# NEGATIVE for a right camera toed out to the right - so the stitcher's printed
-# "right yaw" comes out with the same sign as a real calibration of this rig.
+# Sign convention: a solved yaw_toe_y is NEGATIVE for a cam1 toed out to the
+# right, so the stitcher's printed "right yaw" comes out with the same sign here
+# as it would from a real calibration of this rig.
 t = math.radians(-args.yaw)
 c, s = math.cos(t), math.sin(t)
 # rotation about the vertical (Y) axis

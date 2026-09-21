@@ -3,8 +3,8 @@
 # written before first hardware bring-up; device discovery and encoder
 # element names verified against docs, not yet against the running board.
 #
-# Pipeline per camera (the Rock replacement for the Orin's nvargus MJPEG
-# path - the RK3588 has a real H.265 encoder, the Orin Nano does not):
+# Pipeline per camera (the RK3588 has a real hardware H.265 encoder, so the
+# CPU stays near-idle - the thermal headroom this rig needs outdoors):
 #   rkisp mainpath (NV12, ISP output w/ imx477_RPI-HQ IQ) -> mpph265enc
 #   -> matroskamux -> one MKV per camera
 #

@@ -5,8 +5,7 @@
 *.mov
 *.raw
 *.yuv
-*.tegrastats.log
-thermal_*.log
+*.nv12
 
 # Python
 __pycache__/
@@ -14,14 +13,14 @@ __pycache__/
 .venv/
 venv/
 
-# Calibration: keep the scripts + *_intrinsics.json + stereo_extrinsics.json;
-# ignore the snapshot images and the generated board image
-calibration/images/
+# Calibration: keep the scripts + rock-rig/*.json; ignore the snapshot images
+# and the generated board/sample images
+calibration/images-cam*/
 charuco_board.png
 *_undistort_sample.jpg
 *_rectified_sample.jpg
 
-# Stitching: keep source (stitch_pipeline.cpp/CMakeLists/include);
+# Stitching: keep source (stitch_pipeline.cpp/CMakeLists/include/pair_check.py);
 # ignore build output and generated renders
 stitching/build/
 stitching/*_out/
@@ -29,11 +28,12 @@ stitching/output/
 stitching/pipeline_out/
 *.bin
 
-# 3D model: commit only the zip; ignore the loose CAD files (incl. the 53 MB STEP)
-3d-housing-model/*
-!3d-housing-model/Housing.zip
+# Kernel build tree (rock5t-camera/kernel-build/build-kernel.sh clones into it)
+rock5t-camera/kernel-build/linux*/
+rock5t-camera/kernel-build/*.deb
 
 # Editor / OS
 .vscode/
 .idea/
+.claude/
 .DS_Store

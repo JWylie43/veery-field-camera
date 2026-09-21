@@ -159,7 +159,7 @@ uncertain spots are listed here instead:
 
 ```sh
 sudo apt install linux-headers-$(uname -r)   # if not present
-cd ~/orin-recorder/rock5t-camera/driver      # after pulling the repo
+cd ~/veery-field-camera/rock5t-camera/driver      # after pulling the repo
 make
 sudo make install                            # copies to /lib/modules/.../extra + depmod
 sudo modprobe imx477                         # or: sudo insmod ./imx477.ko

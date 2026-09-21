@@ -7,7 +7,7 @@ The stitcher now estimates the frame offset itself (--pair-offset defaults to
 dropped/duplicated frames. Run it when a take looks wrong, not every time.
 
     python3 pair_check.py take_20260918_181903_cam0.mkv
-    python3 pair_check.py left.mkv right.mkv --seconds 120
+    python3 pair_check.py take_..._cam0.mkv take_..._cam1.mkv --seconds 120
 
 What it checks, and why each matters for the stitch:
 
@@ -110,16 +110,16 @@ def report_file(tag, path, fps_nominal=30.0):
 
 def main():
     ap = argparse.ArgumentParser(description="Verify and pair a Veery take's two files.")
-    ap.add_argument("left", help="cam0 file (cam1 is found automatically if named _cam0)")
-    ap.add_argument("right", nargs="?", help="cam1 file (optional if auto-detectable)")
+    ap.add_argument("cam0", help="cam0 file (cam1 is found automatically if named _cam0)")
+    ap.add_argument("cam1", nargs="?", help="cam1 file (optional if auto-detectable)")
     ap.add_argument("--seconds", type=int, default=60,
                     help="how much of the take to analyse for the offset (default 60)")
     ap.add_argument("--max-shift", type=int, default=15,
                     help="largest frame offset to consider (default 15)")
     args = ap.parse_args()
 
-    left = args.left
-    right = args.right
+    left = args.cam0
+    right = args.cam1
     if not right:
         if "_cam0." in left:
             right = left.replace("_cam0.", "_cam1.")

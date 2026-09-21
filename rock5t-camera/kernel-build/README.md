@@ -14,7 +14,7 @@ sensor — makes the problem not exist.
 ## Build + install (on the Rock, ~1–2 h)
 
 ```
-cd ~/orin-recorder/rock5t-camera/kernel-build
+cd ~/veery-field-camera/rock5t-camera/kernel-build
 ./build-kernel.sh              # clone radxa/kernel, inject driver, build debs
 ./build-kernel.sh install      # dpkg -i + u-boot-update
 sudo reboot

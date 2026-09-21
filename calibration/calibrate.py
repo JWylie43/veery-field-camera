@@ -1,42 +1,54 @@
 #!/usr/bin/env python3
 """
-calibrate.py - Full ChArUco calibration for the stereo rig (run on your Mac)
+calibrate.py - Full ChArUco calibration for the ROCK 5T stereo rig (run on your Mac)
 
-This is a PROCESSING tool, not something the Orin runs. In ONE pass over the
-combined snapshots it computes, for the rig now fixed in its housing:
-  1. LEFT  camera intrinsics  (K, distortion, FOV)
-  2. RIGHT camera intrinsics  (K, distortion, FOV)
-  3. STEREO extrinsics        (rotation + translation between the two cameras:
-                               baseline in mm and toe-in angle)
+This is a PROCESSING tool, not something the Rock runs. In ONE pass over the
+snapshot pairs it computes, for the rig now fixed in its housing:
+  1. CAM0 camera intrinsics  (K, distortion, FOV)
+  2. CAM1 camera intrinsics  (K, distortion, FOV)
+  3. STEREO extrinsics       (rotation + translation between the two cameras:
+                              baseline in mm and toe-in angle)
 
 Workflow:
-  1. On the web panel, tap Snapshot ~30-40x with the ChArUco board at varied
-     angles/distances. Cover each camera's whole frame (edges/corners) AND get a
-     good batch with the board centered where BOTH cameras see it (that overlap
-     set is what the extrinsics are solved from).
-  2. Pull the shots to your Mac:  scp -r joe@joe-desktop.local:/mnt/video/calib ./images
-  3. Run this (from the calibration/ folder):  python3 calibrate.py
+  1. On the Rock, run calibration/calib_server.py (or snap_pair.sh) and capture
+     ~30-40 pairs with the ChArUco board at varied angles/distances. Cover each
+     camera's whole frame (edges/corners) AND get a good batch with the board
+     centered where BOTH cameras see it (that overlap set is what the extrinsics
+     are solved from).
+  2. Pull the shots to your Mac (from the calibration/ folder):
+         scp -r radxa@rock.local:~/calib0 images-cam0
+         scp -r radxa@rock.local:~/calib1 images-cam1
+  3. Run this (from the calibration/ folder):
+         python3 calibrate.py --out rock-rig
 
-Each snapshot is the COMBINED 3840x1200 frame (both cameras). This splits every
-image into left (0:1920) and right (1920:3840) halves. Intrinsics are solved per
-camera from that camera's own views (single-camera shots don't hurt - they just
-feed one camera and are ignored elsewhere). Extrinsics are solved only from frames
-where BOTH halves see the board, with the intrinsics held FIXED (the stable way).
+The rig records TWO INDEPENDENT full-frame files per pose, one per camera - the
+cameras are paired by sort order, so shoot them back-to-back (a static board
+needs no sync). Intrinsics are solved per camera from that camera's own views;
+extrinsics only from poses where BOTH cameras see the board, with the intrinsics
+held FIXED (the stable way).
 
 Intrinsics are mount-independent; extrinsics describe the fixed geometry of the
 CURRENT housing - re-run this if you ever disturb the mount.
 
+*** Projection model: FISHEYE (equidistant), always. ***
+The rig's CIL391 lenses are 110 deg H with ~-16% barrel. The pinhole+polynomial
+models (OpenCV "standard"/"rational") fit them with a uniform ~2.6px residual -
+a model mismatch, not noise. cv2.fisheye lands at ~0.23px. Every JSON this
+writes carries "model": "fisheye", and the stitcher requires it.
+
 Requires OpenCV with the aruco module (>= 4.7):
     pip install -U opencv-contrib-python numpy
 
-Board defaults match the printed board MEASURED with calipers (7x10, DICT_5X5_1000,
-square=39mm, marker=28.5mm). If you reprint at a different scale, re-measure a
-square and pass --square-mm / --marker-mm so the baseline scale is correct.
+Board defaults match the printed board MEASURED with calipers (7x10,
+DICT_5X5_1000, square=78mm, marker=58mm). If you reprint at a different scale,
+re-measure a square and pass --square-mm / --marker-mm so the baseline scale is
+correct.
 
 Outputs (in --out dir):
-    left_intrinsics.json   right_intrinsics.json   stereo_extrinsics.json
-    <side>_undistort_sample.jpg   stereo_rectified_sample.jpg
+    cam0_intrinsics.json   cam1_intrinsics.json   stereo_extrinsics.json
+    <cam>_undistort_sample.jpg   stereo_rectified_sample.jpg
 """
+
 
 import argparse
 import re
@@ -84,23 +96,22 @@ def grid_coverage(points, w, h, gx=8, gy=5):
     return len(filled) / float(gx * gy)
 
 
-def detect_all(files, detector, cfg, right_files=None):
+def detect_all(files, detector, cfg, cam1_files=None):
     """One detection pass over every image. Returns (records, size).
 
-    records: list of {path, <side>: (corners, ids) | None, <side>_n: int}
-             where side is 'left'/'right' (or 'single' with --single).
-    size:    (w, h) of a single camera image - used as the calibration size.
+    records: list of {path, <cam>: (corners, ids) | None, <cam>_n: int}
+             where cam is 'cam0'/'cam1' (or 'single' with --single).
+    size:    (w, h) of one camera's image - used as the calibration size.
 
-    Two capture layouts:
-      combined (old rig): one file = both cameras side by side; split at mid.
-      pair mode (rock rig, right_files given): files[i] is the LEFT camera's
-      full frame and right_files[i] the RIGHT camera's, paired by sort order
-      (shoot them back-to-back per board pose; a static board needs no sync).
+    The rig captures one FULL FRAME per camera per pose: files[i] is CAM0's and
+    cam1_files[i] is CAM1's, paired by sort order (shoot them back-to-back per
+    board pose; a static board needs no sync). With --single there is one camera
+    and no pairing.
     """
-    sides = ["single"] if cfg.single else ["left", "right"]
+    cams = ["single"] if cfg.single else ["cam0", "cam1"]
     records, size = [], None
-    pair_iter = (list(zip(sorted(files), sorted(right_files)))
-                 if right_files is not None else [(p, None) for p in sorted(files)])
+    pair_iter = (list(zip(sorted(files), sorted(cam1_files)))
+                 if cam1_files is not None else [(p, None) for p in sorted(files)])
     for path, rpath in pair_iter:
         img = cv2.imread(path)
         if img is None:
@@ -109,14 +120,13 @@ def detect_all(files, detector, cfg, right_files=None):
             rimg = cv2.imread(rpath)
             if rimg is None:
                 continue
-            halves = {"left": img, "right": rimg}
-            rec = {"path": path, "path_right": rpath}
+            frames = {"cam0": img, "cam1": rimg}
+            rec = {"path": path, "path_cam1": rpath}
         else:
-            mid = img.shape[1] // 2
-            halves = {"single": img, "left": img[:, :mid], "right": img[:, mid:]}
+            frames = {"single": img}
             rec = {"path": path}
-        for side in sides:
-            gray = cv2.cvtColor(halves[side], cv2.COLOR_BGR2GRAY)
+        for side in cams:
+            gray = cv2.cvtColor(frames[side], cv2.COLOR_BGR2GRAY)
             if size is None:
                 size = (gray.shape[1], gray.shape[0])   # (w, h)
             ch_corners, ch_ids, _, _ = detector.detectBoard(gray)
@@ -153,82 +163,10 @@ def calibrate_intrinsics(name, records, board, size, cfg, out_dir):
             print(f"  Too few for {name}; skipping this camera.")
             return None, None, None
 
-    if cfg.model == "fisheye":
-        return _calibrate_fisheye(name, all_obj, all_img, all_pts, recs_used,
-                                  used, board, size, cfg, out_dir, records)
-
-    # CIL391-class lenses (110 deg H, -16% barrel) exceed the default 5-coeff
-    # model; the rational model (k1..k6) keeps edge reprojection sane.
-    iflags = cv2.CALIB_RATIONAL_MODEL if cfg.model == "rational" else 0
-    rms, K, dist, _, _, _, _, pve = cv2.calibrateCameraExtended(
-        all_obj, all_img, size, None, None, flags=iflags)
-    # prune outlier views (blur / screen moire poison the fit) and refit once
-    pve = pve.ravel()
-    med = float(np.median(pve))
-    keep = [i for i, e in enumerate(pve) if e <= max(2.0 * med, 1.5)]
-    if len(keep) < len(pve) and len(keep) >= 8:
-        dropped = [(os.path.basename(recs_used[i]), round(float(pve[i]), 2))
-                   for i in range(len(pve)) if i not in keep]
-        print(f"  pruning {len(pve) - len(keep)} outlier views "
-              f"(median err {med:.2f}px): {dropped}")
-        all_obj = [all_obj[i] for i in keep]
-        all_img = [all_img[i] for i in keep]
-        rms, K, dist, _, _, _, _, pve = cv2.calibrateCameraExtended(
-            all_obj, all_img, size, None, None, flags=iflags)
-        used = len(keep)
-    w, h = size
-    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
-    hfov = math.degrees(2 * math.atan(w / (2 * fx)))
-    vfov = math.degrees(2 * math.atan(h / (2 * fy)))
-    cov = grid_coverage(all_pts, w, h)
-
-    print(f"  images used     : {used}")
-    print(f"  image size      : {w} x {h}")
-    print(f"  RMS reproj error: {rms:.3f} px   ({'good' if rms < 1.0 else 'high - see notes'})")
-    print(f"  focal (fx, fy)  : {fx:.1f}, {fy:.1f} px")
-    print(f"  principal (cx,cy): {cx:.1f}, {cy:.1f}")
-    print(f"  distortion      : {np.round(dist.ravel(), 4).tolist()}")
-    print(f"  >> FOV          : {hfov:.1f} deg horizontal, {vfov:.1f} deg vertical")
-    print(f"  frame coverage  : {cov*100:.0f}% of an 8x5 grid "
-          f"({'good' if cov > 0.8 else 'thin - add edge/corner shots'})")
-
-    result = {
-        "camera": name, "image_width": w, "image_height": h,
-        "rms_reproj_error_px": round(float(rms), 4),
-        "camera_matrix": K.tolist(),
-        "distortion_coefficients": dist.ravel().tolist(),
-        "fov_horizontal_deg": round(hfov, 2),
-        "fov_vertical_deg": round(vfov, 2),
-        "images_used": used,
-        "board": {"squares_x": cfg.squares_x, "squares_y": cfg.squares_y,
-                  "square_mm": cfg.square_mm, "marker_mm": cfg.marker_mm,
-                  "dictionary": cfg.dict},
-    }
-    out_json = os.path.join(out_dir, f"{name}_intrinsics.json")
-    with open(out_json, "w") as f:
-        json.dump(result, f, indent=2)
-    print(f"  saved -> {out_json}")
-
-    # undistort the first usable view as a visual sanity check (straight lines)
-    for rec in records:
-        if rec.get(name) is None:
-            continue
-        img = cv2.imread(rec["path"])
-        if img is None:
-            continue
-        if cfg.single or rec.get("path_right"):
-            half = img if name != "right" else cv2.imread(rec["path_right"])
-        else:
-            half = (img[:, :img.shape[1] // 2] if name == "left"
-                    else img[:, img.shape[1] // 2:])
-        und = cv2.undistort(half, K, dist)
-        out_img = os.path.join(out_dir, f"{name}_undistort_sample.jpg")
-        cv2.imwrite(out_img, und)
-        print(f"  saved -> {out_img}  (eyeball: straight lines should be straight)")
-        break
-
-    return result, K, dist
-
+    # FISHEYE (equidistant) only - see the module docstring. The pinhole and
+    # rational-polynomial models leave a ~2.6px uniform residual on this lens.
+    return _calibrate_fisheye(name, all_obj, all_img, all_pts, recs_used,
+                              used, board, size, cfg, out_dir, records)
 
 
 def _calibrate_fisheye(name, all_obj, all_img, all_pts, recs_used, used,
@@ -240,7 +178,10 @@ def _calibrate_fisheye(name, all_obj, all_img, all_pts, recs_used, used,
     img = [i.reshape(1, -1, 2).astype(np.float64) for i in all_img]
     K = np.zeros((3, 3))
     D = np.zeros((4, 1))
-    fflags = (cv2.CALIB_RECOMPUTE_EXTRINSIC | cv2.CALIB_FIX_SKEW)  # top-level in cv5
+    # These flags live under cv2.fisheye in OpenCV 4.x and were promoted to the
+    # top level in 5.x - accept either so the script runs on both.
+    _f = cv2.fisheye if hasattr(cv2.fisheye, "CALIB_RECOMPUTE_EXTRINSIC") else cv2
+    fflags = (_f.CALIB_RECOMPUTE_EXTRINSIC | _f.CALIB_FIX_SKEW)
     crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 200, 1e-7)
     # fisheye.calibrate can throw on degenerate views; drop offenders and retry
     names = list(recs_used)
@@ -301,16 +242,12 @@ def _calibrate_fisheye(name, all_obj, all_img, all_pts, recs_used, used,
         imgf = cv2.imread(rec["path"])
         if imgf is None:
             continue
-        if cfg.single or rec.get("path_right"):
-            half = imgf if name != "right" else cv2.imread(rec["path_right"])
-        else:
-            half = (imgf[:, :imgf.shape[1] // 2] if name == "left"
-                    else imgf[:, imgf.shape[1] // 2:])
+        frame = imgf if name != "cam1" else cv2.imread(rec["path_cam1"])
         newK = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
             K, D, size, np.eye(3), balance=0.4)
         m1, m2 = cv2.fisheye.initUndistortRectifyMap(
             K, D, np.eye(3), newK, size, cv2.CV_16SC2)
-        und = cv2.remap(half, m1, m2, cv2.INTER_LINEAR)
+        und = cv2.remap(frame, m1, m2, cv2.INTER_LINEAR)
         out_img = os.path.join(out_dir, f"{name}_undistort_sample.jpg")
         cv2.imwrite(out_img, und)
         print(f"  saved -> {out_img}  (eyeball: straight lines should be straight)")
@@ -318,18 +255,23 @@ def _calibrate_fisheye(name, all_obj, all_img, all_pts, recs_used, used,
     return result, K, D
 
 
+# Above this stereo reprojection error the solve is not believable for this rig
+# (a genuine housed-rig calibration lands under ~1px).
+MAX_STEREO_RMS_PX = 3.0
+
+
 def calibrate_extrinsics(records, board, size, KL, dL, KR, dR, cfg, out_dir):
     """Stereo extrinsics from frames where BOTH cameras see the board. Intrinsics
     are held FIXED. Returns the result dict or None if there aren't enough pairs."""
-    print("\n=== STEREO extrinsics (left -> right) ===")
+    print("\n=== STEREO extrinsics (cam0 -> cam1) ===")
     chess = board.getChessboardCorners().astype(np.float32)   # (Ncorners, 3) in mm
     obj_pts, pts_l, pts_r = [], [], []
     used = 0
     for rec in records:
-        if rec.get("left") is None or rec.get("right") is None:
+        if rec.get("cam0") is None or rec.get("cam1") is None:
             continue
-        cl, il = rec["left"]
-        cr, ir = rec["right"]
+        cl, il = rec["cam0"]
+        cr, ir = rec["cam1"]
         il, ir = il.flatten(), ir.flatten()
         common = np.intersect1d(il, ir)                       # ids both cameras saw
         if len(common) < 6:
@@ -354,8 +296,6 @@ def calibrate_extrinsics(records, board, size, KL, dL, KR, dR, cfg, out_dir):
 
     crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-6)
     sflags = cv2.CALIB_FIX_INTRINSIC
-    if cfg.model == "rational":
-        sflags |= cv2.CALIB_RATIONAL_MODEL
     rms, KL, dL, KR, dR, R, T, _, _ = cv2.stereoCalibrate(
         obj_pts, pts_l, pts_r, KL, dL, KR, dR, size,
         flags=sflags, criteria=crit)
@@ -392,6 +332,25 @@ def calibrate_extrinsics(records, board, size, KL, dL, KR, dR, cfg, out_dir):
                   "square_mm": cfg.square_mm, "marker_mm": cfg.marker_mm,
                   "dictionary": cfg.dict},
     }
+    # Sanity gate. A real solve on this rig lands well under 1px; anything
+    # above a few px means the "pairs" are not simultaneous views of the same
+    # board pose. That happens when cam0/cam1 folders hold INDEPENDENT
+    # per-camera intrinsics shoots (calib_server.py writes ~/calib0 and
+    # ~/calib1 separately, both numbered img_NNN) - sort-order pairing then
+    # matches unrelated frames and the solve is meaningless. Use snap_pair.sh,
+    # which captures one genuine cam0+cam1 pair per board pose.
+    # Refusing to write is deliberate: silently replacing a good
+    # stereo_extrinsics.json with a bad one produces a plausible-looking
+    # panorama built from the wrong geometry.
+    if rms > MAX_STEREO_RMS_PX and not cfg.force_extrinsics:
+        print(f"\n  !! REFUSING to write stereo_extrinsics.json: RMS {rms:.1f}px "
+              f"exceeds {MAX_STEREO_RMS_PX}px.")
+        print( "     The cam0/cam1 images are almost certainly not SIMULTANEOUS "
+               "pairs of the\n     same board pose. Capture real pairs with "
+               "snap_pair.sh and re-run.")
+        print( "     (Pass --force-extrinsics to write it anyway.)")
+        return None
+
     out_json = os.path.join(out_dir, "stereo_extrinsics.json")
     with open(out_json, "w") as f:
         json.dump(result, f, indent=2)
@@ -406,15 +365,10 @@ def _save_rectified_sample(records, size, KL, dL, KR, dR, R, T, out_dir):
     stereo solve is good, matching features sit on the SAME horizontal line."""
     try:
         pair = next((r for r in records
-                     if r.get("left") is not None and r.get("right") is not None), None)
+                     if r.get("cam0") is not None and r.get("cam1") is not None), None)
         if pair is None:
             return
-        img = cv2.imread(pair["path"])
-        if pair.get("path_right"):
-            left, right = img, cv2.imread(pair["path_right"])
-        else:
-            mid = img.shape[1] // 2
-            left, right = img[:, :mid], img[:, mid:]
+        left, right = cv2.imread(pair["path"]), cv2.imread(pair["path_cam1"])
         R1, R2, P1, P2, _, _, _ = cv2.stereoRectify(
             KL, dL, KR, dR, size, R, T.reshape(3, 1), alpha=0)
         ml = cv2.initUndistortRectifyMap(KL, dL, R1, P1, size, cv2.CV_16SC2)
@@ -443,61 +397,65 @@ def load_intrinsics(dirpath, name):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Full ChArUco calibration: intrinsics (L+R) + stereo extrinsics.")
-    ap.add_argument("--images", default="images", help="folder of calibration JPG/PNG snapshots")
-    ap.add_argument("--out", default=".", help="where to write results")
+        description="ChArUco calibration for the ROCK 5T rig: cam0 + cam1 "
+                    "intrinsics (fisheye) + stereo extrinsics.")
+    ap.add_argument("--cam0-glob", default="images-cam0/*",
+                    help="glob for CAM0 frames (default: images-cam0/*)")
+    ap.add_argument("--cam1-glob", default="images-cam1/*",
+                    help="glob for CAM1 frames (default: images-cam1/*)")
+    ap.add_argument("--out", default="rock-rig", help="where to write results")
     ap.add_argument("--use-intrinsics", default=None, metavar="DIR",
-                    help="load left_intrinsics.json & right_intrinsics.json from DIR and "
-                         "compute ONLY extrinsics (skip re-computing intrinsics)")
+                    help="load cam0_intrinsics.json & cam1_intrinsics.json from DIR "
+                         "and compute ONLY extrinsics (skip re-computing intrinsics)")
     ap.add_argument("--squares-x", type=int, default=7)
     ap.add_argument("--squares-y", type=int, default=10)
-    ap.add_argument("--square-mm", type=float, default=39.0,
-                    help="MEASURED printed square size in mm")
-    ap.add_argument("--marker-mm", type=float, default=28.5,
-                    help="MEASURED printed marker size in mm")
+    ap.add_argument("--square-mm", type=float, default=78.0,
+                    help="MEASURED printed square size in mm (default 78)")
+    ap.add_argument("--marker-mm", type=float, default=58.0,
+                    help="MEASURED printed marker size in mm (default 58)")
     ap.add_argument("--dict", default="DICT_5X5_1000", help="ArUco dictionary name")
+    ap.add_argument("--force-extrinsics", action="store_true",
+                    help=f"write stereo_extrinsics.json even if its RMS exceeds "
+                         f"{MAX_STEREO_RMS_PX}px (normally refused - see the "
+                         f"note in calibrate_extrinsics)")
     ap.add_argument("--single", action="store_true",
-                    help="treat each image as ONE camera (intrinsics only, no stereo)")
-    ap.add_argument("--left-glob", default=None,
-                    help="pair mode (rock rig): glob for LEFT camera files, e.g. 'images/cam0_*.png'")
-    ap.add_argument("--right-glob", default=None,
-                    help="pair mode: glob for RIGHT camera files, e.g. 'images/cam1_*.png'")
-    ap.add_argument("--model", choices=["standard", "rational", "fisheye"], default="rational",
-                    help="distortion model (rational for the 110deg CIL391 lens; default)")
+                    help="ONE camera only: solve intrinsics from --cam0-glob and "
+                         "write single_intrinsics.json (no pairing, no extrinsics)")
     args = ap.parse_args()
 
-    right_files = None
-    if args.left_glob or args.right_glob:
-        if not (args.left_glob and args.right_glob):
-            sys.exit("Pair mode needs BOTH --left-glob and --right-glob.")
-        files = sorted(set(glob.glob(args.left_glob)))
-        right_files = sorted(set(glob.glob(args.right_glob)))
-        if not files or len(files) != len(right_files):
-            sys.exit(f"Pair mode: {len(files)} left vs {len(right_files)} right files - "
-                     "need equal, nonzero counts (pairs are matched by sort order).")
-    else:
-        files = []
-        for ext in ("*.jpg", "*.jpeg", "*.png", "*.JPG", "*.PNG"):
-            files += glob.glob(os.path.join(args.images, ext))
-        files = sorted(set(files))
+    files = sorted(set(glob.glob(args.cam0_glob)))
+    files = [f for f in files if os.path.splitext(f)[1].lower()
+             in (".jpg", ".jpeg", ".png")]
+    cam1_files = None
+    if not args.single:
+        cam1_files = sorted(set(glob.glob(args.cam1_glob)))
+        cam1_files = [f for f in cam1_files if os.path.splitext(f)[1].lower()
+                      in (".jpg", ".jpeg", ".png")]
+        if len(files) != len(cam1_files) or not files:
+            sys.exit(f"Need equal, nonzero counts - got {len(files)} cam0 "
+                     f"('{args.cam0_glob}') vs {len(cam1_files)} cam1 "
+                     f"('{args.cam1_glob}'). Pairs are matched by sort order.")
     if not files:
-        sys.exit(f"No images found in '{args.images}'. "
-                 f"Pull them first:  scp -r joe@joe-desktop.local:/mnt/video/calib ./images")
+        sys.exit(f"No images matched '{args.cam0_glob}'. Pull them from the Rock first:\n"
+                 f"  scp -r radxa@rock.local:~/calib0 images-cam0\n"
+                 f"  scp -r radxa@rock.local:~/calib1 images-cam1")
     os.makedirs(args.out, exist_ok=True)
 
-    print(f"Found {len(files)} images" + (" (paired L/R)" if right_files else f" in {args.images}"))
+    print(f"Found {len(files)} " + ("images (single camera)" if args.single
+                                    else "cam0/cam1 pairs"))
     print(f"Board: {args.squares_x}x{args.squares_y}, square={args.square_mm}mm, "
           f"marker={args.marker_mm}mm, dict={args.dict}")
     print("(If detection is poor, confirm these match your PRINTED board.)")
+    print("Model: fisheye (equidistant)")
 
     board, detector = build_board(args)
-    records, size = detect_all(files, detector, args, right_files=right_files)
+    records, size = detect_all(files, detector, args, cam1_files=cam1_files)
     if size is None:
         sys.exit("No readable images found.")
 
     if args.use_intrinsics:
-        KL, dL = load_intrinsics(args.use_intrinsics, "left")
-        KR, dR = load_intrinsics(args.use_intrinsics, "right")
+        KL, dL = load_intrinsics(args.use_intrinsics, "cam0")
+        KR, dR = load_intrinsics(args.use_intrinsics, "cam1")
         print(f"\nLoaded intrinsics from {args.use_intrinsics}/ (skipping intrinsic calc).")
         ext = calibrate_extrinsics(records, board, size, KL, dL, KR, dR, args, args.out)
         if ext:
@@ -509,18 +467,18 @@ def main():
         calibrate_intrinsics("single", records, board, size, args, args.out)
         return
 
-    left, KL, dL = calibrate_intrinsics("left", records, board, size, args, args.out)
-    right, KR, dR = calibrate_intrinsics("right", records, board, size, args, args.out)
+    cam0, KL, dL = calibrate_intrinsics("cam0", records, board, size, args, args.out)
+    cam1, KR, dR = calibrate_intrinsics("cam1", records, board, size, args, args.out)
 
-    if left is None or right is None:
+    if cam0 is None or cam1 is None:
         print("\n! Skipping extrinsics - both cameras need valid intrinsics first.")
         return
 
     ext = calibrate_extrinsics(records, board, size, KL, dL, KR, dR, args, args.out)
 
     print("\n=== SUMMARY ===")
-    print(f"  left  FOV: {left['fov_horizontal_deg']:.1f} deg H")
-    print(f"  right FOV: {right['fov_horizontal_deg']:.1f} deg H")
+    print(f"  cam0 FOV : {cam0['fov_horizontal_deg']:.1f} deg H")
+    print(f"  cam1 FOV : {cam1['fov_horizontal_deg']:.1f} deg H")
     if ext:
         print(f"  baseline : {ext['baseline_mm']:.2f} mm")
         print(f"  toe-in   : {ext['toe_in_angle_deg']:.2f} deg")

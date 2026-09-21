@@ -2,7 +2,7 @@
 """
 veery_server.py - web control panel for Veery, the ROCK 5T stereo camera.
 
-The Rock-side successor to the Orin's recorder/server.py, in the same visual
+The Rock-side web control panel for the rig, in the same visual
 language, stripped to what the field needs: two live previews, one record
 button, and a Manage Files page. Python stdlib only (no flask).
 

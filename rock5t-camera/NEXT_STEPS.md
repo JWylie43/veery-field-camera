@@ -31,7 +31,7 @@ Nothing else is blocking.
 ## Environment / how to operate (IMPORTANT)
 
 - The Rock: **`ssh rock`** from Joe's Mac (user `radxa`, 192.168.86.136). Repo on
-  the Rock: **`~/orin-recorder`**, branch `rock-5t-camera`. `git pull` there to
+  the Rock: **`~/veery-field-camera`**, branch `radxa-rock-5t`. `git pull` there to
   get the latest.
 - **The assistant's Bash tool CANNOT reach the Rock over the LAN** (sandbox
   network limit: gateway + internet work, LAN peer devices do not). So Rock
@@ -113,7 +113,8 @@ level shift — same as the validated Orin rig). The overlay already assigns
 roles: CAM0 = `trigger-mode = "source"` (master), CAM1 = `"sink"` (slave); the
 driver applies the 4 registers (0x3F0B/0x3041/0x3040/0x4B81) at every stream
 start in standby — so unlike the Orin, NO register pokes are needed, it comes up
-genlocked. Prove it by porting `../recorder/sync_test.sh` (Orin) to the Rock's
+genlocked. Prove it by porting `recorder/sync_test.sh` from the `nvidia-orin-jetson-nano`
+branch (it is not on this one) to the Rock's
 v4l2 nodes: measure the cam0<->cam1 frame-timestamp offset; LOCKED = frozen
 offset. (On the Orin the poke was needed because its driver never set the regs;
 here the driver does it, so just start both streams and measure.)

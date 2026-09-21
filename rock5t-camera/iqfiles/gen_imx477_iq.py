@@ -8,9 +8,11 @@ Secondary ref    : reference/imx415_radxa_iq_skeleton.json (structure cross-chec
 
 Every transform prints its math so TRANSLATION_NOTES.md stays traceable.
 """
-import json, copy, math
+import json, copy, math, os
 
-BASE = '/Users/josephwylie/Desktop/orin-nano-recorder/rock5t-camera'
+# rock5t-camera/, resolved from this script's own location so the repo can
+# live anywhere (it used to be a hardcoded absolute path).
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 skel = json.load(open(BASE + '/reference/imx577_radxa_12m_iq.json'))
 rpi_raw = json.load(open(BASE + '/reference/imx477_rpi_tuning.json'))
 rpi = {}

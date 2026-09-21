@@ -62,7 +62,7 @@ that can be proven without cameras is proven:
   reached the chip-ID read and reported `Unexpected sensor id(0000), ret(-5)`
   on both buses — the correct "no sensor connected" signal.
 
-**Install steps that worked** (from ~/orin-recorder/rock5t-camera):
+**Install steps that worked** (from ~/veery-field-camera/rock5t-camera):
 ```
 cd driver && make && sudo cp imx477.ko /lib/modules/$(uname -r)/kernel/drivers/media/i2c/ && sudo depmod -a
 sudo cp iqfiles/imx477_RPI-HQ_default.json /etc/iqfiles/
@@ -361,7 +361,8 @@ as preview.sh; add selfpath selection reset to record_dual.sh.
 ### 4. Cross-checks once cables exist
 - `i2cdetect` for 0x1a on the connector's bus, then driver probe.
 - Streaming smoke test: `v4l2-ctl` raw frames, then rkaiq path.
-- Genlock: port `recorder/sync_test.sh` (timestamp drift measurement) — the
+- Genlock: port `recorder/sync_test.sh` (timestamp drift measurement) from the
+  `nvidia-orin-jetson-nano` branch — the
   method is platform-neutral.
 
 ## Access

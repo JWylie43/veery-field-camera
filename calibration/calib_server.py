@@ -17,8 +17,12 @@ How it works around the hardware:
     3840x2160 input every time the preview starts.
   - SNAPSHOTS come from the *mainpath* (video22/video31) at full 3840x2160 -
     a different device node, so the preview keeps running while you snap.
-  - Files land in ~/calib0 / ~/calib1 as img_NNN.png, matching calibrate.py's
-    --single workflow (see snap_pair.sh header for the rig/extrinsics flow).
+  - Files land in ~/calib0 / ~/calib1 as img_NNN.png - one INDEPENDENT shoot
+    per camera, for INTRINSICS only:
+        python3 calibrate.py --single --cam0-glob 'images-cam0/*' --out rock-cam0
+    These are NOT pairs: both cameras number from img_000, so pairing them by
+    sort order matches unrelated frames. The extrinsics need simultaneous
+    pairs - use snap_pair.sh (see its header).
 """
 
 import http.server

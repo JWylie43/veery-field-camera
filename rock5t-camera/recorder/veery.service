@@ -1,7 +1,7 @@
 [Unit]
 # Web control panel for Veery, the ROCK 5T stereo camera (previews + record button).
 # Install:
-#   sudo cp ~/orin-recorder/rock5t-camera/recorder/veery.service \
+#   sudo cp ~/veery-field-camera/rock5t-camera/recorder/veery.service \
 #           /etc/systemd/system/
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now veery
@@ -10,7 +10,7 @@
 # Manual:  sudo systemctl stop veery   (before running the script by hand,
 #          or by-hand runs fail: only one process can hold a camera node)
 Description=Veery stereo camera - web control panel
-Documentation=file:///home/radxa/orin-recorder/ROCK5T_CAMERA.md
+Documentation=file:///home/radxa/veery-field-camera/ROCK5T_CAMERA.md
 # rkaiq_3A drives the ISP's exposure/colour; without it frames are unusable
 After=network-online.target rkaiq_3A.service
 Wants=network-online.target rkaiq_3A.service
@@ -21,8 +21,8 @@ Type=simple
 # no privileged helper script or sudoers rule to maintain. The panel has no
 # login and is reachable by anyone on the network it is attached to, so put a
 # password on the field hotspot (see ROCK5T_CAMERA.md).
-WorkingDirectory=/home/radxa/orin-recorder
-ExecStart=/usr/bin/python3 /home/radxa/orin-recorder/rock5t-camera/recorder/veery_server.py
+WorkingDirectory=/home/radxa/veery-field-camera
+ExecStart=/usr/bin/python3 /home/radxa/veery-field-camera/rock5t-camera/recorder/veery_server.py
 # the camera pipeline settles a few seconds after the sensors probe (~12s);
 # starting into a half-ready pipeline just makes the first previews fail
 ExecStartPre=/bin/sleep 8
