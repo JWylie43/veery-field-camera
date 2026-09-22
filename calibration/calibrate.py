@@ -19,7 +19,7 @@ Workflow:
          scp -r radxa@rock.local:~/calib0 images-cam0
          scp -r radxa@rock.local:~/calib1 images-cam1
   3. Run this (from the calibration/ folder):
-         python3 calibrate.py --out rock-rig
+         python3 calibrate.py
 
 The rig records TWO INDEPENDENT full-frame files per pose, one per camera - the
 cameras are paired by sort order, so shoot them back-to-back (a static board
@@ -403,7 +403,9 @@ def main():
                     help="glob for CAM0 frames (default: images-cam0/*)")
     ap.add_argument("--cam1-glob", default="images-cam1/*",
                     help="glob for CAM1 frames (default: images-cam1/*)")
-    ap.add_argument("--out", default="rock-rig", help="where to write results")
+    ap.add_argument("--out", default=".",
+                    help="where to write results (default: alongside the scripts, "
+                         "which is where the stitcher looks)")
     ap.add_argument("--use-intrinsics", default=None, metavar="DIR",
                     help="load cam0_intrinsics.json & cam1_intrinsics.json from DIR "
                          "and compute ONLY extrinsics (skip re-computing intrinsics)")

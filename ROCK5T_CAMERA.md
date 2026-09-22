@@ -1,5 +1,15 @@
 # Raspberry Pi HQ Camera (IMX477) on the ROCK 5T
 
+**Status: working.** Both IMX477s image through the full ISP path at 4K30 and
+record to hardware HEVC. Driver is built into a custom kernel
+(`6.1.84-8-rk2410-imx477`, `CONFIG_VIDEO_IMX477=y`), overlay and IQ file are
+installed, intrinsics are solved. The open item is the stereo extrinsics, which
+are still placeholder design values — see the README.
+
+This file is the **bring-up log**: a dated record of what was tried, what broke
+and why, kept because none of it is recoverable from the code. Newest entries
+are at the bottom. For how to *run* the rig, see [README.md](README.md).
+
 > **Resuming this work (e.g. cables arrived)? Start with
 > [`NEXT_STEPS.md`](NEXT_STEPS.md)** — a self-contained handoff: current state,
 > how to operate the board, and the exact next-step sequence.
@@ -281,7 +291,7 @@ as preview.sh; add selfpath selection reset to record_dual.sh.
   104.5x58.8 deg, 98% frame coverage, 46 views each. Per-unit decenter
   measured: cam0 cx 49px left (explains the asymmetric-baseboard look),
   cam1 cy 148px low - normal M12 tolerance, now calibrated rather than
-  assumed. Saved: calibration/rock-rig/cam{0,1}_intrinsics.json.
+  assumed. Saved: calibration/cam{0,1}_intrinsics.json.
   Board: charuco_board.png on a TV, 78mm squares (measured on glass).
   **Never touch the focus rings or reseat a lens** without recalibrating
   that camera.
@@ -299,71 +309,6 @@ as preview.sh; add selfpath selection reset to record_dual.sh.
 - Browser note: Chrome can refuse LAN panels entirely
   (ERR_ADDRESS_UNREACHABLE) when a planted `LocalNetworkAccessAllowedForUrls`
   policy turns on Local Network Access enforcement. Safari is unaffected.
-
-## Status (2026-09-03): all three pieces DRAFTED, awaiting hardware
-
-- **Driver**: `rock5t-camera/driver/imx477.c` + Makefile + NOTES.md — Rockchip
-  imx577 body + RPi imx477 sensor facts + XVS genlock via DT `trigger-mode`.
-  NOT yet compiled — first action next time the Rock is on: `make` against the
-  installed headers (expected 1-line fixups listed in NOTES.md).
-- **Overlay**: `rock5t-camera/overlay/rock-5t-dual-rpi-hq-imx477.dts` — both
-  cameras, genlock roles baked in (CAM0 source, CAM1 sink). Chains verified
-  TWICE: schematic sheet 18 + Radxa's own upstream rock-5t camera overlays
-  (which the installed radxa-overlays 0.2.27 predates — `apt upgrade` gets
-  Radxa's stock ones too). Build/install: overlay/README.md.
-- **IQ file**: `rock5t-camera/iqfiles/imx477_RPI-HQ_default.json` — skeleton
-  switched to Radxa's shipping **imx577** IQ (sibling sensor; BLC cross-
-  validates RPi's to the LSB). RPi lab data transplanted: AWB gains, 14 CCMs,
-  gamma. LSC neutral (per-lens, later). Regenerate via gen_imx477_iq.py.
-- **Bring-up order** (Rock on, cameras cabled): compile driver -> install
-  .ko + .dtbo + IQ json -> reboot -> i2cdetect 0x1a on buses 3 & 4 ->
-  v4l2 raw smoke test -> rkaiq/ISP path -> port sync_test.sh for genlock proof.
-
-## Work plan
-
-### 1. Kernel driver (out-of-tree module `imx477.ko`)
-- Base: Rockchip's `imx577.c` from the vendor kernel source
-  (github.com/radxa/kernel, the 6.1 rkr branch matching `6.1.84-8-rk2410`).
-- Adapt: chip ID (0x0477), mode tables (full 4056x3040, 2x2 binned 2028x1520,
-  1080p), link freq for the connector's lane count.
-- Bake in the XVS genlock from the Orin work: registers 0x3F0B/0x3041/0x3040/
-  0x4B81, source=1/1/1/1 sink=1/0/0/0, applied at stream-on in standby.
-  Role selection via a DT property (`trigger-mode = "source"|"sink"`) per
-  camera node. NEVER both source (bus contention on the shared XVS wire).
-- Build on the 5T against the installed headers; load via
-  `/etc/modules-load.d/`.
-
-### 2. Device-tree overlay
-- No 5T camera overlay exists to copy — author from `rk3588-rock-5t.dts`
-  (vendor kernel source) to find each CSI connector's i2c bus, dphy/csi2
-  host, clock and power rails.
-- Model on the CM3 rpi-camera overlays + the 5B radxa-camera-4k pattern:
-  sensor node (i2c addr 0x1a, 24MHz xclk) -> csi2_dphy -> mipi2_csi2 ->
-  rkcif -> rkisp virtual nodes.
-- OPEN QUESTION: 5T connector pinout/lane count vs the Pi HQ's 2-lane, 15-pin
-  FPC — determines the adapter cable AND whether the rock-5-pcb flex design
-  (drawn for the 5B+ 31-pin CAM0) needs rework for the 5T.
-
-### 3. IQ / tuning file (`imx477_RPI-HQ_default.json`)
-- Skeleton: `/etc/iqfiles/imx415_RADXA-CAMERA-4K_DEFAULT.json` (4K sensor,
-  same rkisp v30 schema).
-- Transplant from RPi's `imx477.json`: black level, noise model, AWB
-  calibration, CCMs, gamma.
-- Daylight-first simplification: the rig records outdoors (sun / partly
-  cloudy, ~5500-6800K). One daylight CCM + fixed daylight AWB gains covers
-  the whole operating range; skip the tungsten-to-shade table initially.
-- Lens shading: ships neutral at first; calibrate later from a flat-field
-  shot with the actual lenses (matters at the stitch seam).
-- Verification without a color chart: shoot the same scene with the Orin
-  pipeline (same sensors+lenses, trusted tuning) and fit the residual
-  correction — the same method that produced `grade.sh`'s matrix.
-
-### 4. Cross-checks once cables exist
-- `i2cdetect` for 0x1a on the connector's bus, then driver probe.
-- Streaming smoke test: `v4l2-ctl` raw frames, then rkaiq path.
-- Genlock: port `recorder/sync_test.sh` (timestamp drift measurement) from the
-  `nvidia-orin-jetson-nano` branch — the
-  method is platform-neutral.
 
 ## Access
 - SSH from the Mac: `ssh rock` (radxa@192.168.86.136, key auth works).

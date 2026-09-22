@@ -3,7 +3,7 @@
 placeholder_extrinsics.py - write a stereo_extrinsics.json from the rig's
 DESIGN numbers, so the stitch pipeline can run before the housing exists.
 
-    python3 placeholder_extrinsics.py --yaw 74 --baseline-mm 60 --out rock-rig
+    python3 placeholder_extrinsics.py --yaw 74 --baseline-mm 60
 
 This is a stand-in, not a measurement. It assumes the cameras are perfectly
 mounted: pure yaw, no pitch, no roll, and a baseline straight along X. A real
@@ -30,7 +30,7 @@ ap.add_argument("--yaw", type=float, default=74.0,
                 help="design angle between the cameras, degrees (default 74)")
 ap.add_argument("--baseline-mm", type=float, default=60.0,
                 help="camera-to-camera spacing in mm (default 60)")
-ap.add_argument("--out", default="rock-rig", help="output directory")
+ap.add_argument("--out", default=".", help="output directory")
 args = ap.parse_args()
 
 # Sign convention: a solved yaw_toe_y is NEGATIVE for a cam1 toed out to the

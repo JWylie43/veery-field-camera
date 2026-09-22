@@ -1,7 +1,7 @@
 // stitch_pipeline.cpp - calibration-driven cylindrical stitch (C++), NO feature detection.
 //
 // Reads the Veery rig's calibration (cam0/cam1 fisheye intrinsics + stereo
-// extrinsics from calibration/rock-rig/) and stitches the two camera feeds into a
+// extrinsics from calibration/) and stitches the two camera feeds into a
 // cylindrical panorama, aligning them from the extrinsic rotation R. No BRISK /
 // matcher / findHomography anywhere.
 //
@@ -1802,13 +1802,11 @@ static string resolveCalibDir(const string &requested)
     std::error_code ec;
     for (fs::path d = fs::path(exePath()).parent_path(); !d.empty(); d = d.parent_path())
     {
-        if (hasCalib(d / "calibration" / "rock-rig")) return (d / "calibration" / "rock-rig").string();
         if (hasCalib(d / "calibration")) return (d / "calibration").string();
         if (d == d.root_path()) break;
     }
     for (fs::path d = fs::current_path(ec); !d.empty(); d = d.parent_path())
     {
-        if (hasCalib(d / "calibration" / "rock-rig")) return (d / "calibration" / "rock-rig").string();
         if (hasCalib(d / "calibration")) return (d / "calibration").string();
         if (d == d.root_path()) break;
     }
@@ -2183,7 +2181,7 @@ int main(int argc, char **argv)
     signal(SIGPIPE, SIG_IGN);
 #endif
     string source = argVal(argc, argv, "--source", argVal(argc, argv, "--image", ""));
-    string calibDir = resolveCalibDir(argVal(argc, argv, "--calib-dir", "../calibration/rock-rig"));
+    string calibDir = resolveCalibDir(argVal(argc, argv, "--calib-dir", "../calibration"));
     string outDir = argVal(argc, argv, "--out", "pipeline_out");
     string outFile = argVal(argc, argv, "--out-file", "");   // full path incl. filename (overrides --out)
     double degrees = stod(argVal(argc, argv, "--degrees", "0"));

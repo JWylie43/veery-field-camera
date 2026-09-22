@@ -10,7 +10,7 @@
 # Afterwards pull to the Mac and solve (from the repo's calibration/ dir).
 # These ARE simultaneous pairs, so they are what the EXTRINSICS need:
 #     scp -r radxa@veery.local:~/calib images-pairs
-#     python3 calibrate.py --use-intrinsics rock-rig --out rock-rig \
+#     python3 calibrate.py --use-intrinsics . \
 #                          --cam0-glob 'images-pairs/cam0_*.png' \
 #                          --cam1-glob 'images-pairs/cam1_*.png'
 set -euo pipefail

@@ -13,8 +13,8 @@ __pycache__/
 .venv/
 venv/
 
-# Calibration: keep the scripts + rock-rig/*.json; ignore the snapshot images
-# and the generated board/sample images
+# Calibration: keep the scripts + the cam0/cam1/stereo JSONs; ignore the
+# snapshot images and the generated board/sample images
 calibration/images-cam*/
 charuco_board.png
 *_undistort_sample.jpg
