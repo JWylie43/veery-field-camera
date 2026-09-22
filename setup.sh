@@ -35,7 +35,7 @@ bad()  { printf '    \033[31mMISS\033[0m  %s\n' "$1"; fail=1; }
 # deliberately NOT apt-installed: it comes from the vendor image / Radxa's repo
 # and the package name varies by image, so guessing it would just fail the run.
 # It is checked for below instead.
-PKGS="v4l-utils i2c-tools ffmpeg exfatprogs
+PKGS="v4l-utils ffmpeg exfatprogs
       gstreamer1.0-tools gstreamer1.0-plugins-base
       gstreamer1.0-plugins-good gstreamer1.0-plugins-bad"
 
@@ -87,18 +87,28 @@ done
 echo
 echo "==> Camera pipeline"
 
-if lsmod 2>/dev/null | grep -q '^imx477' || grep -qi imx477 /proc/modules 2>/dev/null; then
-  ok "imx477 module loaded"
+# Ask sysfs, not lsmod: on this rig the driver is COMPILED IN
+# (CONFIG_VIDEO_IMX477=y - see rock5t-camera/kernel-build/README.md), so lsmod
+# shows nothing even when it is working. The driver directory exists either way.
+# Bound sensors appear inside it as <bus>-<addr> symlinks. Also avoids i2cdetect,
+# which needs root and would report a false miss under a plain ./setup.sh.
+DRV=/sys/bus/i2c/drivers/imx477
+if [ -d "$DRV" ]; then
+  ok "imx477 driver registered"
 else
-  bad "imx477 module not loaded - see rock5t-camera/driver/NOTES.md"
+  bad "imx477 driver not registered - see rock5t-camera/driver/NOTES.md"
 fi
 
-bound=""
-for bus in 3 4; do
-  i2cdetect -y "$bus" 2>/dev/null | grep -q 'UU' && bound="$bound bus$bus"
-done
-[ -n "$bound" ] && ok "sensors bound on I2C:$bound (expect bus3 + bus4)" \
-                || bad "no driver-bound sensor at 0x1a on bus 3 or 4 - check the ribbons + overlay"
+bound=$(ls -1 "$DRV" 2>/dev/null | grep -E '^[0-9]+-00[0-9a-f]+$' | tr '\n' ' ')
+nb=$(echo $bound | wc -w | tr -d " ")
+if [ "$nb" -eq 2 ]; then
+  ok "both sensors bound: $bound"
+elif [ "$nb" -gt 0 ]; then
+  bad "only $nb sensor bound ($bound), want 2 (3-001a + 4-001a) - check the other ribbon"
+else
+  bad "no sensor bound to the imx477 driver - check the ribbons + overlay
+          manual look: sudo i2cdetect -y 3   (UU at 0x1a = bound)"
+fi
 
 mainpaths=$(for v in /sys/class/video4linux/video*; do
               grep -q rkisp_mainpath "$v/name" 2>/dev/null && echo "/dev/$(basename "$v")"
