@@ -132,6 +132,42 @@ fi
   || bad "/etc/iqfiles/imx477_RPI-HQ_default.json missing
           cp rock5t-camera/iqfiles/imx477_RPI-HQ_default.json /etc/iqfiles/"
 
+# ---------------------------------------------------------------- service
+# The installed unit is a COPY in /etc - re-cloning the repo to a new path does
+# not update it, and systemd caches it besides. A unit whose ExecStart points at
+# a deleted checkout fails silently at boot, so check the path it actually holds,
+# not just that the file exists.
+echo
+echo "==> Web panel service"
+UNIT=/etc/systemd/system/veery.service
+REPO_UNIT="$(cd "$(dirname "$0")" && pwd)/rock5t-camera/recorder/veery.service"
+FIXCMD="sudo cp $REPO_UNIT /etc/systemd/system/ &&
+          sudo systemctl daemon-reload && sudo systemctl enable --now veery"
+
+if [ ! -f "$UNIT" ]; then
+  bad "veery.service not installed
+          $FIXCMD"
+else
+  exec_path=$(sed -n 's/^ExecStart=[^ ]* \(.*\)$/\1/p' "$UNIT" | head -1)
+  if [ -n "$exec_path" ] && [ ! -f "$exec_path" ]; then
+    bad "veery.service points at a path that does not exist:
+            $exec_path
+          (stale after moving or re-cloning the repo) - reinstall it:
+          $FIXCMD"
+  else
+    ok "veery.service installed ($exec_path)"
+    systemctl is-enabled --quiet veery 2>/dev/null \
+      && ok "veery enabled at boot" \
+      || warn "veery not enabled at boot (sudo systemctl enable veery)"
+    if systemctl is-active --quiet veery 2>/dev/null; then
+      ok "veery running"
+    else
+      warn "veery not running (sudo systemctl start veery)
+          normal if you stopped it to use record_dual.sh by hand"
+    fi
+  fi
+fi
+
 # ---------------------------------------------------------------- storage
 echo
 echo "==> Storage"
