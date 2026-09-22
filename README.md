@@ -47,7 +47,7 @@ veery-field-camera/
 │   ├── kernel-build/       kernel build script + notes
 │   ├── iqfiles/            rkaiq ISP tuning (generated; → /etc/iqfiles/)
 │   ├── reference/          vendor DTS / drivers / schematic used as source material
-│   └── recorder/           veery_server.py (web panel), record_dual.sh, veery.service
+│   └── recorder/           veery_server.py (web panel), veery.service, ae_follower.py
 ├── calibration/          Runs ON YOUR MAC — ChArUco stereo calibration
 │   ├── calib_server.py     Rock-side capture panel (preview + full-res snapshot)
 │   ├── snap_pair.sh        Rock-side: capture ONE simultaneous cam0+cam1 pair
@@ -111,10 +111,21 @@ panorama built from the wrong geometry.
 |---|---|
 | IMX477 driver + dual-camera overlay | working on kernel 6.1.84-8-rk2410-imx477 |
 | ISP tuning (`imx477_RPI-HQ_default.json`) | tuned; see `iqfiles/TRANSLATION_NOTES.md` |
-| Dual 4K30 HEVC recording | working (`record_dual.sh`, `veery_server.py`) |
+| Dual 4K30 HEVC recording | working (`veery_server.py`) |
 | cam0/cam1 fisheye intrinsics | **solved** — ~0.23 px RMS, 104.5° H |
 | Stereo extrinsics | **PLACEHOLDER** (design values, not a measurement) |
 | Stitcher | working, fisheye + paired input |
+
+⚠️ **Capture bitrate is unvalidated and looks low.** The panel records 28 Mbit/s
+per camera at 4K30 = **0.113 bits/pixel** (measured 27.3 Mbit on the first dual
+take). The stitcher's own `auto` target for its HEVC *output* is **0.20 bpp**,
+derived from VMAF runs that put good H.264 at ~0.26 bpp with HEVC buying ~40%.
+So the capture master — which then gets de-warped, stitched and re-encoded — is
+running at roughly **half** the bits/pixel this project already established as
+"good", on high-entropy content (grass, motion). `rock5t-camera/NEXT_STEPS.md`
+lists "confirm against footage" as an open item; that was never done. Matching
+0.20 bpp would mean ~50 Mbit/cam (~45 GB/hr for the pair, vs ~25 today). Worth
+an A/B on real footage before a real game.
 
 ⚠️ `calibration/stereo_extrinsics.json` is still `placeholder_extrinsics.py`
 output — design geometry assuming perfect mounting (60 mm baseline, 74° toe-in).
@@ -173,8 +184,6 @@ cd stitching && ./stitch.command
 
 ## 1. Record (on the Rock)
 
-### 1a. Web panel — the normal way
-
 ```bash
 sudo python3 rock5t-camera/recorder/veery_server.py
 ```
@@ -190,23 +199,12 @@ Previews run on the *selfpath* and recording on the *mainpath*, so previews keep
 running during a take. Stop sends SIGINT to the process group → GStreamer emits
 EOS → a finalized, seekable file.
 
-> Only one process can hold a camera node. Stop the service before running
-> `record_dual.sh` by hand: `sudo systemctl stop veery`.
+The sensor mode and bitrate are **fixed** at the rig's target — 4K30, 28 Mbit
+per camera — deliberately: one less thing to get wrong at a game. Change the
+tuning, not the panel. (See the bitrate note in [Status](#status).)
 
-### 1b. Script — for tests and non-default modes
-
-```bash
-cd rock5t-camera/recorder
-DUR=10 ./record_dual.sh                      # 10-second 4K30 test
-W=2028 H=1520 FPS=40 DUR=30 ./record_dual.sh # binned mode
-BR=20000000 DUR=60 ./record_dual.sh          # 20 Mbit/cam
-```
-
-Dials: `W` `H` `FPS` (must be a driver mode: 4056×3040@10, 3840×2160@30,
-2028×1520@40), `DUR`, `BR`, `OUT`, `CODEC` (`h265`|`h264`).
-
-It prints frames-actually-in-the-file vs frames-requested when it finishes —
-read that number, it is the honest completion check.
+> Only one process can hold a camera node. If you run anything else against the
+> cameras, stop the panel first: `sudo systemctl stop veery`.
 
 ---
 
@@ -255,11 +253,7 @@ df -h /home/radxa
 
 ### 2c. Network alternative
 
-`smb-share.sh` shares `~/recordings` over SMB so Finder can mount it. It works
-but is **not** the chosen path — it topped out at ~63 MB/s, limited by macOS's
-SMB client. Kept as a documented fallback.
-
-Plain `rsync` over the LAN works too, from the **Mac**:
+Plain `rsync` over the LAN, from the **Mac**:
 
 ```bash
 rsync -avP radxa@veery.local:'/home/radxa/recordings/take_YYYYmmdd_HHMMSS_cam*.mkv' ~/Desktop/veery-takes/

@@ -121,7 +121,7 @@ here the driver does it, so just start both streams and measure.)
 
 ## STEP 6 — recorder
 
-Drafts exist, untested: `../recorder/record_dual.sh` (dual 4K30 H.265 via
+Drafts exist, untested: the recording path in `../recorder/veery_server.py` (dual 4K30 H.265 via
 mpph265enc, one MKV per camera, auto-discovers the mainpath nodes) and
 `../recorder/ae_follower.py` (cam0 = the only AE, mirrors exposure/gain to cam1,
 gain clamped). First runs will likely need element-name/device-node fixups

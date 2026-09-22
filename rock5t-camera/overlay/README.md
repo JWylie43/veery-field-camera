@@ -29,8 +29,10 @@ Overlays in `/boot/dtbo/` ending in `.dtbo` are active; rename to
 
 ## Depends on
 
-- `../driver/imx477.ko` loaded (the overlay's `compatible = "sony,imx477"` and
-  `trigger-mode` property are consumed by it)
+- the imx477 driver present in the running kernel (it is built IN,
+  `CONFIG_VIDEO_IMX477=y` - see `../kernel-build/README.md`; it is NOT a
+  loadable .ko). The overlay's `compatible = "sony,imx477"` and `trigger-mode`
+  property are consumed by it.
 - `../iqfiles/imx477_RPI-HQ_default.json` in `/etc/iqfiles/` (matched via
   `rockchip,camera-module-name = "RPI-HQ"`)
 

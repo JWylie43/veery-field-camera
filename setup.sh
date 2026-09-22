@@ -163,7 +163,7 @@ else
       ok "veery running"
     else
       warn "veery not running (sudo systemctl start veery)
-          normal if you stopped it to use record_dual.sh by hand"
+          normal if you stopped it to run something else against the cameras"
     fi
   fi
 fi
@@ -185,7 +185,6 @@ else
   echo "Some checks FAILED (see MISS above) - recording will not work until they pass."
 fi
 echo
-echo "Record a test take:  cd rock5t-camera/recorder && DUR=10 ./record_dual.sh"
 echo "Web panel:           sudo python3 rock5t-camera/recorder/veery_server.py"
 echo "                     (then http://<rock-ip>:8080)"
 exit "$fail"

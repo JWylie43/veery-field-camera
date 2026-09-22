@@ -887,9 +887,8 @@ if __name__ == "__main__":
 #     PAGE instead of FILES_PAGE and the takes table just went blank
 #     ("where did my files go?", 2026-09-20).
 #
-# After editing PAGE or FILES_PAGE, run:
-#
-#     python3 check_pages.py
-#
-# It checks both pages for JS syntax, for on*= handlers with no definition, and
-# for bare calls that resolve to nothing. Exits non-zero on any of them.
+# There is no automated check for this any more (check_pages.py was removed).
+# After editing PAGE or FILES_PAGE, exercise BOTH pages in a browser with the
+# console open: load the panel, start/stop a record, then open Manage Files and
+# mount/browse. A dead <script> shows up as frozen status or dead buttons; a
+# wrong-page function shows up as a ReferenceError and an empty table.

@@ -1,6 +1,12 @@
 # imx477_RPI-HQ_default.json — translation notes
 
-**Status: DRAFT — structurally valid, never loaded on hardware.**
+**Status: IN USE — loaded, A/B tested and tuned on hardware.**
+Round 1 (NR/sharpening) and the AE setpoint raise were validated outdoors on
+2026-09-13; see the bring-up logs in `../../ROCK5T_CAMERA.md`. The
+section-by-section notes below describe the ORIGINAL translation from the
+reference files — later tuning is recorded in those logs and in
+`gen_imx477_iq.py`, which remains the source of truth: edit the script and
+regenerate, never hand-edit the JSON.
 
 Target: RK3588 (Rock 5T), rkisp v30 schema, rkaiq 6.8.0.
 Filename follows Radxa's `<sensor>_<module>_<lens>.json` convention: sensor `imx477`,
