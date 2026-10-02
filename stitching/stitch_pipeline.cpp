@@ -595,16 +595,31 @@ static int g_pairOffset = 0;
 static bool g_pairAuto = true;    // --pair-offset N disables; "auto" forces
 static bool g_pairResolved = false;
 
+// Which camera is the LEFT image is decided by the calibration, not the file
+// names: if the extrinsic yaw puts cam1 to the LEFT of cam0 (as it does once the
+// rig saves its upside-down sensors rotated 180 - see calibration/rotate180.py),
+// main() sets this and the whole pipeline runs with cam1 as left, cam0 as right.
+// File names, --pair-offset and printed offsets stay in cam0/cam1 terms.
+static bool g_swapLR = false;
+
+// g_pairOffset as the L/R streams see it (it is stored in cam0/cam1 terms)
+static int pairOffsetLR() { return g_swapLR ? -g_pairOffset : g_pairOffset; }
+
 static bool resolvePairPaths(const string &src, string &L, string &R)
 {
     size_t d = src.find("::");
-    if (d != string::npos) { L = src.substr(0, d); R = src.substr(d + 2); return true; }
+    if (d != string::npos)
+    {
+        L = src.substr(0, d); R = src.substr(d + 2);
+        if (g_swapLR) std::swap(L, R);
+        return true;
+    }
     size_t c = src.rfind("_cam0.");
     if (c != string::npos)
     {
         L = src;
         R = src.substr(0, c) + "_cam1." + src.substr(c + 6);
-        if (std::filesystem::exists(R)) return true;
+        if (std::filesystem::exists(R)) { if (g_swapLR) std::swap(L, R); return true; }
         cerr << "ERROR: " << src << " looks like a cam0 file but its partner\n"
              << "       " << R << " does not exist.\n";
         L.clear(); R.clear();
@@ -688,7 +703,7 @@ static int estimatePairOffset(const string &lp, const string &rp,
     for (int sh = -maxShift; sh <= maxShift; sh++)
         if (abs(sh - best) > 1) runnerUp = max(runnerUp, score(sh));
 
-    cout << "  auto pair-offset: " << best << " frames (correlation "
+    cout << "  auto pair-offset: " << (g_swapLR ? -best : best) << " frames (correlation "
          << std::fixed << std::setprecision(3) << bestScore
          << ", margin " << (bestScore - runnerUp) << ")";
     if (bestScore < 0.5) cout << "  [weak - cameras free-running?]";
@@ -712,12 +727,14 @@ public:
         if (!b_.open(R)) { a_.release(); return false; }
         if (g_pairAuto && !g_pairResolved)
         {
-            g_pairOffset = estimatePairOffset(L, R);
+            int est = estimatePairOffset(L, R);           // in L/R terms
+            g_pairOffset = g_swapLR ? -est : est;
             g_pairResolved = true;
         }
         // apply the constant offset once, at open, by pre-skipping frames
-        int skipB = g_pairOffset > 0 ? g_pairOffset : 0;
-        int skipA = g_pairOffset < 0 ? -g_pairOffset : 0;
+        int off = pairOffsetLR();
+        int skipB = off > 0 ? off : 0;
+        int skipA = off < 0 ? -off : 0;
         for (int i = 0; i < skipA; i++) a_.grab();
         for (int i = 0; i < skipB; i++) b_.grab();
         cout << "  paired input: " << std::filesystem::path(L).filename().string()
@@ -743,7 +760,7 @@ public:
     {
         bool ok = a_.set(prop, v);
         // keep the streams' relative offset when seeking
-        double vb = (prop == CAP_PROP_POS_FRAMES) ? v + g_pairOffset : v;
+        double vb = (prop == CAP_PROP_POS_FRAMES) ? v + pairOffsetLR() : v;
         return b_.set(prop, vb) && ok;
     }
 
@@ -2239,6 +2256,17 @@ int main(int argc, char **argv)
     loadIntrinsics(calibDir + "/cam1_intrinsics.json", KR, DR);
     cout << "calibration model: fisheye (equidistant)\n";
     R = loadRotation(calibDir + "/stereo_extrinsics.json");
+    // cam1 left of cam0 (negative yaw) -> run with cam1 as the left image. R maps
+    // cam0-frame directions into cam1's frame; the reverse mapping is its transpose.
+    if (atan2(R.at<double>(2, 0), R.at<double>(2, 2)) < 0)
+    {
+        g_swapLR = true;
+        std::swap(KL, KR);
+        std::swap(DL, DR);
+        R = R.t();
+        cout << "orientation: cam1 is the LEFT camera (from the extrinsics) - "
+             << "stitching cam1|cam0\n";
+    }
 
     // Interactive tuner — the default when no --source is given, and whenever
     // --tune is passed. The browser's Import button loads the source on demand,

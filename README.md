@@ -266,6 +266,17 @@ rsync -avP radxa@veery.local:'/home/radxa/recordings/take_YYYYmmdd_HHMMSS_cam*.m
 Do this once per housing build, and again any time the mount is disturbed.
 Intrinsics are mount-independent; **extrinsics are not**.
 
+> **Orientation.** The cameras are mounted upside down. The sensors read out
+> as they are, and everything that saves or shows an image (recording
+> encoder, panel previews, `/calib` snapshots, `calib_server.py`,
+> `snap_pair.sh`) rotates it 180°, so files on disk are upright. Calibration
+> must be solved in that same orientation. Files solved from older
+> upside-down captures are converted once with
+> `python3 calibration/rotate180.py` (exact: it moves the principal point and
+> conjugates the extrinsic rotation, and marks each file so it is never
+> converted twice). The stitcher then sees cam1 to the left of cam0 and swaps
+> the two automatically.
+
 ### 3a. Capture (on the Rock)
 
 For **intrinsics**, one camera at a time is fine — walk the board around each
