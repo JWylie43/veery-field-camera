@@ -101,8 +101,12 @@ for a 2160-row window is unpublished; verify on first stream test.
    | source | 1 | 1 | 1 | 1 |
    | sink | 1 | 0 | 0 | 0 |
 
-   Module param `trigger_mode=1|2` kept as a fallback when the DT property
-   is absent. Each sensor node gets exactly one role — no both-roles path.
+   Module param `genlock` (bool, default 1) is the one sync switch for all
+   sensors: 1 = each takes its DT role (cam0 source, cam1 sink), 0 = all
+   free-run. Runtime: stop streams, write
+   `/sys/module/imx477/parameters/genlock`, restart. Boot default:
+   `imx477.genlock=0` on the kernel cmdline. Each sensor node gets exactly
+   one role — no both-roles path.
 5. **Common regs written once per power-on** (RPi's `common_regs_written`
    flag, cleared in power_off) instead of unconditionally in `s_power` —
    works both through the rkaiq pipeline (s_power then s_stream) and plain

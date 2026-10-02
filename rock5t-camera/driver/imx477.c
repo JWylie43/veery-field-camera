@@ -17,7 +17,8 @@
  *
  * XVS hardware genlock: optional device tree string property "trigger-mode"
  * on the sensor node selects "source" (drive XVS) or "sink" (slave to XVS).
- * Absent property = free running.
+ * Absent property = free running. One global switch picks sync vs free-run
+ * for every sensor at once: /sys/module/imx477/parameters/genlock (see below).
  *
  * V0.0X01.0X00 first version.
  */
@@ -56,20 +57,18 @@ module_param(dpc_enable, int, 0644);
 MODULE_PARM_DESC(dpc_enable, "Enable on-sensor DPC");
 
 /*
- * Runtime override of the XVS genlock role, applied at every stream start:
- *   -1 = follow the DT "trigger-mode" property
- *    0 = force free-run (DEFAULT while the XVS pads are unwired: a DT
- *        "sink" camera never streams without master pulses, and per-boot
- *        echo 0 was a recurring trap - set to -1, or change this default,
- *        once the genlock wire is in)
- *    1 = force source, 2 = force sink
- * Writable at runtime: /sys/module/imx477/parameters/trigger_mode
- * (restart the stream to apply).
+ * XVS genlock mode for ALL sensors, applied at every stream start:
+ *   1 = sync (DEFAULT): each sensor takes its DT "trigger-mode" role
+ *       (cam0 "source" = master, cam1 "sink" = slave)
+ *   0 = free-run: every sensor ignores XVS and runs on its own clock
+ * Writable at runtime: /sys/module/imx477/parameters/genlock - stop the
+ * streams, write it, restart them. Boot default can be set on the kernel
+ * command line with imx477.genlock=0.
  */
-static int trigger_mode;
-module_param(trigger_mode, int, 0644);
-MODULE_PARM_DESC(trigger_mode,
-		 "XVS trigger mode override: -1=follow DT, 0=none (default), 1=source, 2=sink");
+static bool genlock = true;
+module_param(genlock, bool, 0644);
+MODULE_PARM_DESC(genlock,
+		 "XVS genlock: 1=sync, sensors take their DT source/sink roles (default), 0=all free-run");
 
 /*
  * The Raspberry Pi modes run the CSI-2 link at 450MHz (900Mbps/lane,
@@ -265,7 +264,7 @@ struct imx477 {
 	u32			cur_vts;
 	/* Current long exposure factor in use. Set through V4L2_CID_VBLANK */
 	unsigned int		long_exp_shift;
-	/* XVS genlock role, from DT "trigger-mode" (or module param) */
+	/* XVS genlock role from DT "trigger-mode" (used while genlock=1) */
 	enum imx477_trigger_mode xvs_trigger_mode;
 	u32			module_index;
 	const char		*module_facing;
@@ -1730,14 +1729,10 @@ static long imx477_compat_ioctl32(struct v4l2_subdev *sd,
 static int imx477_apply_trigger_mode(struct imx477 *imx477)
 {
 	struct i2c_client *client = imx477->client;
-	enum imx477_trigger_mode tm = imx477->xvs_trigger_mode;
+	enum imx477_trigger_mode tm = genlock ? imx477->xvs_trigger_mode :
+						IMX477_TRIGGER_MODE_NONE;
 	u32 mc_mode, ms_sel, xvs_io_ctrl, extout_en;
 	int ret;
-
-	/* module param overrides the DT role when set (>= 0) */
-	if (trigger_mode >= IMX477_TRIGGER_MODE_NONE &&
-	    trigger_mode <= IMX477_TRIGGER_MODE_SINK)
-		tm = trigger_mode;
 
 	switch (tm) {
 	case IMX477_TRIGGER_MODE_SOURCE:
@@ -2405,14 +2400,7 @@ static void imx477_parse_trigger_mode(struct imx477 *imx477)
 			dev_warn(dev,
 				 "unknown trigger-mode '%s', using none\n",
 				 tm_str);
-		return;
 	}
-
-	/* No DT property; honour the module parameter as a fallback */
-	if (trigger_mode == 1)
-		imx477->xvs_trigger_mode = IMX477_TRIGGER_MODE_SOURCE;
-	else if (trigger_mode == 2)
-		imx477->xvs_trigger_mode = IMX477_TRIGGER_MODE_SINK;
 }
 
 static int imx477_probe(struct i2c_client *client,

@@ -6,6 +6,9 @@ The Rock-side web control panel for the rig, in the same visual
 language, stripped to what the field needs: two live previews, one record
 button, and a Manage Files page. Python stdlib only (no flask).
 
+/calib is the calibration page: the same previews and one Take Snapshot
+button that saves a full-res cam0+cam1 PAIR (same index) for calibrate.py.
+
     sudo python3 veery_server.py    # http://veery.local:8080  (root: mounts USB)
     # or let systemd run it at boot: see veery.service
 
@@ -56,6 +59,11 @@ CAMS = {
 # explicit path, not "~", which would be /root under systemd.
 PANEL_USER = "radxa"
 REC_DIR = f"/home/{PANEL_USER}/recordings"
+SNAP_DIR = f"/home/{PANEL_USER}/calib-pairs"
+# frames each mainpath runs before the one we keep (~1.5s at 30fps): the first
+# frames after a path starts are stale/unsettled, so let it run, keep the last
+SNAP_SETTLE_FRAMES = 45
+SNAP_W, SNAP_H = 3840, 2160
 
 _state = {
     "gst": {},                      # continuous preview procs (cam -> Popen)
@@ -305,15 +313,7 @@ def stop_recording():
     _state["rec_name"] = None
     _state["rec_started"] = None
     files = sorted(glob.glob(os.path.join(REC_DIR, f"{name}_cam*.mkv")))
-    # created by a root process: give them to the panel user so ssh/scp and
-    # manual cleanup do not need sudo
-    try:
-        uid = int(sh(f"id -u {PANEL_USER}").stdout.strip())
-        gid = int(sh(f"id -g {PANEL_USER}").stdout.strip())
-        for f in files:
-            os.chown(f, uid, gid)
-    except (ValueError, OSError):
-        pass
+    _chown_panel_user(files)
     sizes = [f"{os.path.basename(f)} {human(os.path.getsize(f))}" for f in files]
     return {"ok": True, "msg": "saved " + ", ".join(sizes) + ("; " + "; ".join(warn) if warn else "")}
 
@@ -324,6 +324,104 @@ def rec_bytes():
     return sum(os.path.getsize(f) for f in
                glob.glob(os.path.join(REC_DIR, f"{_state['rec_name']}_cam*.mkv"))
                if os.path.exists(f))
+
+
+# --------------------------------------------------------- calib snapshots
+
+def _chown_panel_user(paths):
+    """Files written by this root process -> the panel user, so ssh/scp and
+    manual cleanup do not need sudo."""
+    try:
+        uid = int(sh(f"id -u {PANEL_USER}").stdout.strip())
+        gid = int(sh(f"id -g {PANEL_USER}").stdout.strip())
+        for f in paths:
+            os.chown(f, uid, gid)
+    except (ValueError, OSError):
+        pass
+
+
+def snap_pairs():
+    """Indices of the complete cam0+cam1 pairs in SNAP_DIR."""
+    idx = {}
+    for f in glob.glob(os.path.join(SNAP_DIR, "cam[01]_*.png")):
+        m = re.fullmatch(r"cam([01])_(\d+)\.png", os.path.basename(f))
+        if m:
+            idx.setdefault(int(m.group(2)), set()).add(m.group(1))
+    return sorted(i for i, cams in idx.items() if cams == {"0", "1"})
+
+
+def genlock_mode():
+    try:
+        with open("/sys/module/imx477/parameters/genlock") as f:
+            return "sync" if f.read().strip() in ("Y", "1") else "free-run"
+    except OSError:
+        return "unknown"
+
+
+def take_snapshot_pair():
+    """One full-res still from EACH camera, saved as cam0_NNN.png + cam1_NNN.png.
+
+    Both mainpaths start together and run SNAP_SETTLE_FRAMES frames; the last
+    one is kept. Running them together is what makes this work in sync mode
+    too: a sink camera only produces frames while the source is streaming.
+    All or nothing - if either camera fails, neither file is kept, so the
+    numbering never drifts out of pairs.
+    """
+    if _state["rec"]:
+        return {"ok": False, "msg": "not while recording"}
+    os.makedirs(SNAP_DIR, exist_ok=True)
+    pairs = snap_pairs()
+    idx = pairs[-1] + 1 if pairs else 0
+    raw = {cam: f"/dev/shm/snap_cam{cam}.nv12" for cam in CAMS}
+    procs = {}
+    for cam, c in CAMS.items():
+        try:
+            os.remove(raw[cam])
+        except FileNotFoundError:
+            pass
+        # multifilesink with a fixed name overwrites per buffer -> last frame wins
+        pipeline = (f"gst-launch-1.0 v4l2src device={c['main']} "
+                    f"num-buffers={SNAP_SETTLE_FRAMES} ! "
+                    f"video/x-raw,format=NV12,width={SNAP_W},height={SNAP_H} ! "
+                    f"multifilesink location={raw[cam]}")
+        log = open(f"/tmp/snap_cam{cam}.log", "w")
+        procs[cam] = subprocess.Popen(pipeline, shell=True, stdout=log,
+                                      stderr=log, preexec_fn=os.setsid)
+    errors = []
+    for cam, p in procs.items():
+        try:
+            p.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+            errors.append(f"cam{cam} timed out (sync mode: is cam0 streaming?)")
+    frame_bytes = SNAP_W * SNAP_H * 3 // 2
+    for cam in CAMS:
+        if not os.path.exists(raw[cam]) or os.path.getsize(raw[cam]) != frame_bytes:
+            errors.append(f"cam{cam} gave no full frame - see /tmp/snap_cam{cam}.log")
+    out = {cam: os.path.join(SNAP_DIR, f"cam{cam}_{idx:03d}.png") for cam in CAMS}
+    if not errors:
+        conv = {cam: subprocess.Popen(
+                    ["ffmpeg", "-loglevel", "error", "-y", "-f", "rawvideo",
+                     "-pix_fmt", "nv12", "-s", f"{SNAP_W}x{SNAP_H}", "-i", raw[cam],
+                     "-frames:v", "1", out[cam]],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                for cam in CAMS}
+        for cam, p in conv.items():
+            _, err = p.communicate(timeout=60)
+            if p.returncode != 0 or not os.path.exists(out[cam]):
+                errors.append(f"cam{cam} png convert failed: {(err or '').strip()[:200]}")
+    for cam in CAMS:
+        try:
+            os.remove(raw[cam])
+        except FileNotFoundError:
+            pass
+    if errors:
+        for f in out.values():
+            if os.path.exists(f):
+                os.remove(f)
+        return {"ok": False, "msg": "; ".join(errors)}
+    _chown_panel_user([SNAP_DIR] + list(out.values()))
+    return {"ok": True, "msg": f"saved pair {idx:03d}", "count": len(snap_pairs())}
 
 
 def list_takes():
@@ -513,6 +611,7 @@ PAGE = """<!doctype html>
  <button id="start">&#9679; Start Recording</button>
  <button id="stop" disabled>&#9632; Stop Recording</button>
  <a id="manage" href="/files" class="btnlink">&#128193; Manage Files</a>
+ <a id="calib" href="/calib" class="btnlink" style="background:#555">&#127919; Calibration Snapshots</a>
  <button id="off" onclick="poweroff()">&#9211; Shut Down</button>
  <div class="muted" id="msg"></div>
 </div>
@@ -537,6 +636,7 @@ async function refresh(){
     $('start').disabled = s.recording;
     $('stop').disabled = !s.recording;
     $('manage').classList.toggle('disabled', s.recording);
+    $('calib').classList.toggle('disabled', s.recording);
     $('off').disabled = s.recording;
   }catch(e){ $('statetext').textContent = 'server unreachable'; }
 }
@@ -727,6 +827,55 @@ load();
 </script></body></html>""".replace("%CSS%", CSS)
 
 
+CALIB_PAGE = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Calibration</title>
+<style>%CSS%</style></head><body><div class="wrap">
+ <h1>&#127919; Calibration Snapshots &nbsp;<a class="back" href="/">&larr; back to recorder</a></h1>
+ <div class="card" style="padding:6px">
+   <div class="cams">
+     <figure><img id="p0" src="/preview0.mjpg" alt="cam0"><figcaption>cam0</figcaption></figure>
+     <figure><img id="p1" src="/preview1.mjpg" alt="cam1"><figcaption>cam1</figcaption></figure>
+   </div>
+ </div>
+ <div class="card">
+   <div><b id="count">&hellip;</b> pairs saved</div>
+   <div id="info" class="muted"></div>
+ </div>
+ <button id="snap" class="go">&#128247; Take Snapshot</button>
+ <div class="muted" id="msg"></div>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+['p0','p1'].forEach(id => { $(id).onerror = () =>
+  setTimeout(()=>{ $(id).src = '/preview'+id[1]+'.mjpg?'+Date.now(); }, 1500); });
+let busy = false;
+async function refresh(){
+  try{
+    const s = await (await fetch('/api/calib')).json();
+    $('count').textContent = s.count;
+    $('info').textContent = 'saving to ' + s.dir + '  |  genlock: ' + s.genlock
+      + (s.recording ? '  |  RECORDING - snapshots disabled' : '');
+    $('snap').disabled = busy || s.recording;
+  }catch(e){ $('info').textContent = 'server unreachable'; }
+}
+$('snap').onclick = async () => {
+  busy = true; $('snap').disabled = true;
+  $('snap').textContent = 'Hold still - capturing...';
+  $('msg').textContent = '';
+  try{
+    const r = await (await fetch('/api/snap')).json();
+    $('msg').textContent = r.msg || '';
+    $('msg').className = r.ok ? 'muted ok' : 'muted hot';
+  }catch(e){ $('msg').textContent = 'snapshot request failed: ' + e; }
+  busy = false; $('snap').innerHTML = '&#128247; Take Snapshot'; refresh();
+};
+setInterval(refresh, 2000); refresh();
+</script></body></html>""".replace("%CSS%", CSS)
+
+
 # ----------------------------------------------------------------- server
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -754,6 +903,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(PAGE)
         elif path == "/files":
             self._send(FILES_PAGE)
+        elif path == "/calib":
+            self._send(CALIB_PAGE)
+        elif path == "/api/calib":
+            self._json({"count": len(snap_pairs()), "dir": SNAP_DIR,
+                        "genlock": genlock_mode(), "recording": bool(_state["rec"])})
+        elif path == "/api/snap":
+            with _state["lock"]:
+                self._json(take_snapshot_pair())
         elif path == "/status":
             self._json({
                 "recording": bool(_state["rec"]),
@@ -888,7 +1045,7 @@ if __name__ == "__main__":
 #     ("where did my files go?", 2026-09-20).
 #
 # There is no automated check for this any more (check_pages.py was removed).
-# After editing PAGE or FILES_PAGE, exercise BOTH pages in a browser with the
+# After editing PAGE, FILES_PAGE or CALIB_PAGE, exercise ALL pages in a browser with the
 # console open: load the panel, start/stop a record, then open Manage Files and
 # mount/browse. A dead <script> shows up as frozen status or dead buttons; a
 # wrong-page function shows up as a ReferenceError and an empty table.
