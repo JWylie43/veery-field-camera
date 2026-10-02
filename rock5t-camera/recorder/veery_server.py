@@ -70,7 +70,9 @@ SNAP_DIR = f"/home/{PANEL_USER}/calib-pairs"
 # frames after a path starts are stale/unsettled, so let it run, keep the last
 SNAP_SETTLE_FRAMES = 45
 SNAP_W, SNAP_H = 3840, 2160
-# cameras are mounted upside down: everything saved or shown is rotated 180
+# cameras are mounted upside down: everything saved or shown is rotated 180.
+# (videoflip must use video-direction= - on this GStreamer 1.22 build the
+# deprecated method= is accepted and silently does nothing)
 ROTATION = 180
 
 _state = {
@@ -234,7 +236,7 @@ def start_previews():
             pass
         pipeline = (f"gst-launch-1.0 v4l2src device={c['self']} ! "
                     f"video/x-raw,format=NV12,width=1920,height=1080 ! videorate ! "
-                    f"video/x-raw,framerate=5/1 ! videoflip method=rotate-{ROTATION} ! "
+                    f"video/x-raw,framerate=5/1 ! videoflip video-direction={ROTATION} ! "
                     f"jpegenc quality=80 ! multifilesink location={PREV_JPG[cam]}")
         log = open(f"/tmp/rec_prev{cam}.log", "w")
         # own process group: shell=True means Popen's pid is the shell, so only

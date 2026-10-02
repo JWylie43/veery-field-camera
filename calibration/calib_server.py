@@ -92,7 +92,7 @@ def start_previews():
             pass
         pipeline = (f"gst-launch-1.0 v4l2src device={c['self']} ! "
                     f"video/x-raw,format=NV12,width=1920,height=1080 ! videorate ! "
-                    f"video/x-raw,framerate=5/1 ! videoflip method=rotate-180 ! "
+                    f"video/x-raw,framerate=5/1 ! videoflip video-direction=180 ! "
                     f"jpegenc quality=80 ! "
                     f"multifilesink location={PREV_JPG[cam]}")
         log = open(f"/tmp/calib_gst{cam}.log", "w")
@@ -101,7 +101,7 @@ def start_previews():
         # snapshot is just a file copy (instant) - no per-tap pipeline starts
         full = (f"gst-launch-1.0 v4l2src device={c['main']} ! "
                 f"video/x-raw,format=NV12,width=3840,height=2160 ! videorate ! "
-                f"video/x-raw,framerate=2/1 ! videoflip method=rotate-180 ! "
+                f"video/x-raw,framerate=2/1 ! videoflip video-direction=180 ! "
                 f"jpegenc quality=97 ! "
                 f"multifilesink location={FULL_JPG[cam]}")
         logf = open(f"/tmp/calib_gst_full{cam}.log", "w")
