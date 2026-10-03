@@ -60,6 +60,31 @@ def luma_series(path, seconds):
     return [float(m) for m in re.findall(r'YAVG=([\d.]+)', r.stdout)]
 
 
+SHARED_CLOCK_TAG = "veery-shared-clock"   # written by veery_server.py
+
+
+def timestamp_offset(cam0, cam1):
+    """Exact frame offset for a shared-clock take (both files tagged), from the
+    two files' start timestamps - same convention as --pair-offset (<0 skips
+    cam0 frames). None for older, untagged takes."""
+    for f in (cam0, cam1):
+        if SHARED_CLOCK_TAG not in run(f'ffprobe -v error -show_entries format_tags '
+                                       f'-of default=nw=1 "{f}"').stdout:
+            return None
+
+    def probe(f, entry):
+        return run(f'ffprobe -v error -select_streams v:0 -show_entries stream={entry} '
+                   f'-of default=nokey=1:noprint_wrappers=1 "{f}"').stdout.strip()
+    try:
+        t0, t1 = float(probe(cam0, "start_time")), float(probe(cam1, "start_time"))
+        num, den = probe(cam0, "r_frame_rate").split("/")
+        fps = float(num) / float(den)
+    except ValueError:
+        return None
+    frames = (t1 - t0) * fps
+    return -round(frames), frames - round(frames), t0, t1
+
+
 def correlate(a, b, max_shift):
     """Best integer shift of b against a, plus how much it beats the runner-up."""
     n = min(len(a), len(b))
@@ -143,6 +168,16 @@ def main():
     else:
         print("  frame counts match")
 
+    ts = timestamp_offset(left, right)
+    if ts:
+        off, resid, t0, t1 = ts
+        print(f"  timestamp offset: {off} frames   (EXACT - shared-clock take; starts "
+              f"cam0 {t0:.3f}s, cam1 {t1:.3f}s, off-grid residual {resid:+.3f} frame)")
+        if abs(resid) > 0.25:
+            print("    ! residual > 1/4 frame - the cameras do not look genlocked")
+    else:
+        print("  no shared-clock tag - older take; offset is estimated from brightness below")
+
     la = luma_series(left, args.seconds)
     lb = luma_series(right, args.seconds)
     dups_a = sum(1 for i in range(1, len(la)) if la[i] == la[i - 1])
@@ -156,7 +191,7 @@ def main():
         print("  ! too few frames analysed to estimate an offset")
         sys.exit(1)
 
-    print(f"  best offset: {shift} frames   (correlation {corr:.3f}, "
+    print(f"  {'brightness cross-check' if ts else 'best offset'}: {shift} frames   (correlation {corr:.3f}, "
           f"margin over next candidate {margin:.3f})")
     if corr < 0.5:
         print("    weak match - expected while the cameras FREE-RUN (they drift, so no")
@@ -170,8 +205,11 @@ def main():
 
     print(f"\n== stitch with ==")
     print(f"  ./build/StitchPipeline --source \"{left}\" --tune")
-    print("  (the stitcher estimates this same offset itself - --pair-offset defaults to")
-    print(f"   'auto'. Pass --pair-offset {shift} only to pin it, or 0 to disable.)\n")
+    if ts:
+        print("  (the stitcher reads the same timestamp offset itself - nothing to pass)\n")
+    else:
+        print("  (the stitcher estimates this same offset itself - --pair-offset defaults to")
+        print(f"   'auto'. Pass --pair-offset {shift} only to pin it, or 0 to disable.)\n")
 
 
 if __name__ == "__main__":

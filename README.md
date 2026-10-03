@@ -70,15 +70,18 @@ where the stitcher looks by default — no `--calib-dir` needed.
 
 ## How the pieces fit
 
-**1 — Record (on the Rock).** Two IMX477s, genlocked over XVS, each written to
-its own MKV by its own GStreamer pipeline:
+**1 — Record (on the Rock).** Two IMX477s, genlocked over XVS, both recorded by
+ONE GStreamer pipeline into one MKV per camera:
 
 ```
-rkisp mainpath (NV12, tuned IQ) → mpph265enc (CBR) → matroskamux → take_TS_camN.mkv
+rkisp mainpath (NV12, tuned IQ) → videorate → mpph265enc (CBR, rotation=180) → matroskamux → take_TS_camN.mkv
 ```
 
-Two **independent** files is deliberate: fault isolation, full per-camera
-timestamps, no live cross-coupling. Pairing happens later, at stitch time.
+One pipeline means one clock: genlocked frames carry the same timestamps in
+both files, each file keeps its first frame's real start time, and both are
+tagged `veery-shared-clock`. The stitcher (and `pair_check.py`) read the two
+start times and get the frame offset **exactly** - no brightness guessing.
+The trade-off, chosen deliberately: a fault in one camera ends the whole take.
 
 **2 — Calibrate (capture on the Rock, solve on the Mac).** `calib_server.py` or
 `snap_pair.sh` captures full-res ChArUco frames; `calibrate.py` solves per-camera
@@ -423,7 +426,7 @@ you can reproduce a tuned render by hand.
 | `--source <file>` | input — a `_cam0` file, or `"a::b"` |
 | `--shift-top N` / `--shift-bottom N` | far/near edge alignment (your tuned values) |
 | `--shift-x N` / `--shift-y N` | uniform horizontal / vertical shift of cam1 |
-| `--pair-offset N\|auto` | frame offset between the two files (default `auto`) |
+| `--pair-offset N\|auto` | frame offset between the two files (default `auto`: exact from the capture timestamps on shared-clock takes, brightness estimate on older ones) |
 | `--crop x,y,w,h` | restrict to a bounding box (full-canvas coords) |
 | `--start N` / `--end N` | frame range |
 | `--scale F` | render the cylinder at F× radius — same FOV, fewer pixels |

@@ -41,7 +41,9 @@
 //
 // Two-file takes (the recorder writes one file per camera):
 //   --source take_..._cam0.mkv   finds _cam1 automatically and pairs them in memory.
-//   --pair-offset auto  (DEFAULT) estimates the frame offset between the two files by
+//   --pair-offset auto  (DEFAULT) takes the frame offset from the files' capture
+//              timestamps when the recorder tagged them as one shared-clock take
+//              (exact). Otherwise (older takes) it estimates it by
 //              cross-correlating per-frame brightness over the first seconds - the same
 //              method as pair_check.py, so no separate step is needed. Prints the
 //              offset, its correlation and its margin. --pair-offset N pins a value
@@ -646,6 +648,44 @@ static bool resolvePairPaths(const string &src, string &L, string &R)
 // whatever fits the analysed window, but the true offset drifts across a take,
 // so no single number stays right. With XVS genlock the offset is a genuine
 // constant and this is exact.
+// EXACT offset for takes from the shared-clock recorder. veery_server.py records
+// both cameras in ONE GStreamer pipeline (one clock, one base time), starts each
+// file at its camera's first real frame and keeps that frame's real timestamp,
+// and tags both files SHARED_CLOCK_TAG. With genlock the two start times differ
+// by a whole number of frames, and that number IS the offset - read straight off
+// the capture timestamps, no brightness guessing. Untagged (older) takes return
+// false and fall back to estimatePairOffset below. Result is in cam0/cam1 terms.
+static const char *SHARED_CLOCK_TAG = "veery-shared-clock";
+static string runCmd(const string &cmd);
+
+static bool sharedClockOffset(const string &cam0, const string &cam1, int &offset)
+{
+    for (const string &f : {cam0, cam1})
+        if (runCmd("ffprobe -v error -show_entries format_tags -of default=nw=1 \""
+                   + f + "\"").find(SHARED_CLOCK_TAG) == string::npos)
+            return false;
+    auto probe = [](const string &f, const string &entry) {
+        return runCmd("ffprobe -v error -select_streams v:0 -show_entries stream=" + entry
+                      + " -of default=nokey=1:noprint_wrappers=1 \"" + f + "\"");
+    };
+    double t0, t1, fps = 30.0;
+    try { t0 = stod(probe(cam0, "start_time")); t1 = stod(probe(cam1, "start_time")); }
+    catch (...) { return false; }
+    string rate = probe(cam0, "r_frame_rate");                   // e.g. "30/1"
+    size_t sl = rate.find('/');
+    try { if (sl != string::npos) fps = stod(rate.substr(0, sl)) / stod(rate.substr(sl + 1)); }
+    catch (...) {}
+    double frames = (t1 - t0) * fps;                  // cam1 starts this many frames later
+    offset = -(int)llround(frames);                   // <0 skips that many frames of cam0
+    cout << "  pair-offset from capture timestamps: " << offset << " frames (start cam0 "
+         << std::fixed << std::setprecision(3) << t0 << "s, cam1 " << t1
+         << "s; off-grid residual " << (frames - llround(frames)) << " frame)"
+         << std::defaultfloat << "\n";
+    if (fabs(frames - llround(frames)) > 0.25)
+        cout << "  [!! residual > 1/4 frame - the cameras do not look genlocked]\n";
+    return true;
+}
+
 static int estimatePairOffset(const string &lp, const string &rp,
                               int maxShift = 15, double seconds = 5.0)
 {
@@ -727,8 +767,15 @@ public:
         if (!b_.open(R)) { a_.release(); return false; }
         if (g_pairAuto && !g_pairResolved)
         {
-            int est = estimatePairOffset(L, R);           // in L/R terms
-            g_pairOffset = g_swapLR ? -est : est;
+            const string &c0 = g_swapLR ? R : L, &c1 = g_swapLR ? L : R;
+            int ts;
+            if (sharedClockOffset(c0, c1, ts))
+                g_pairOffset = ts;                        // exact, from timestamps
+            else
+            {
+                int est = estimatePairOffset(L, R);       // in L/R terms
+                g_pairOffset = g_swapLR ? -est : est;
+            }
             g_pairResolved = true;
         }
         // apply the constant offset once, at open, by pre-skipping frames

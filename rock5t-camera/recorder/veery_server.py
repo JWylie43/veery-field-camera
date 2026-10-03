@@ -28,8 +28,13 @@ Design rules (each learned the hard way on this vendor stack):
     and are NEVER stopped or restarted - pipeline churn has locked this board
     up. Their crop selection is reset at start (stale-crop gotcha).
   - Recording runs on the mainpath - a different node, so previews keep running
-    during a take. TWO independent files by design: fault isolation, and the
-    stitcher pairs full-res frames by timestamp.
+    during a take. ONE gst process records BOTH cameras into TWO files: one
+    pipeline means one clock and one base time, so the genlocked frames carry
+    the same timestamps in both files. Each file starts at its camera's first
+    real frame (videorate skip-to-first) and keeps that frame's real time
+    (matroskamux offset-to-zero=false), and is tagged SYNC_TAG - the stitcher
+    reads the two start times and gets the frame offset exactly. Trade-off,
+    chosen deliberately: a fault in one camera ends the whole take.
   - The record pipeline is the validated one: io-mode=dmabuf + an explicit
     framerate stamp (without it mpph265enc silently ignores bps) + CBR + a
     decoupling queue. Stop = SIGINT to the process group -> gst -e sends EOS ->
@@ -74,6 +79,9 @@ SNAP_W, SNAP_H = 3840, 2160
 # (videoflip must use video-direction= - on this GStreamer 1.22 build the
 # deprecated method= is accepted and silently does nothing)
 ROTATION = 180
+# written into every take (MKV comment tag): "both files share one clock, the
+# frame offset is in their start timestamps" - read by the stitcher/pair_check
+SYNC_TAG = "veery-shared-clock"
 
 _state = {
     "gst": {},                      # continuous preview procs (cam -> Popen)
@@ -263,18 +271,23 @@ def start_recording():
         return {"ok": False, "msg": "already recording"}
     os.makedirs(REC_DIR, exist_ok=True)
     name = time.strftime("take_%Y%m%d_%H%M%S")
+    # one branch per camera, all in ONE pipeline (shared clock - see the header)
+    branches = []
     for cam, c in CAMS.items():
         f = os.path.join(REC_DIR, f"{name}_cam{cam}.mkv")
-        pipeline = (f"gst-launch-1.0 -e v4l2src device={c['main']} io-mode=dmabuf ! "
-                    f"video/x-raw,format=NV12,width=3840,height=2160 ! videorate ! "
-                    f"video/x-raw,framerate=30/1 ! "
-                    f"queue max-size-buffers=8 max-size-time=0 max-size-bytes=0 ! "
-                    f"mpph265enc rc-mode=cbr bps={BITRATE} bps-max={BITRATE * 3 // 2} "
-                    f"rotation={ROTATION} ! "
-                    f"h265parse ! matroskamux ! filesink location={f}")
-        log = open(f"/tmp/rec_cam{cam}.log", "w")
-        _state["rec"][cam] = subprocess.Popen(pipeline, shell=True, stdout=log,
-                                              stderr=log, preexec_fn=os.setsid)
+        branches.append(
+            f"v4l2src name=src{cam} device={c['main']} io-mode=dmabuf ! "
+            f"video/x-raw,format=NV12,width=3840,height=2160 ! "
+            f"videorate skip-to-first=true ! video/x-raw,framerate=30/1 ! "
+            f"queue max-size-buffers=8 max-size-time=0 max-size-bytes=0 ! "
+            f"mpph265enc name=enc{cam} rc-mode=cbr bps={BITRATE} "
+            f"bps-max={BITRATE * 3 // 2} rotation={ROTATION} ! "
+            f"h265parse ! taginject tags=comment={SYNC_TAG} ! "
+            f"matroskamux offset-to-zero=false ! filesink location={f}")
+    pipeline = "gst-launch-1.0 -e " + "  ".join(branches)
+    log = open("/tmp/rec.log", "w")
+    _state["rec"]["pair"] = subprocess.Popen(pipeline, shell=True, stdout=log,
+                                             stderr=log, preexec_fn=os.setsid)
     _state["rec_name"] = name
     _state["rec_started"] = time.time()
 
@@ -282,16 +295,17 @@ def start_recording():
     # catch it and say why, rather than listing empty takes
     time.sleep(2)
     dead = []
-    for cam, p in _state["rec"].items():
+    for p in _state["rec"].values():
         if p.poll() is not None:
             tail = ""
             try:
-                with open(f"/tmp/rec_cam{cam}.log") as fh:
+                with open("/tmp/rec.log") as fh:
                     lines = [ln for ln in fh.read().splitlines() if ln.strip()]
                 tail = " | ".join(lines[-3:])
             except OSError:
                 pass
-            dead.append(f"cam{cam} pipeline died: {tail[:300]}")
+            # element names (src0/enc1/...) in the error say which camera
+            dead.append(f"recording pipeline died: {tail[:300]}")
     if dead:
         for cam, p in _state["rec"].items():
             if p.poll() is None:
@@ -313,12 +327,12 @@ def stop_recording():
         if p.poll() is None:
             os.killpg(os.getpgid(p.pid), signal.SIGINT)   # gst -e: EOS + finalize
     warn = []
-    for cam, p in _state["rec"].items():
+    for p in _state["rec"].values():
         try:
             p.wait(timeout=20)
         except subprocess.TimeoutExpired:
             os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-            warn.append(f"cam{cam} force-stopped")
+            warn.append("force-stopped (files may be unfinalized - see /tmp/rec.log)")
     name = _state["rec_name"]
     _state["rec"] = {}
     _state["rec_name"] = None
