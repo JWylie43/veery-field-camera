@@ -11,7 +11,53 @@ all lose by design; full autopsy in `../../ROCK5T_CAMERA.md`, bring-up log
 df6b0ec). Building the driver in — exactly like every in-tree Rockchip
 sensor — makes the problem not exist.
 
-## Build + install (on the Rock, ~1–2 h)
+## What defines the kernel (all in this repo)
+
+| Piece | Where |
+|---|---|
+| Radxa kernel source, pinned to one commit | `KERNEL_COMMIT` in `build-kernel-docker.sh` (`34337a9c76fd`, branch `linux-6.1-stan-rkr4.1`, 6.1.84) |
+| The IMX477 driver | `../driver/imx477.c`, added by `inject-driver.sh` |
+| Kernel settings | `kernel.config` — the Rock's own config + `CONFIG_VIDEO_IMX477=y` + release suffix `-8-rk2410-imx477` |
+
+Built kernels are published as **GitHub Releases** (`kernel-N`, with the two
+`.deb` files attached), not committed - so nobody has to rebuild to install.
+
+## Install a released kernel (no build)
+
+On the Mac, download the two `.deb` files from the repo's Releases page
+(e.g. `kernel-6`), or with the GitHub CLI:
+
+```
+gh release download kernel-6 --repo JWylie43/veery-field-camera --dir ~/Desktop/veery-kernel-6
+scp ~/Desktop/veery-kernel-6/*.deb veery:~/
+```
+
+Then on the Rock:
+
+```
+sudo dpkg -i ~/linux-image-*-imx477-6_arm64.deb ~/linux-headers-*-imx477-6_arm64.deb
+sudo u-boot-update && sudo reboot
+```
+
+Check with `uname -v` (build number) and `cat /sys/module/imx477/parameters/genlock` (`Y`).
+
+## Build on any machine (Docker) - recommended
+
+Mac (Apple Silicon or Intel), Linux (arm64 or x86-64), or Windows with
+Docker Desktop. Nothing to install but Docker:
+
+```
+cd rock5t-camera/kernel-build
+REV=7 ./build-kernel-docker.sh        # bump REV every build
+```
+
+The packages land in `kernel-build/out/` (ignored by git). The first build
+takes ~30-60 min (the whole kernel and its modules); the source and objects
+are kept in the Docker volume `veery-kernel-src`, so a rebuild after a
+driver change takes minutes. On arm64 hosts it builds natively; on x86-64 it
+cross-compiles. `docker volume rm veery-kernel-src` frees the space (~15 GB).
+
+## Build + install on the Rock (~1–2 h)
 
 ```
 cd ~/veery-field-camera/rock5t-camera/kernel-build
@@ -20,11 +66,27 @@ cd ~/veery-field-camera/rock5t-camera/kernel-build
 sudo reboot
 ```
 
+This one takes its settings from the running kernel instead of
+`kernel.config`, so run it from the stock kernel, or prefer the Docker build.
+
 The new kernel installs alongside the stock one (release string suffix
 `-imx477`); the stock kernel remains in the u-boot menu as a fallback.
 No reflash. Use the normal full-enable boot overlay
 (`../overlay/rock-5t-dual-rpi-hq-imx477.dts`) — rebuild it and the boot
 dtbo installs unchanged.
+
+## Publishing a new kernel release
+
+After building and testing a new revision N on the Rock:
+
+```
+gh release create kernel-N rock5t-camera/kernel-build/out/linux-image-*-imx477-N_arm64.deb \
+    rock5t-camera/kernel-build/out/linux-headers-*-imx477-N_arm64.deb \
+    --title "Kernel N" --notes "what changed in the driver"
+```
+
+(or on github.com: Releases → Draft a new release → tag `kernel-N` → attach
+the two `.deb` files → Publish).
 
 ## After the new kernel boots
 

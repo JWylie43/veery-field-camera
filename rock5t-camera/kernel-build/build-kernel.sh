@@ -9,7 +9,9 @@
 # in-tree Rockchip sensor — makes the whole runtime-workaround stack
 # (split overlay, rk_cam_defer_enable, modules-load ordering) unnecessary.
 #
-# Run ON the Rock (native aarch64 build, ~1-2h):
+# Run ON the Rock (native aarch64 build, ~1-2h). To build on any other machine
+# (Mac, Linux, Windows) use build-kernel-docker.sh instead - same kernel.
+#
 #   ./build-kernel.sh            # clone + patch + build
 #   ./build-kernel.sh install    # dpkg -i the built debs + u-boot-update
 #
@@ -53,18 +55,8 @@ if [ "$SRCVER" != "$RUNBASE" ]; then
 fi
 
 # --- inject the driver ------------------------------------------------------
-cp "$REPO_DIR/driver/imx477.c" drivers/media/i2c/imx477.c
-
-if ! grep -q "CONFIG_VIDEO_IMX477" drivers/media/i2c/Makefile; then
-    sed -i '/obj-$(CONFIG_VIDEO_IMX415) += imx415.o/a obj-$(CONFIG_VIDEO_IMX477) += imx477.o' \
-        drivers/media/i2c/Makefile
-fi
-
-if ! grep -q "config VIDEO_IMX477" drivers/media/i2c/Kconfig; then
-    # insert right before the VIDEO_IMX415 entry, mirroring its shape
-    sed -i '/^config VIDEO_IMX415$/i config VIDEO_IMX477\n\ttristate "Sony IMX477 sensor support"\n\tdepends on I2C \&\& VIDEO_DEV\n\tdepends on MEDIA_CAMERA_SUPPORT\n\tselect MEDIA_CONTROLLER\n\tselect VIDEO_V4L2_SUBDEV_API\n\thelp\n\t  This is a Video4Linux2 sensor driver for the Sony\n\t  IMX477 camera (Raspberry Pi HQ Camera), with Rockchip\n\t  RKMODULE support and XVS trigger-mode genlock.\n' \
-        drivers/media/i2c/Kconfig
-fi
+# (shared with build-kernel-docker.sh, so both build the same kernel)
+"$REPO_DIR/kernel-build/inject-driver.sh" "$(pwd)" "$REPO_DIR/driver"
 
 # commit the injected driver so setlocalversion doesn't append a '+' (dirty tree)
 git add -A && git -c user.email=build@local -c user.name=build commit -q -m "imx477 in-tree" || true

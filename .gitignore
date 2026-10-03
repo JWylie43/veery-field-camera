@@ -33,6 +33,7 @@ stitching/pipeline_out/
 # Kernel build tree (rock5t-camera/kernel-build/build-kernel.sh clones into it)
 rock5t-camera/kernel-build/linux*/
 rock5t-camera/kernel-build/*.deb
+rock5t-camera/kernel-build/out/
 
 # Editor / OS
 .vscode/
