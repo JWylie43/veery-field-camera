@@ -24,6 +24,9 @@ and the sensor mode + bitrate are fixed at the rig's target (4K30, 28 Mbit).
 One less thing to get wrong at a game; change the tuning, not the panel.
 
 Design rules (each learned the hard way on this vendor stack):
+  - Every job is ONE gst process with a branch per camera: previews, recording,
+    snapshots. The jobs stay separate processes because their lifecycles
+    differ (a running gst-launch cannot gain or lose branches).
   - Previews (both cams) run CONTINUOUSLY on the ISP selfpath at 1920x1080/5fps
     and are NEVER stopped or restarted - pipeline churn has locked this board
     up. Their crop selection is reset at start (stale-crop gotcha).
@@ -235,6 +238,12 @@ def usb_targets():
 # ----------------------------------------------------------------- previews
 
 def start_previews():
+    # ONE process, a branch per camera - same shape as recording and snapshots.
+    # It stays separate from those because its lifecycle differs: previews start
+    # once and run for the life of the panel, while a running gst-launch cannot
+    # gain or lose branches, so sharing a process with recording would restart
+    # the previews on every Start/Stop.
+    branches = []
     for cam, c in CAMS.items():
         sh(f"v4l2-ctl -d {c['self']} --set-selection "
            f"target=crop,top=0,left=0,width=3840,height=2160")
@@ -242,16 +251,18 @@ def start_previews():
             os.remove(PREV_JPG[cam])
         except FileNotFoundError:
             pass
-        pipeline = (f"gst-launch-1.0 v4l2src device={c['self']} ! "
-                    f"video/x-raw,format=NV12,width=1920,height=1080 ! videorate ! "
-                    f"video/x-raw,framerate=5/1 ! videoflip video-direction={ROTATION} ! "
-                    f"jpegenc quality=80 ! multifilesink location={PREV_JPG[cam]}")
-        log = open(f"/tmp/rec_prev{cam}.log", "w")
-        # own process group: shell=True means Popen's pid is the shell, so only
-        # killpg reaches gst - otherwise previews outlive the server and hold
-        # the selfpath nodes, blacking the next run
-        _state["gst"][cam] = subprocess.Popen(pipeline, shell=True, stdout=log,
-                                              stderr=log, preexec_fn=os.setsid)
+        branches.append(
+            f"v4l2src name=prev{cam} device={c['self']} ! "
+            f"video/x-raw,format=NV12,width=1920,height=1080 ! videorate ! "
+            f"video/x-raw,framerate=5/1 ! videoflip video-direction={ROTATION} ! "
+            f"jpegenc quality=80 ! multifilesink location={PREV_JPG[cam]}")
+    log = open("/tmp/rec_prev.log", "w")
+    # own process group: shell=True means Popen's pid is the shell, so only
+    # killpg reaches gst - otherwise previews outlive the server and hold
+    # the selfpath nodes, blacking the next run
+    _state["gst"]["pair"] = subprocess.Popen("gst-launch-1.0 " + "  ".join(branches),
+                                             shell=True, stdout=log, stderr=log,
+                                             preexec_fn=os.setsid)
 
 
 def stop_previews():
@@ -386,9 +397,10 @@ def genlock_mode():
 def take_snapshot_pair():
     """One full-res still from EACH camera, saved as cam0_NNN.png + cam1_NNN.png.
 
-    Both mainpaths start together and run SNAP_SETTLE_FRAMES frames; the last
-    one is kept. Running them together is what makes this work in sync mode
-    too: a sink camera only produces frames while the source is streaming.
+    ONE process with a branch per camera (same shape as recording): both
+    mainpaths start together and run SNAP_SETTLE_FRAMES frames; the last one
+    is kept. Running them together is what makes this work in sync mode too:
+    a sink camera only produces frames while the source is streaming.
     All or nothing - if either camera fails, neither file is kept, so the
     numbering never drifts out of pairs.
     """
@@ -398,31 +410,31 @@ def take_snapshot_pair():
     pairs = snap_pairs()
     idx = pairs[-1] + 1 if pairs else 0
     raw = {cam: f"/dev/shm/snap_cam{cam}.nv12" for cam in CAMS}
-    procs = {}
+    branches = []
     for cam, c in CAMS.items():
         try:
             os.remove(raw[cam])
         except FileNotFoundError:
             pass
-        # multifilesink with a fixed name overwrites per buffer -> last frame wins
-        pipeline = (f"gst-launch-1.0 v4l2src device={c['main']} "
-                    f"num-buffers={SNAP_SETTLE_FRAMES} ! "
-                    f"video/x-raw,format=NV12,width={SNAP_W},height={SNAP_H} ! "
-                    f"multifilesink location={raw[cam]}")
-        log = open(f"/tmp/snap_cam{cam}.log", "w")
-        procs[cam] = subprocess.Popen(pipeline, shell=True, stdout=log,
-                                      stderr=log, preexec_fn=os.setsid)
+        # multifilesink with a fixed name overwrites per buffer -> last frame wins;
+        # the process exits once BOTH branches have sent their num-buffers
+        branches.append(f"v4l2src name=snap{cam} device={c['main']} "
+                        f"num-buffers={SNAP_SETTLE_FRAMES} ! "
+                        f"video/x-raw,format=NV12,width={SNAP_W},height={SNAP_H} ! "
+                        f"multifilesink location={raw[cam]}")
+    log = open("/tmp/snap.log", "w")
+    proc = subprocess.Popen("gst-launch-1.0 " + "  ".join(branches), shell=True,
+                            stdout=log, stderr=log, preexec_fn=os.setsid)
     errors = []
-    for cam, p in procs.items():
-        try:
-            p.wait(timeout=20)
-        except subprocess.TimeoutExpired:
-            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-            errors.append(f"cam{cam} timed out (sync mode: is cam0 streaming?)")
+    try:
+        proc.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        errors.append("capture timed out (sync mode: is cam0 streaming?) - see /tmp/snap.log")
     frame_bytes = SNAP_W * SNAP_H * 3 // 2
     for cam in CAMS:
         if not os.path.exists(raw[cam]) or os.path.getsize(raw[cam]) != frame_bytes:
-            errors.append(f"cam{cam} gave no full frame - see /tmp/snap_cam{cam}.log")
+            errors.append(f"cam{cam} gave no full frame - see /tmp/snap.log")
     out = {cam: os.path.join(SNAP_DIR, f"cam{cam}_{idx:03d}.png") for cam in CAMS}
     if not errors:
         conv = {cam: subprocess.Popen(
