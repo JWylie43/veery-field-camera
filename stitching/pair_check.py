@@ -68,7 +68,7 @@ def timestamp_offset(cam0, cam1):
     two files' start timestamps - same convention as --pair-offset (<0 skips
     cam0 frames). None for older, untagged takes."""
     for f in (cam0, cam1):
-        if SHARED_CLOCK_TAG not in run(f'ffprobe -v error -show_entries format_tags '
+        if SHARED_CLOCK_TAG not in run(f'ffprobe -v error -show_entries format_tags:stream_tags '
                                        f'-of default=nw=1 "{f}"').stdout:
             return None
 

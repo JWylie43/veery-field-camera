@@ -655,13 +655,15 @@ static bool resolvePairPaths(const string &src, string &L, string &R)
 // by a whole number of frames, and that number IS the offset - read straight off
 // the capture timestamps, no brightness guessing. Untagged (older) takes return
 // false and fall back to estimatePairOffset below. Result is in cam0/cam1 terms.
+// (matroskamux stores taginject's comment on the video TRACK - "COMMENTS" in the
+// stream tags - so both tag levels are searched.)
 static const char *SHARED_CLOCK_TAG = "veery-shared-clock";
 static string runCmd(const string &cmd);
 
 static bool sharedClockOffset(const string &cam0, const string &cam1, int &offset)
 {
     for (const string &f : {cam0, cam1})
-        if (runCmd("ffprobe -v error -show_entries format_tags -of default=nw=1 \""
+        if (runCmd("ffprobe -v error -show_entries format_tags:stream_tags -of default=nw=1 \""
                    + f + "\"").find(SHARED_CLOCK_TAG) == string::npos)
             return false;
     auto probe = [](const string &f, const string &entry) {
