@@ -6,7 +6,7 @@
 // matcher / findHomography anywhere.
 //
 // EVERY input is a PAIR - the rig writes one file per camera and this stitcher has
-// no single-file mode. Pass the _cam0 file and the _cam1 partner is found next to
+// no single-file mode. Pass EITHER file of a pair and its partner is found next to
 // it, or give both explicitly as "cam0path::cam1path". See "dual input" below.
 //
 // The calibration must be FISHEYE (equidistant). The lenses are 110 deg with -16%
@@ -40,7 +40,7 @@
 //   --no-jobs  (or --jobs 1) run everything in this one process - no parallelism.
 //
 // Two-file takes (the recorder writes one file per camera):
-//   --source take_..._cam0.mkv   finds _cam1 automatically and pairs them in memory.
+//   --source take_..._cam0.mkv   (or _cam1.mkv) finds the partner and pairs them in memory.
 //   --pair-offset auto  (DEFAULT) takes the frame offset from the files' capture
 //              timestamps when the recorder tagged them as one shared-clock take
 //              (exact). Otherwise (older takes) it estimates it by
@@ -170,7 +170,18 @@ struct StitchMaps
     // original height and the crop's top offset to reproduce it exactly.
     int fullOH = 0;         // original (uncropped) canvas height; 0 = same as OH
     int cropX = 0, cropY = 0;
+    // Rotate-then-crop (see viewMaps): when set, composite() stitches this map region
+    // and then applies `view` (a 2x3 output->stitched affine, WARP_INVERSE_MAP) to
+    // produce the outW x outH output. Empty view = the stitched region IS the output.
+    Mat view;
+    int outW = 0, outH = 0;
 };
+
+// Output frame size: the rotate+crop view when there is one, else the map region.
+static Size outSize(const StitchMaps &m)
+{
+    return m.view.empty() ? Size(m.OW, m.OH) : Size(m.outW, m.outH);
+}
 
 // Right-image alignment (per-row horizontal shear + vertical shift) + seam blend.
 struct Align
@@ -378,6 +389,60 @@ static StitchMaps cropMaps(const StitchMaps &m, int cx, int cy, int cw, int ch)
     return c;
 }
 
+// The output view: ROTATE the whole panorama, THEN crop - exactly what the tuner
+// preview draws (it rotates the full canvas about its centre and lays the crop box
+// over the result). Positive degrees = clockwise as shown.
+//
+// Rotating after a crop would pull empty space into the box's corners, and padding
+// the crop is a guess that fails at larger angles. Instead the box's four corners
+// are mapped back through the rotation, which gives the EXACT region of the
+// un-rotated panorama that lands inside the box, at any angle. Only that region is
+// stitched (seam, blend, shear and exposure work as for any crop), and one affine
+// then rotates it and cuts the box out at its exact size. No crop = the whole
+// canvas is the box. No rotation = a plain crop, as before.
+//
+// The cam1 shear/shift (Align) moves cam1's picture by up to max(|top|,|bottom|)
+// px sideways and |shiftY| px vertically, so a box edge can need cam1 picture
+// from just OUTSIDE the box - rendering only the box left a black strip there
+// (e.g. shift -40 -> up to 40 px at the right edge). The region is widened by
+// exactly those amounts, so it holds for any shear.
+static StitchMaps viewMaps(const StitchMaps &full, int cx, int cy, int cw, int ch,
+                           double degrees, const Align &a)
+{
+    if (cw <= 0 || ch <= 0) { cx = 0; cy = 0; cw = full.OW; ch = full.OH; }
+    int mx = (int)ceil(max(fabs(a.shiftTop), fabs(a.shiftBottom)));
+    int my = (int)ceil(fabs(a.shiftY));
+    bool wholeBox = (cx == 0 && cy == 0 && cw == full.OW && ch == full.OH);
+    if (degrees == 0.0 && (wholeBox || (mx == 0 && my == 0)))
+        return wholeBox ? full : cropMaps(full, cx, cy, cw, ch);
+    double ph = degrees * CV_PI / 180.0, c = cos(ph), s = sin(ph);
+    double CX = full.OW / 2.0, CY = full.OH / 2.0;
+    // output point P (full-canvas coords) shows un-rotated point C + A(P - C),
+    // A = [c s; -s c] - the inverse of a clockwise (canvas y-down) rotation
+    auto src = [&](double px, double py) {
+        return Point2d(CX + c * (px - CX) + s * (py - CY), CY - s * (px - CX) + c * (py - CY));
+    };
+    double x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+    for (Point2d P : {Point2d(cx, cy), Point2d(cx + cw, cy), Point2d(cx, cy + ch),
+                      Point2d(cx + cw, cy + ch)})
+    {
+        Point2d q = src(P.x, P.y);
+        x0 = min(x0, q.x); y0 = min(y0, q.y); x1 = max(x1, q.x); y1 = max(y1, q.y);
+    }
+    // + the shear/shift margin, +2 px so bilinear sampling at the edge has its
+    // neighbours; clamp to the canvas
+    int bx = max(0, (int)floor(x0) - 2 - mx), by = max(0, (int)floor(y0) - 2 - my);
+    int bx1 = min(full.OW, (int)ceil(x1) + 2 + mx), by1 = min(full.OH, (int)ceil(y1) + 2 + my);
+    if (bx1 <= bx) { bx = 0; bx1 = full.OW; }   // box rotated wholly off-canvas: render it
+    if (by1 <= by) { by = 0; by1 = full.OH; }   // (black) rather than fail
+    StitchMaps v = cropMaps(full, bx, by, bx1 - bx, by1 - by);
+    // output pixel (u,v) -> stitched-region pixel: src(cx+u, cy+v) - (bx, by)
+    Point2d o = src(cx, cy);
+    v.view = (Mat_<double>(2, 3) << c, s, o.x - bx, -s, c, o.y - by);
+    v.outW = cw; v.outH = ch;
+    return v;
+}
+
 static void warpHalves(const UMat &frame, const StitchMaps &m, UMat &warpL, UMat &warpR)
 {
     int w = frame.cols / 2, h = frame.rows;
@@ -525,7 +590,7 @@ static void exposureMatch(const UMat &warpL, UMat &right, int seam, int OW, int 
 }
 
 static UMat composite(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
-                      double degrees, const Align &a, vector<int> *prevSeam = nullptr)
+                      const Align &a, vector<int> *prevSeam = nullptr)
 {
     UMat right = warpR;
     if (a.shiftTop != 0.0 || a.shiftBottom != 0.0 || a.shiftY != 0.0)
@@ -561,13 +626,12 @@ static UMat composite(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
         pano = right.clone();
         warpL.copyTo(pano, mask8);          // left where mask, right elsewhere
     }
-    if (degrees != 0.0)
+    if (!m.view.empty())                    // rotate, then crop (see viewMaps)
     {
-        double ang = degrees * CV_PI / 180.0;
-        double c = cos(ang), s = sin(ang), ccx = m.OW / 2.0, ccy = m.OH / 2.0;
-        Mat M = (Mat_<double>(2, 3) << c, s, (1 - c) * ccx - s * ccy,
-                 -s, c, s * ccx + (1 - c) * ccy);
-        warpAffine(pano, pano, M, Size(m.OW, m.OH));
+        UMat out;
+        warpAffine(pano, out, m.view, outSize(m), INTER_LINEAR | WARP_INVERSE_MAP,
+                   BORDER_CONSTANT, Scalar());
+        return out;
     }
     return pano;
 }
@@ -584,7 +648,8 @@ static UMat composite(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
 //
 // Pairing is driven by the FILENAME so that --jobs children and the tuner
 // inherit it with no extra plumbing:
-//     --source take_..._cam0.mkv       ->  also opens take_..._cam1.mkv
+//     --source take_..._cam0.mkv       ->  also opens take_..._cam1.mkv (either half works;
+//                                          so do the /calib page's cam0_NNN / cam1_NNN)
 //     --source "a.mkv::b.mkv"          (explicit, any names)
 // A source that resolves to neither is an ERROR: this stitcher has no
 // single-file mode. Every input is a pair.
@@ -607,6 +672,32 @@ static bool g_swapLR = false;
 // g_pairOffset as the L/R streams see it (it is stored in cam0/cam1 terms)
 static int pairOffsetLR() { return g_swapLR ? -g_pairOffset : g_pairOffset; }
 
+// cam0 + cam1 file names for either half of a pair, in the two naming styles the
+// rig produces: the recorder's take_..._cam0.mkv / take_..._cam1.mkv, and the
+// /calib page's cam0_NNN.png / cam1_NNN.png. False if src is neither.
+static bool pairNames(const string &src, string &c0, string &c1)
+{
+    for (const char *tag : {"_cam0.", "_cam1."})
+    {
+        size_t c = src.rfind(tag);
+        if (c != string::npos)
+        {
+            string pre = src.substr(0, c), post = src.substr(c + 6);
+            c0 = pre + "_cam0." + post; c1 = pre + "_cam1." + post;
+            return true;
+        }
+    }
+    size_t slash = src.find_last_of("/\\");
+    size_t b = slash == string::npos ? 0 : slash + 1;
+    if (src.compare(b, 5, "cam0_") == 0 || src.compare(b, 5, "cam1_") == 0)
+    {
+        string dir = src.substr(0, b), rest = src.substr(b + 5);
+        c0 = dir + "cam0_" + rest; c1 = dir + "cam1_" + rest;
+        return true;
+    }
+    return false;
+}
+
 static bool resolvePairPaths(const string &src, string &L, string &R)
 {
     size_t d = src.find("::");
@@ -616,22 +707,22 @@ static bool resolvePairPaths(const string &src, string &L, string &R)
         if (g_swapLR) std::swap(L, R);
         return true;
     }
-    size_t c = src.rfind("_cam0.");
-    if (c != string::npos)
+    string c0, c1;
+    if (pairNames(src, c0, c1))
     {
-        L = src;
-        R = src.substr(0, c) + "_cam1." + src.substr(c + 6);
-        if (std::filesystem::exists(R)) { if (g_swapLR) std::swap(L, R); return true; }
-        cerr << "ERROR: " << src << " looks like a cam0 file but its partner\n"
-             << "       " << R << " does not exist.\n";
+        bool h0 = std::filesystem::exists(c0), h1 = std::filesystem::exists(c1);
+        if (h0 && h1) { L = c0; R = c1; if (g_swapLR) std::swap(L, R); return true; }
+        cerr << "ERROR: " << src << " is one half of a pair but its partner\n"
+             << "       " << (h0 ? c1 : c0) << " does not exist.\n";
         L.clear(); R.clear();
         return false;
     }
     cerr << "ERROR: cannot pair '" << src << "'.\n"
          << "       This rig records one file per camera and the stitcher needs "
          << "both. Pass\n"
-         << "       a *_cam0.* file (its _cam1 partner is found automatically) "
-         << "or an explicit\n       \"cam0path::cam1path\".\n";
+         << "       either file of a pair (take_..._cam0.mkv / _cam1.mkv, or the /calib\n"
+         << "       page's cam0_NNN.png / cam1_NNN.png - the partner is found next to\n"
+         << "       it) or an explicit \"cam0path::cam1path\".\n";
     L.clear(); R.clear();
     return false;
 }
@@ -878,7 +969,7 @@ static Mat readPairedImage(const string &source)
     Mat out; hconcat(fa, fb, out); return out;
 }
 
-static string stitchImageFile(const string &source, StitchMaps &m, double degrees,
+static string stitchImageFile(const string &source, StitchMaps &m,
                               const Align &a, const string &outDir, const string &outFile = "")
 {
     Mat img = readPairedImage(source);
@@ -886,7 +977,7 @@ static string stitchImageFile(const string &source, StitchMaps &m, double degree
     UMat uImg, wL, wR;
     img.copyTo(uImg);
     warpHalves(uImg, m, wL, wR);
-    UMat uPano = composite(wL, wR, m, degrees, a);
+    UMat uPano = composite(wL, wR, m, a);
     Mat pano; uPano.copyTo(pano);
     string out = !outFile.empty() ? outFile : (outDir + "/pano.jpg");
     imwrite(out, pano);
@@ -976,7 +1067,7 @@ static string buildEncodeCmd(const string &venc, int W, int H, double fps, const
     return c.str();
 }
 
-static string stitchVideoFile(const string &source, StitchMaps &m, double degrees,
+static string stitchVideoFile(const string &source, StitchMaps &m,
                               const Align &a, int startFrame, int endFrame, int totalFrames,
                               const string &outDir, const string &outFile = "",
                               std::atomic<int> *prog = nullptr, const string &progFile = "")
@@ -992,25 +1083,26 @@ static string stitchVideoFile(const string &source, StitchMaps &m, double degree
     string out = !outFile.empty() ? outFile : (outDir + "/stitched_video.mp4");
 
     // Encode via an ffmpeg pipe (hardware HEVC when available, else libx264). ffmpeg
-    // is already required for the default --jobs concat and audio-attach. If it isn't
+    // is already required for the default --jobs concat. If it isn't
     // on PATH we fall back to OpenCV's own H.264 writer (avc1) so a bare install still
     // stitches - on macOS that path is itself VideoToolbox-backed.
-    string venc = chooseVideoEncoder(m.OW, m.OH);
+    Size osz = outSize(m);
+    string venc = chooseVideoEncoder(osz.width, osz.height);
     bool useFfmpeg = ffmpegAvailable();
     FILE *pipe = nullptr;
     VideoWriter writer;
     if (useFfmpeg)
     {
         cout << "encoder: " << venc << " (ffmpeg pipe, "
-             << resolveBitrate(venc, m.OW, m.OH, fps)
+             << resolveBitrate(venc, osz.width, osz.height, fps)
              << (g_vbitrate == "auto" ? " auto" : "") << ")\n";
-        pipe = popen(buildEncodeCmd(venc, m.OW, m.OH, fps, out).c_str(), PIPE_WMODE);
+        pipe = popen(buildEncodeCmd(venc, osz.width, osz.height, fps, out).c_str(), PIPE_WMODE);
         if (!pipe) useFfmpeg = false;   // couldn't spawn - fall back below
     }
     if (!useFfmpeg)
     {
         cout << "encoder: OpenCV avc1 (ffmpeg unavailable - using built-in writer)\n";
-        writer.open(out, VideoWriter::fourcc('a', 'v', 'c', '1'), fps, Size(m.OW, m.OH));
+        writer.open(out, VideoWriter::fourcc('a', 'v', 'c', '1'), fps, osz);
         if (!writer.isOpened()) return "ERROR: cannot open output video";
     }
 
@@ -1024,7 +1116,7 @@ static string stitchVideoFile(const string &source, StitchMaps &m, double degree
         if (!cap.read(frame) || frame.empty()) break;   // also stops at EOF
         frame.copyTo(uFrame);
         warpHalves(uFrame, m, wL, wR);
-        composite(wL, wR, m, degrees, a, &prevSeam).copyTo(pano);
+        composite(wL, wR, m, a, &prevSeam).copyTo(pano);
         if (pipe)
         {
             if (pano.type() != CV_8UC3) pano.convertTo(pano, CV_8UC3);
@@ -1112,23 +1204,16 @@ static string tunerHtml()
 </style></head><body>
 <div id="bar">
   <div class="grp"><button id="import">Import source…</button><input class="path" id="srcpath" type="text" readonly placeholder="no file loaded"></div>
-  <div class="grp">Output <input class="path" id="outpath" type="text" readonly placeholder="chosen when you click Stitch"></div>
+  <div class="grp">Output <input class="path" id="outpath" type="text" readonly placeholder="not chosen yet"><button id="chooseout">Choose…</button></div>
   <div class="grp">Shift far (top) <button id="tl">&#9664;</button><input class="val" id="tv" type="number" value="0"><button id="tr">&#9654;</button></div>
   <div class="grp">Shift near (bottom) <button id="bl">&#9664;</button><input class="val" id="bv" type="number" value="0"><button id="br">&#9654;</button></div>
-  <div class="grp">Seam <input class="val" id="mv" type="number" value="0"><button id="mc">reset</button> <span class="hint">or drag the red line</span></div>
   <div class="grp">Rotate&deg; <button id="rl">&#9664;</button><input class="val" id="rot" type="number" value="0" step="0.5"><button id="rr">&#9654;</button></div>
-  <div class="grp"><label><input type="checkbox" id="showseam" checked> show seam line</label></div>
-  <!-- Hidden for now (smart seam, multi-band blend, and exposure match are on by default):
-  <div class="grp">Shift-y <button id="yl">&#9664;</button><input class="val" id="yv" type="number" value="0"><button id="yr">&#9654;</button></div>
-  <div class="grp">Seam <button id="ml">&#9664;</button><input class="val" id="mv" type="number" value="0"><button id="mr">&#9654;</button></div>
-  <div class="grp"><label><input type="checkbox" id="mb" checked> multi-band blend</label></div>
-  <div class="grp"><label><input type="checkbox" id="xc" checked> exposure/color match</label></div>
-  <div class="grp"><label><input type="checkbox" id="ss" checked> seam avoidance (moving objects)</label></div>
-  -->
-  <div class="grp" id="framegrp">Frame <button id="fprev">&#9664;</button><input type="range" id="frange" min="0" value="0" style="vertical-align:middle;width:140px"><input class="val" id="fval" type="number" value="0"><span id="ftot" style="color:#9cf">/ ?</span><button id="fnext">&#9654;</button></div>
+  <div class="grp"><label><input type="checkbox" id="showseam" checked> show seam line</label>
+                   <label><input type="checkbox" id="crop" checked> crop to box</label> <span class="hint" id="cropdim"></span></div>
   <div class="grp"><label><input type="checkbox" id="blend"> overlap blend</label></div>
-  <div class="grp"><label><input type="checkbox" id="crop" checked> crop to box</label> <span class="hint" id="cropdim"></span></div>
-  <div class="grp"><label><input type="checkbox" id="withaudio" checked> attach audio after stitch</label> <span class="hint">if a .sync.json sidecar is found</span></div>
+  <!-- Fixed defaults, not exposed: shift-y 0, seam at the middle of the overlap,
+       smart seam (routes around moving objects), 6-band blend, exposure match. -->
+  <div class="grp" id="framegrp">Frame <button id="fprev">&#9664;</button><input type="range" id="frange" min="0" value="0" style="vertical-align:middle;width:140px"><input class="val" id="fval" type="number" value="0"><span id="ftot" style="color:#9cf">/ ?</span><button id="fnext">&#9654;</button></div>
   <button id="stitch" disabled>Stitch all frames</button>
   <button id="quit">Quit</button>
   <span class="hint">&#8592;/&#8594; shift both</span>
@@ -1141,21 +1226,19 @@ static string tunerHtml()
 </div>
 <div id="parts" style="padding:0 10px 10px;display:none;font-size:.9em;line-height:1.7"></div>
 <div id="cmdwrap" style="display:none;padding:0 10px 10px">
-  <div style="font-size:.8em;color:#9cf;margin-bottom:4px">Equivalent CLI command (click to select, then copy):</div>
+  <div style="font-size:.8em;color:#9cf;margin-bottom:4px">Equivalent CLI command for these settings (click to select, then copy):</div>
   <textarea id="cmdbox" readonly onclick="this.select()" style="width:100%;height:64px;font-family:monospace;font-size:.78em;background:#111;color:#dfe;border:1px solid #444;border-radius:6px;padding:6px;box-sizing:border-box"></textarea>
 </div>
 <div id="wrap"><canvas id="c"></canvas></div>
 <script>
 // Dynamic state — filled in by /state (on load) or /import (button).
-let OW=0, OH=0, SEAM0=0, OX0=0, OX1=0, TOTAL=1, VIDEO=false, loaded=false;
+let OW=0, OH=0, SEAM0=0, TOTAL=1, VIDEO=false, loaded=false;
 const cv=document.getElementById('c'), ctx=cv.getContext('2d');
-// Clamp the seam into the valid overlap band [OX0,OX1) (both cameras present there).
-const clampSeam=v=>{ const lo=OX0||0, hi=OX1||OW; return Math.max(lo,Math.min(hi,Math.round(v))); };
 const stepv=()=>{ return 1; };   // arrows nudge by 1
 const st=t=>{ document.getElementById('status').textContent=t; };
 const tv=document.getElementById('tv'), bv=document.getElementById('bv');
 const stitchBtn=document.getElementById('stitch');
-let sTop=0, sBot=0, sY=0, seam=0, pending=0;   // sY fixed; seam set by the draggable bar
+let sTop=0, sBot=0, sY=0, seam=0, pending=0;   // sY fixed; seam fixed at the middle of the overlap
 let rot=0, showSeam=true;   // rot = whole-panorama rotation (deg); showSeam toggles the red line
 const clmp=(v,lo,hi)=>{ return Math.max(lo,Math.min(hi,v)); };
 // Crop box (in OW/OH panorama coords). cropOn toggles it; drag body to move,
@@ -1170,7 +1253,7 @@ function drawRight(){
 }
 function render(){
   if(!loaded) return;
-  sTop=+tv.value||0; sBot=+bv.value||0;   // sY stays fixed; seam comes from the drag/number box
+  sTop=+tv.value||0; sBot=+bv.value||0;   // sY and the seam stay fixed
   ctx.setTransform(1,0,0,1,0,0); ctx.globalAlpha=1; ctx.clearRect(0,0,OW,OH);
   // Preview the whole-panorama rotation the same way the engine does: rotate about the
   // canvas centre. The crop box stays axis-aligned (drawn after we restore).
@@ -1185,8 +1268,6 @@ function render(){
   if(showSeam){
     ctx.strokeStyle='#f33'; ctx.lineWidth=2;
     ctx.beginPath(); ctx.moveTo(seam,0); ctx.lineTo(seam,OH); ctx.stroke();
-    // Grab handle at mid-height so the seam line reads as draggable (hidden while cropping).
-    if(!cropOn){ const hh=Math.max(16,OH*0.03); ctx.fillStyle='#f33'; ctx.fillRect(seam-hh/2,OH/2-hh,hh,2*hh); }
   }
   ctx.restore();
   if(cropOn) drawCrop();
@@ -1208,19 +1289,14 @@ function drawCrop(){
   ctx.restore();
   document.getElementById('cropdim').textContent=Math.round(cropW)+'x'+Math.round(cropH);
 }
-const nudge=(el,d)=>{ el.value=(+el.value||0)+d; render(); };
+const nudge=(el,d)=>{ el.value=(+el.value||0)+d; changed(); };
 tl.onclick=()=>{ nudge(tv,-stepv()); }; tr.onclick=()=>{ nudge(tv,stepv()); };
 bl.onclick=()=>{ nudge(bv,-stepv()); }; br.onclick=()=>{ nudge(bv,stepv()); };
-[tv,bv].forEach(el=>{ el.oninput=render; });
-// Seam number box + reset (mirror the draggable red bar).
-const mv=document.getElementById('mv');
-if(mv){ mv.oninput=()=>{ seam=clampSeam(+mv.value||0); render(); }; }
-const mc=document.getElementById('mc');
-if(mc){ mc.onclick=()=>{ seam=SEAM0; if(mv) mv.value=seam; render(); }; }
+[tv,bv].forEach(el=>{ el.oninput=changed; });
 // Whole-panorama rotation (levels a tilted field) + show/hide the red seam line.
 const rotEl=document.getElementById('rot');
-const setRot=v=>{ rot=Math.round(v*10)/10; if(rotEl) rotEl.value=rot; render(); };
-if(rotEl){ rotEl.oninput=()=>{ rot=+rotEl.value||0; render(); }; }
+const setRot=v=>{ rot=Math.round(v*10)/10; if(rotEl) rotEl.value=rot; changed(); };
+if(rotEl){ rotEl.oninput=()=>{ rot=+rotEl.value||0; changed(); }; }
 const rlb=document.getElementById('rl'), rrb=document.getElementById('rr');
 if(rlb){ rlb.onclick=()=>{ setRot((+rotEl.value||0)-0.5); }; }
 if(rrb){ rrb.onclick=()=>{ setRot((+rotEl.value||0)+0.5); }; }
@@ -1230,12 +1306,8 @@ document.getElementById('blend').onchange=render;
 // Crop box: drag body to move, drag the yellow corner handles to resize.
 const toCanvas=(e)=>{ return { x: e.offsetX * OW / cv.clientWidth, y: e.offsetY * OH / cv.clientHeight }; };
 cv.onmousedown=(e)=>{
-  if(!loaded) return;
+  if(!loaded || !cropOn) return;
   const p=toCanvas(e);
-  if(!cropOn){   // not cropping -> grab the red seam line if we're near it
-    if(Math.abs(p.x-seam)<Math.max(14, OW*0.012)){ dragMode='seam'; dragStart=p; e.preventDefault(); }
-    return;
-  }
   const hs=Math.max(14, OW*0.016);
   const nBR=Math.abs(p.x-(cropX+cropW))<hs && Math.abs(p.y-(cropY+cropH))<hs;
   const nTL=Math.abs(p.x-cropX)<hs && Math.abs(p.y-cropY)<hs;
@@ -1245,14 +1317,10 @@ cv.onmousedown=(e)=>{
   if(dragMode){ dragStart=p; cropStart={x:cropX,y:cropY,w:cropW,h:cropH}; e.preventDefault(); }
 };
 cv.onmousemove=(e)=>{
+  if(!dragMode) return;
   const p=toCanvas(e);
-  if(!dragMode){   // hover feedback: show a resize cursor when over the draggable seam line
-    if(loaded && !cropOn){ cv.style.cursor=(Math.abs(p.x-seam)<Math.max(14,OW*0.012))?'ew-resize':'default'; }
-    return;
-  }
   const dx=p.x-dragStart.x, dy=p.y-dragStart.y;
-  if(dragMode==='seam'){ seam=clampSeam(p.x); const mv=document.getElementById('mv'); if(mv) mv.value=seam; }
-  else if(dragMode==='move'){ cropX=clmp(cropStart.x+dx,0,OW-cropW); cropY=clmp(cropStart.y+dy,0,OH-cropH); }
+  if(dragMode==='move'){ cropX=clmp(cropStart.x+dx,0,OW-cropW); cropY=clmp(cropStart.y+dy,0,OH-cropH); }
   else if(dragMode==='br'){ cropW=clmp(cropStart.w+dx,20,OW-cropX); cropH=clmp(cropStart.h+dy,20,OH-cropY); }
   else if(dragMode==='tl'){
     const nx=clmp(cropStart.x+dx,0,cropStart.x+cropStart.w-20), ny=clmp(cropStart.y+dy,0,cropStart.y+cropStart.h-20);
@@ -1260,17 +1328,17 @@ cv.onmousemove=(e)=>{
   }
   render();
 };
-addEventListener('mouseup',()=>{ dragMode=null; });
+addEventListener('mouseup',()=>{ if(dragMode){ dragMode=null; showCmd(); } });
 document.getElementById('crop').onchange=(e)=>{
   cropOn=e.target.checked;
   if(!cropOn) document.getElementById('cropdim').textContent='';
-  render();
+  changed();
 };
 addEventListener('keydown',e=>{
   if(e.target.tagName==='INPUT') return;      // let typing in the boxes work normally
   const d=stepv();
-  if(e.key==='ArrowLeft'){tv.value=(+tv.value||0)-d; bv.value=(+bv.value||0)-d; render(); e.preventDefault();}
-  else if(e.key==='ArrowRight'){tv.value=(+tv.value||0)+d; bv.value=(+bv.value||0)+d; render(); e.preventDefault();}
+  if(e.key==='ArrowLeft'){tv.value=(+tv.value||0)-d; bv.value=(+bv.value||0)-d; changed(); e.preventDefault();}
+  else if(e.key==='ArrowRight'){tv.value=(+tv.value||0)+d; bv.value=(+bv.value||0)+d; changed(); e.preventDefault();}
 });
 // frame scrubbing (video only)
 const frange=document.getElementById('frange'), fval=document.getElementById('fval');
@@ -1294,13 +1362,11 @@ fval.onchange=()=>{ loadFrame(fval.value); };
 // frame slider, show the first frame, and enable stitching.
 function applyLoad(d){
   loaded=true; OW=d.ow; OH=d.oh; SEAM0=d.seam; TOTAL=d.total; VIDEO=d.video; seam=SEAM0;
-  OX0=(d.ox0!=null?d.ox0:0); OX1=(d.ox1!=null?d.ox1:OW);   // valid overlap band for the seam drag
-  { const mv=document.getElementById('mv'); if(mv){ mv.value=seam; mv.min=OX0; mv.max=OX1; } }
   rot=0; { const r=document.getElementById('rot'); if(r) r.value=0; }   // reset rotation for a new source
   cropW=0;   // re-initialise the crop box to the new frame size on next draw
   cv.width=OW; cv.height=OH;
   document.getElementById('srcpath').value=d.source||'';
-  if(d.output) document.getElementById('outpath').value=d.output;
+  document.getElementById('outpath').value=d.output||'';
   const known=TOTAL>1, FMAX=known?TOTAL-1:100000;
   frange.max=FMAX; frange.value=0; fval.value=0; fval.max=FMAX;
   document.getElementById('ftot').textContent = known ? ('/ '+TOTAL) : '/ ?';
@@ -1308,6 +1374,7 @@ function applyLoad(d){
   stitchBtn.disabled=false;
   pending=2; imgL.src=d.left; imgR.src=d.right;
   st('Loaded. Align the far (top) and near (bottom) edges, then Stitch.');
+  showCmd();
 }
 document.getElementById('import').onclick=async()=>{
   st('Choose an input file…');
@@ -1325,22 +1392,40 @@ document.getElementById('import').onclick=async()=>{
 
 let polling=null;
 const pb=document.getElementById('pb'), pct=document.getElementById('pct');
-// hidden controls fixed to defaults: shift-y 0, smart seam on, 6-band blend, exposure match on
+// fixed defaults: shift-y 0, seam at the middle of the overlap, smart seam, 6-band blend, exposure match
 const params=()=>{
-  let p='shifttop='+(+tv.value||0)+'&shiftbottom='+(+bv.value||0)+'&shifty=0&seam='+Math.round(seam)+'&degrees='+rot+'&bands=6&exposure=1&smartseam=1';
+  let p='shifttop='+(+tv.value||0)+'&shiftbottom='+(+bv.value||0)+'&shifty=0&degrees='+rot+'&bands=6&exposure=1&smartseam=1';
   if(cropOn && cropW>0) p+='&cropx='+Math.round(cropX)+'&cropy='+Math.round(cropY)+'&cropw='+Math.round(cropW)+'&croph='+Math.round(cropH);
-  var wa=document.getElementById('withaudio'); if(wa&&wa.checked) p+='&audio=1';
   return p;
 };
-stitchBtn.onclick=async()=>{
-  if(polling || !loaded) return;
-  // pop the native "save as" dialog to choose the output path + filename
+// Show the equivalent CLI command as soon as an output is chosen, and keep it in
+// step with every change - so a command can be copied without starting a stitch.
+const outEl=document.getElementById('outpath'), cmdWrap=document.getElementById('cmdwrap'), cmdBox=document.getElementById('cmdbox');
+let cmdTimer=null;
+function showCmd(){
+  if(!loaded || !outEl.value){ if(!polling) cmdWrap.style.display='none'; return; }
+  clearTimeout(cmdTimer);
+  cmdTimer=setTimeout(async()=>{
+    try{ const d=await (await fetch('/command?'+params())).json();
+         if(d.cmd){ cmdBox.value=d.cmd; cmdWrap.style.display='block'; } }catch(e){}
+  },250);
+}
+function changed(){ render(); showCmd(); }
+async function chooseOutput(){
   st('Choose where to save the output…');
   let out='';
   try{ out=(await (await fetch('/chooseoutput')).json()).path||''; }
-  catch(e){ st('Could not open save dialog: '+e); return; }
-  if(!out){ st('Save cancelled.'); return; }
-  document.getElementById('outpath').value=out;
+  catch(e){ st('Could not open save dialog: '+e); return ''; }
+  if(!out){ st('Save cancelled.'); return ''; }
+  outEl.value=out; st('Output: '+out); showCmd();
+  return out;
+}
+document.getElementById('chooseout').onclick=()=>{ chooseOutput(); };
+stitchBtn.onclick=async()=>{
+  if(polling || !loaded) return;
+  // use the chosen output, or pop the "save as" dialog now if none was chosen yet
+  const out=outEl.value || await chooseOutput();
+  if(!out) return;
   stitchBtn.disabled=true;
   document.getElementById('prog').style.display='block';
   document.getElementById('finish').style.display='none';
@@ -1383,13 +1468,18 @@ document.getElementById('quit').onclick=async()=>{ try{await fetch('/quit');}cat
     return h.str();
 }
 
+// Value of `key` in a query string, "" if absent. Matches WHOLE keys only: a
+// plain find("seam=") also hits "smartseam=1" and would read the seam as 1.
 static string qparam(const string &query, const string &key)
 {
     string k = key + "=";
-    size_t p = query.find(k);
-    if (p == string::npos) return "";
-    size_t s = p + k.size(), e = query.find('&', s);
-    return query.substr(s, e == string::npos ? string::npos : e - s);
+    for (size_t p = query.find(k); p != string::npos; p = query.find(k, p + 1))
+    {
+        if (p != 0 && query[p - 1] != '&') continue;
+        size_t s = p + k.size(), e = query.find('&', s);
+        return query.substr(s, e == string::npos ? string::npos : e - s);
+    }
+    return "";
 }
 
 // Run a command and capture its stdout (trimmed). Used to drive the OS's
@@ -1496,9 +1586,6 @@ static int runParallelJobs(const string &source, const string &calibDir,
                            const string &cropArg, int startFrame, int endFrame,
                            const string &outFile, int jobs, std::atomic<int> *prog = nullptr,
                            int panoW = 64, int panoH = 64);
-// Forward decl: after a video stitch, optionally mux the recording's audio in.
-static string attachAudioToStitch(const string &stitchedOut, const string &source,
-                                  const string &explicitSidecar);
 
 static void runTuneServer(const Mat &KL, const vector<double> &DL,
                           const Mat &KR, const vector<double> &DR, const Mat &R,
@@ -1558,6 +1645,34 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
           << ",\"source\":\"" << jsonEscape(source) << "\",\"output\":\"" << jsonEscape(outFile) << "\""
           << ",\"left\":\"" << curLeft << "\",\"right\":\"" << curRight << "\"}";
         return j.str();
+    };
+
+    // Stitch settings from a /stitch or /command query. One parser for both, so the
+    // command shown before a stitch is exactly the one the stitch runs.
+    auto parseStitch = [&](const string &query, Align &a, StitchMaps &mm,
+                           string &cropStr, int &seamVal, double &dg) {
+        a.shiftTop = !qparam(query, "shifttop").empty() ? stod(qparam(query, "shifttop")) : 0;
+        a.shiftBottom = !qparam(query, "shiftbottom").empty() ? stod(qparam(query, "shiftbottom")) : 0;
+        a.shiftY = !qparam(query, "shifty").empty() ? stod(qparam(query, "shifty")) : 0;
+        a.bands = !qparam(query, "bands").empty() ? stoi(qparam(query, "bands")) : 0;
+        a.exposure = qparam(query, "exposure") == "1";
+        a.smartSeam = qparam(query, "smartseam") == "1";
+        string ss = qparam(query, "seam");
+        StitchMaps full = m;
+        if (!ss.empty()) full.seam = stoi(ss);
+        seamVal = ss.empty() ? -1 : stoi(ss);
+        // Optional crop (full-canvas coords): restrict all work to this region.
+        int cw = !qparam(query, "cropw").empty() ? stoi(qparam(query, "cropw")) : 0;
+        int chh = !qparam(query, "croph").empty() ? stoi(qparam(query, "croph")) : 0;
+        int cx = !qparam(query, "cropx").empty() ? stoi(qparam(query, "cropx")) : 0;
+        int cy = !qparam(query, "cropy").empty() ? stoi(qparam(query, "cropy")) : 0;
+        // Crop rect as a --crop string (parallel children re-apply it themselves).
+        cropStr = (cw > 0 && chh > 0)
+            ? (to_string(cx) + "," + to_string(cy) + "," + to_string(cw) + "," + to_string(chh)) : "";
+        // Rotation of the finished panorama (tuner's Rotate control -> --degrees);
+        // falls back to whatever was passed on the command line when the param is absent.
+        dg = !qparam(query, "degrees").empty() ? stod(qparam(query, "degrees")) : degrees;
+        mm = viewMaps(full, cx, cy, cw, chh, dg, a);   // rotate, then crop
     };
 
     // Preload a source passed on the command line (`--source x --tune`).
@@ -1634,29 +1749,9 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
             else if (g_busy) { body = "busy"; }
             else
             {
-                Align a;
-                a.shiftTop = query.find("shifttop=") != string::npos ? stod(qparam(query, "shifttop")) : 0;
-                a.shiftBottom = query.find("shiftbottom=") != string::npos ? stod(qparam(query, "shiftbottom")) : 0;
-                a.shiftY = query.find("shifty=") != string::npos ? stod(qparam(query, "shifty")) : 0;
-                a.bands = query.find("bands=") != string::npos ? stoi(qparam(query, "bands")) : 0;
-                a.exposure = qparam(query, "exposure") == "1";
-                a.smartSeam = qparam(query, "smartseam") == "1";
-                string ss = qparam(query, "seam");
-                StitchMaps mm = m;
-                if (!ss.empty()) mm.seam = stoi(ss);
-                // Optional crop (full-canvas coords): restrict all work to this region.
-                int cw = query.find("cropw=") != string::npos ? stoi(qparam(query, "cropw")) : 0;
-                int chh = query.find("croph=") != string::npos ? stoi(qparam(query, "croph")) : 0;
-                int cx = query.find("cropx=") != string::npos ? stoi(qparam(query, "cropx")) : 0;
-                int cy = query.find("cropy=") != string::npos ? stoi(qparam(query, "cropy")) : 0;
-                // Crop rect as a --crop string (parallel children re-apply it themselves).
-                string cropStr = (cw > 0 && chh > 0)
-                    ? (to_string(cx) + "," + to_string(cy) + "," + to_string(cw) + "," + to_string(chh)) : "";
-                if (cw > 0 && chh > 0)
-                {
-                    mm = cropMaps(mm, cx, cy, cw, chh);
-                    cout << "[stitch] crop " << cw << "x" << chh << " @ (" << cx << "," << cy << ")\n";
-                }
+                Align a; StitchMaps mm; string cropStr; int seamVal; double dg;
+                parseStitch(query, a, mm, cropStr, seamVal, dg);
+                if (!cropStr.empty()) cout << "[stitch] crop " << cropStr << "\n";
                 g_busy = true; g_done = false; g_percent = 0;
                 { lock_guard<mutex> lk(g_mu); g_result.clear(); }
                 { lock_guard<mutex> lk(g_partMu); g_partPct.clear(); g_partDone.clear(); g_partTotal.clear(); }
@@ -1664,13 +1759,8 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
                      << " y=" << a.shiftY << " seam=" << mm.seam << " -> " << outFile << " ...\n";
                 int tf = totalFrames;
                 string src = source, of = outFile; bool vid = video;
-                bool wantAudio = qparam(query, "audio") == "1";
-                int seamVal = ss.empty() ? -1 : stoi(ss);
                 int endRes = endFrame >= 0 ? endFrame : (tf > 0 ? tf - 1 : -1);
                 string calib = calibDir;
-                // Global rotation of the finished panorama (tuner's Rotate control -> --degrees);
-                // falls back to whatever was passed on the command line when the param is absent.
-                double dg = query.find("degrees=") != string::npos ? stod(qparam(query, "degrees")) : degrees;
                 // Build + record the exact equivalent CLI command (shown in UI + console).
                 {
                     string fo = of.empty() ? (outDir + "/stitched_video.mp4") : of;
@@ -1680,32 +1770,42 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
                     cout << "[stitch] equivalent CLI command:\n  " << cmd << "\n";
                 }
                 std::thread([mm, a, src, vid, dg, startFrame, endFrame, endRes, tf,
-                             outDir, of, seamVal, cropStr, calib, jobs, wantAudio]() mutable {
+                             outDir, of, seamVal, cropStr, calib, jobs]() mutable {
                     string res;
                     if (vid && jobs > 1 && endRes >= startFrame)   // parallel video render
                     {
                         string fo = of.empty() ? (outDir + "/stitched_video.mp4") : of;
                         int rc = runParallelJobs(src, calib, dg, seamVal, a, cropStr,
                                                  startFrame, endRes, fo, jobs, &g_percent,
-                                                 mm.OW, mm.OH);
+                                                 outSize(mm).width, outSize(mm).height);
                         res = rc == 0 ? fo : string("ERROR: parallel stitch failed (see console)");
                     }
                     else                                           // single-process (image, or --no-jobs)
                         res = vid
-                            ? stitchVideoFile(src, mm, dg, a, startFrame, endFrame, tf, outDir, of, &g_percent)
-                            : stitchImageFile(src, mm, dg, a, outDir, of);
-                    // Attach the recording's audio to the finished stitch, if asked and available.
-                    if (wantAudio && vid && res.rfind("ERROR", 0) != 0)
-                    {
-                        string wa = attachAudioToStitch(res, src, "");
-                        if (!wa.empty()) res = wa;
-                    }
+                            ? stitchVideoFile(src, mm, a, startFrame, endFrame, tf, outDir, of, &g_percent)
+                            : stitchImageFile(src, mm, a, outDir, of);
                     { lock_guard<mutex> lk(g_mu); g_result = res; }
                     g_percent = 100; g_done = true; g_busy = false;
                     cout << "[stitch] done -> " << res << "\n";
                 }).detach();
                 body = "started";
             }
+        }
+        else if (path == "/command")
+        {
+            // The CLI command for the current settings WITHOUT stitching - shown as
+            // soon as an output is chosen. Empty until a source and an output exist.
+            ctype = "application/json";
+            string cmd;
+            if (loaded && !outFile.empty())
+            {
+                Align a; StitchMaps mm; string cropStr; int seamVal; double dg;
+                parseStitch(query, a, mm, cropStr, seamVal, dg);
+                int endRes = endFrame >= 0 ? endFrame : (totalFrames > 0 ? totalFrames - 1 : -1);
+                cmd = buildCliCommand(source, calibDir, dg, seamVal, a, cropStr, startFrame,
+                                      (video ? endRes : -1), (video ? jobs : 1), outFile);
+            }
+            body = "{\"cmd\":\"" + jsonEscape(cmd) + "\"}";
         }
         else if (path == "/frame")
         {
@@ -1999,104 +2099,6 @@ static void runShellsConcurrent(const vector<string> &cmds, vector<int> &rc)
 #endif
 }
 
-// Attach a take's audio (from a .sync.json sidecar written next to it) to a
-// stitched video. The Rock recorder does not write audio or a sidecar today, so
-// this is dormant until it does - when no sidecar is found the stitch is left
-// untouched.
-// writing "<stem>.withaudio.mp4" (H.264 video copied + AAC audio). Non-destructive - the video-only
-// stitch is left intact. Needs ffmpeg (already required for --jobs concat).
-// Each audio segment is shifted onto the video
-// timeline by (segment.anchor_ns - video.anchor_ns). Returns the new file path,
-// or "" if there was nothing to attach.
-static string attachAudioToStitch(const string &stitchedOut, const string &source,
-                                  const string &explicitSidecar)
-{
-    auto q = [](const string &s) { return "\"" + s + "\""; };
-    std::error_code ec;
-
-    // 1. locate the sidecar (explicit, else derived from the source name)
-    fs::path sidecar;
-    if (!explicitSidecar.empty()) sidecar = explicitSidecar;
-    else
-    {
-        fs::path s(source);
-        string stem = s.stem().string();
-        const string suf = "_seekable";   // a remuxed source drops back to the base name
-        if (stem.size() > suf.size() &&
-            stem.compare(stem.size() - suf.size(), suf.size(), suf) == 0)
-            stem = stem.substr(0, stem.size() - suf.size());
-        sidecar = s.parent_path() / (stem + ".sync.json");
-    }
-    if (!fs::exists(sidecar, ec))
-    {
-        cout << "[audio] no sidecar at " << sidecar.string() << " - leaving the stitch video-only.\n";
-        return "";
-    }
-
-    // 2. parse it
-    json j;
-    {
-        ifstream f(sidecar.string());
-        if (!f.is_open()) { cout << "[audio] cannot open " << sidecar.string() << "\n"; return ""; }
-        try { f >> j; }
-        catch (...) { cout << "[audio] sidecar is not valid JSON; skipping.\n"; return ""; }
-    }
-    if (!j.contains("video") || j["video"]["anchor_ns"].is_null())
-    {
-        cout << "[audio] sidecar has no video anchor; skipping.\n";
-        return "";
-    }
-    long long v0 = j["video"]["anchor_ns"].get<long long>();
-    if (!j.contains("audio_segments") || j["audio_segments"].empty())
-    {
-        cout << "[audio] no audio segments in the sidecar; nothing to attach.\n";
-        return "";
-    }
-    fs::path base = sidecar.parent_path();
-
-    // 3. build the ffmpeg command (one delayed audio input per segment; amix if >1)
-    ostringstream inputs, filt, amixIns;
-    inputs << " -i " << q(stitchedOut);
-    int n = 0;
-    for (auto &s : j["audio_segments"])
-    {
-        string fn = s.value("file", string());
-        if (fn.empty() || s["anchor_ns"].is_null()) continue;
-        fs::path wav = base / fn;
-        if (!fs::exists(wav, ec)) { cout << "[audio] missing segment " << wav.string() << " - skipping.\n"; continue; }
-        double delay = (double)(s["anchor_ns"].get<long long>() - v0) / 1e9;
-        ++n;
-        string lab = "a" + to_string(n);
-        inputs << " -f wav -ignore_length 1 -i " << q(wav.string());
-        if (delay >= 0)
-            filt << "[" << n << ":a]adelay=" << (long long)llround(delay * 1000.0) << ":all=1[" << lab << "];";
-        else
-            filt << "[" << n << ":a]atrim=start=" << to_string(-delay) << ",asetpts=PTS-STARTPTS[" << lab << "];";
-        amixIns << "[" << lab << "]";
-    }
-    if (n == 0) { cout << "[audio] no usable audio segment files; nothing to attach.\n"; return ""; }
-
-    string aout;
-    if (n == 1) aout = "a1";
-    else { aout = "aout"; filt << amixIns.str() << "amix=inputs=" << n << ":normalize=0[aout];"; }
-    string fg = filt.str();
-    if (!fg.empty() && fg.back() == ';') fg.pop_back();
-
-    // MP4 + AAC: YouTube's recommended combo and browser-playable. The video is
-    // stream-copied (already H.264 from the stitch, no second re-encode), so the
-    // only work here is AAC-encoding the audio. AAC (not PCM) is what lets this be
-    // an .mp4 at all - MP4 can't carry PCM, which is why the old output was .mkv.
-    fs::path outPath = fs::path(stitchedOut).parent_path() /
-                       (fs::path(stitchedOut).stem().string() + ".withaudio.mp4");
-    string cmd = "ffmpeg -y" + inputs.str() + " -filter_complex " + q(fg) +
-                 " -map 0:v -map " + q("[" + aout + "]") +
-                 " -c:v copy -c:a aac -b:a 192k -movflags +faststart " + q(outPath.string());
-    cout << "[audio] attaching " << n << " segment(s) -> " << outPath.string() << "\n";
-    if (runShell(cmd) != 0) { cerr << "[audio] ffmpeg failed; keeping the video-only output.\n"; return ""; }
-    cout << "[audio] done -> " << outPath.string() << "\n";
-    return outPath.string();
-}
-
 // Parallel stitch: split [startFrame..endFrame] across `jobs` child processes (each
 // this same exe with --jobs 1 over its sub-range -> its own temp part), run them
 // concurrently, then ffmpeg-concat the parts (in order) into `outFile`. Child
@@ -2281,11 +2283,6 @@ int main(int argc, char **argv)
     g_forceCpu   = hasArg(argc, argv, "--cpu") || hasArg(argc, argv, "--no-hwenc");
     g_vencExplicit = argVal(argc, argv, "--venc", "");
     g_vbitrate   = argVal(argc, argv, "--bitrate", "auto");
-    // Attach the recording's audio after the stitch (mux from the .sync.json sidecar).
-    // --audio auto-finds the sidecar next to --source; --audio-file names it. Never
-    // passed to --jobs children, so only the top-level render attaches.
-    string audioFile = argVal(argc, argv, "--audio-file", "");
-    bool wantAudio = hasArg(argc, argv, "--audio") || !audioFile.empty();
 
     // Ensure the output destination exists (batch, or a preset --out-file).
     if (!outFile.empty()) { fs::path p(outFile); if (p.has_parent_path()) fs::create_directories(p.parent_path()); }
@@ -2366,17 +2363,15 @@ int main(int argc, char **argv)
             // that were comfortably inside H.264's 4096 limit once cropped.
             StitchMaps pm = buildStitchMaps(KL, DL, KR, DR, R,
                                             frame.cols / 2, frame.rows, seamArg);
-            if (!cropArg.empty())
             {
                 int cx = 0, cy = 0, cw = 0, ch = 0;
-                if (sscanf(cropArg.c_str(), "%d,%d,%d,%d", &cx, &cy, &cw, &ch) == 4
-                    && cw > 0 && ch > 0)
-                    pm = cropMaps(pm, cx, cy, cw, ch);
+                if (!cropArg.empty())
+                    sscanf(cropArg.c_str(), "%d,%d,%d,%d", &cx, &cy, &cw, &ch);
+                pm = viewMaps(pm, cx, cy, cw, ch, degrees, a);
             }
             int rc = runParallelJobs(source, calibDir, degrees, seamArg, a, cropArg,
                                      startFrame, endResolved, finalOut, jobs, nullptr,
-                                     pm.OW, pm.OH);
-            if (rc == 0 && wantAudio) attachAudioToStitch(finalOut, source, audioFile);
+                                     outSize(pm).width, outSize(pm).height);
             return rc;
         }
         cerr << "jobs: couldn't determine frame count; running single-process.\n";
@@ -2384,20 +2379,21 @@ int main(int argc, char **argv)
 
     StitchMaps m = buildStitchMaps(KL, DL, KR, DR, R, frame.cols / 2, frame.rows, seamArg);
 
-    // Optional --crop "x,y,w,h" (full-canvas coords): restrict work to that region.
-    if (!cropArg.empty())
+    // Optional --crop "x,y,w,h" (full-canvas coords) and --degrees: rotate the whole
+    // panorama, then crop - one view (see viewMaps).
     {
         int cx = 0, cy = 0, cw = 0, ch = 0;
-        if (sscanf(cropArg.c_str(), "%d,%d,%d,%d", &cx, &cy, &cw, &ch) == 4 && cw > 0 && ch > 0)
-        {
-            m = cropMaps(m, cx, cy, cw, ch);
+        if (!cropArg.empty()
+            && sscanf(cropArg.c_str(), "%d,%d,%d,%d", &cx, &cy, &cw, &ch) == 4 && cw > 0 && ch > 0)
             cout << "crop " << cw << "x" << ch << " @ (" << cx << "," << cy << ")\n";
-        }
+        m = viewMaps(m, cx, cy, cw, ch, degrees, a);
+        if (degrees != 0.0)
+            cout << "rotate " << degrees << " deg (clockwise), then crop -> "
+                 << outSize(m).width << "x" << outSize(m).height << "\n";
     }
 
-    string result = video ? stitchVideoFile(source, m, degrees, a, startFrame, endFrame, totalFrames, outDir, outFile, nullptr, progFile)
-                          : stitchImageFile(source, m, degrees, a, outDir, outFile);
+    string result = video ? stitchVideoFile(source, m, a, startFrame, endFrame, totalFrames, outDir, outFile, nullptr, progFile)
+                          : stitchImageFile(source, m, a, outDir, outFile);
     cout << (video ? "video -> " : "image -> ") << result << "\n";
-    if (video && wantAudio) attachAudioToStitch(result, source, audioFile);
     return 0;
 }

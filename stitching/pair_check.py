@@ -135,7 +135,8 @@ def report_file(tag, path, fps_nominal=30.0):
 
 def main():
     ap = argparse.ArgumentParser(description="Verify and pair a Veery take's two files.")
-    ap.add_argument("cam0", help="cam0 file (cam1 is found automatically if named _cam0)")
+    ap.add_argument("cam0", help="either file of the pair (the partner is found automatically "
+                                 "if named _cam0/_cam1)")
     ap.add_argument("cam1", nargs="?", help="cam1 file (optional if auto-detectable)")
     ap.add_argument("--seconds", type=int, default=60,
                     help="how much of the take to analyse for the offset (default 60)")
@@ -146,8 +147,11 @@ def main():
     left = args.cam0
     right = args.cam1
     if not right:
+        # either half of a pair works - find the partner next to it
         if "_cam0." in left:
             right = left.replace("_cam0.", "_cam1.")
+        elif "_cam1." in left:
+            left, right = left.replace("_cam1.", "_cam0."), left
         else:
             sys.exit("give both files, or name them *_cam0.* / *_cam1.*")
     for f in (left, right):

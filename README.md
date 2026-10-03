@@ -130,11 +130,9 @@ lists "confirm against footage" as an open item; that was never done. Matching
 0.20 bpp would mean ~50 Mbit/cam (~45 GB/hr for the pair, vs ~25 today). Worth
 an A/B on real footage before a real game.
 
-⚠️ `calibration/stereo_extrinsics.json` is still `placeholder_extrinsics.py`
-output — design geometry assuming perfect mounting (60 mm baseline, 74° toe-in).
-Enough to run the pipeline end to end, but the seam will not be right until you
-capture real simultaneous pairs with `snap_pair.sh` on the housed rig and
-re-solve. See [§3](#3-calibrate).
+`calibration/stereo_extrinsics.json` is the real housed-rig solve (2026-10-03:
+74.7° yaw, 1.5° residual tilt). Re-solve it if the mount is ever disturbed -
+see [§3](#3-calibrate).
 
 ---
 
@@ -179,7 +177,7 @@ cd stitching && ./stitch.command
 | Shuttle SSD copies land in | `<drive>/rock-recordings/` |
 | Calibration lives in | `calibration/` (cam0/cam1 intrinsics + stereo extrinsics) |
 | Stitcher output | HEVC in `.mp4`, tagged `hvc1`, bitrate `auto` (~0.20 bpp) |
-| **No audio** | the Rock recorder does not capture audio today |
+| **No audio** | by design - neither the recorder nor the stitcher handles audio |
 
 **Golden rule:** *copy → verify → only then delete.*
 
@@ -394,11 +392,13 @@ Remux **both** halves and keep the `_cam0`/`_cam1` suffixes so pairing still wor
 Build once — `./stitch.command` (Mac) or `stitch.bat` (Windows). Run from
 `stitching/`.
 
-**Every input is a pair.** Pass the `_cam0` file and `_cam1` is found next to it,
-or give both explicitly:
+**Every input is a pair.** Pass either file of a pair and its partner is found
+next to it, or give both explicitly:
 
 ```bash
 --source take_TS_cam0.mkv                    # partner found automatically
+--source take_TS_cam1.mkv                    # either half works
+--source images-pairs/cam1_013.png           # /calib page pairs too
 --source "left.mkv::right.mkv"               # explicit, any names
 ```
 
@@ -410,9 +410,27 @@ There is no single-file mode; a source that resolves to neither is an error.
 ./stitch.command
 ```
 
-Opens a browser tuner: **Import source…** → align the far/near edges → **Stitch
-all frames** (native save dialog). It also prints the equivalent CLI command, so
-you can reproduce a tuned render by hand.
+Opens a browser tuner: **Import source…** (either file of a pair) → align the
+far/near edges → **Stitch all frames**. **Output → Choose…** picks the file up
+front; once one is chosen the equivalent CLI command is shown and kept in step
+with every change, so you can copy it without stitching (Stitch also asks for an
+output if none is chosen yet).
+
+Controls: the two edge shifts (near/far parallax, below), **Rotate** (levels the
+finished panorama: it rotates the whole panorama and THEN applies the crop box,
+exactly as the preview shows - positive = clockwise; it does not change how the
+cameras are aligned),
+**show seam line** / **crop to box**, **overlap blend** (preview aid), and the
+frame seeker. The seam is always the middle of the overlap (smart seam routes it
+around moving players); shift-y, blending and exposure match are fixed defaults.
+
+Why the edge shifts still matter with a real calibration: the calibration
+aligns the cameras' *directions*, which is exact only for distant things. The
+lenses are ~68 mm apart, so a nearer object lands at a different spot in each
+view - roughly 2104 px × 0.068 m / distance: ~3 px at 50 m, ~15 px at 10 m,
+~30 px at 5 m. The far edge of the field usually needs nothing; the near edge
+(bottom of frame) can need a few to a few tens of px depending on how close the
+rig is to the touchline.
 
 ### 5b. Headless
 
@@ -423,11 +441,12 @@ you can reproduce a tuned render by hand.
 
 | Flag | Meaning |
 |---|---|
-| `--source <file>` | input — a `_cam0` file, or `"a::b"` |
+| `--source <file>` | input — either file of a pair (`_cam0`/`_cam1`, or `/calib` `cam0_`/`cam1_`), or `"a::b"` |
 | `--shift-top N` / `--shift-bottom N` | far/near edge alignment (your tuned values) |
 | `--shift-x N` / `--shift-y N` | uniform horizontal / vertical shift of cam1 |
 | `--pair-offset N\|auto` | frame offset between the two files (default `auto`: exact from the capture timestamps on shared-clock takes, brightness estimate on older ones) |
-| `--crop x,y,w,h` | restrict to a bounding box (full-canvas coords) |
+| `--crop x,y,w,h` | output box (full-canvas coords); applied AFTER `--degrees` |
+| `--degrees N` | rotate the finished panorama, positive = clockwise (as in the tuner) |
 | `--start N` / `--end N` | frame range |
 | `--scale F` | render the cylinder at F× radius — same FOV, fewer pixels |
 | `--seam N` / `--bands N` / `--no-smart-seam` | seam placement and blending |
