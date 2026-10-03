@@ -13,28 +13,28 @@
   ],
   "rotation_matrix": [
     [
-      0.26361105571479637,
-      -0.028337005522969295,
-      -0.96421274904604
+      0.25690002163717107,
+      -0.026548987302613573,
+      -0.9660732529969074
     ],
     [
-      0.0024081860816408244,
-      0.9995846478469587,
-      -0.028718155032456824
+      0.00038406911132390556,
+      0.9996253274143904,
+      -0.027368910876959078
     ],
     [
-      0.9646260477224979,
-      0.0052484194442938255,
-      0.26356980507753547
+      0.9664379087006777,
+      0.006660034900724277,
+      0.25681396488778085
     ]
   ],
   "rotation_euler_deg": {
-    "pitch_x": 1.141,
-    "yaw_toe_y": -74.715,
-    "roll_z": 0.523
+    "pitch_x": 1.486,
+    "yaw_toe_y": -75.114,
+    "roll_z": 0.086
   },
-  "toe_in_angle_deg": 74.715,
-  "total_rotation_deg": 74.729,
+  "toe_in_angle_deg": 75.114,
+  "total_rotation_deg": 75.127,
   "board": {
     "squares_x": 7,
     "squares_y": 10,
@@ -44,11 +44,18 @@
   },
   "scene_refinement": {
     "date": "2026-10-03",
-    "what": "rotation_matrix corrected so cam1 lines up VERTICALLY with cam0 on real footage. Only the two rotations that move cam1 up/down in the overlap were changed - pitch about the horizontal axis at the seam, roll about the seam view direction - so yaw (horizontal alignment, which parallax also affects) is exactly as the board solve gave it; parallax is left to --shift-top/--shift-bottom.",
-    "pitch_correction_deg": -0.2915,
-    "roll_correction_deg": 1.3701,
-    "measured_on": "take_20261003_133914 frames 0 and 3000 (vertical offset across the overlap: -11.8 px at the seam, -24 px per 1000 px across -> ~0 after)",
-    "why": "with a horizontal baseline, vertical offsets are distance-independent, so they pin the rotation without the tilt-vs-offset trade-off the close-range board solve suffers from. translation_mm is still the board solve (its ~4.6 mm vertical component is that same artifact); the stitcher uses only rotation_matrix.",
+    "what": "rotation_matrix corrected on real footage so the two cameras agree for a scene at infinity. Only parallax-free measurements were used, so nothing that depends on where the rig stands went into the calibration; parallax is left to --shift-top/--shift-bottom.",
+    "pitch_correction_deg": -0.2898,
+    "roll_correction_deg": 1.2395,
+    "yaw_correction_deg": -0.4013,
+    "how": {
+      "pitch": "vertical offset at the seam column (no parallax there: the baseline is perpendicular to that view direction)",
+      "roll": "left-to-right change of the vertical offset across the overlap, fitted as constant + a parallax term growing with tan^2(angle below horizon); only the constant part was absorbed",
+      "yaw": "horizontal offset on the far field just below the horizon (parallax ~0 at any baseline)",
+      "axes": "pitch about the horizontal axis at the seam, roll about the seam view direction, yaw about the canvas vertical (cam0 frame), applied as R = R_board * Rp * Rr * Ry"
+    },
+    "measured_on": "take_20261003_133914 frames 0 and 3000 (rig ~15-18 ft up). After: vertical offset ~0.3 px, far-field horizontal ~0; that scene then needs shift-top -3 / shift-bottom +8.4 (pure parallax).",
+    "not_absorbed": "translation_mm is still the board solve (its 4.6 mm vertical component is a solve artifact; the stitcher ignores translation). Horizontal parallax measures ~1/3 of what a 68 mm baseline predicts, likely lens-model (intrinsics) error at the fisheye edges; not a rotation, so left to the shear.",
     "board_solve_rotation_matrix": [
       [
         0.2640039716137648,

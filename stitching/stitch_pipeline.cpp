@@ -1446,12 +1446,11 @@ static string tunerHtml()
   <div class="grp">Output <input class="path" id="outpath" type="text" readonly placeholder="not chosen yet"><button id="chooseout">Choose…</button></div>
   <div class="grp">Shift far (top) <button id="tl">&#9664;</button><input class="val" id="tv" type="number" value="0"><button id="tr">&#9654;</button></div>
   <div class="grp">Shift near (bottom) <button id="bl">&#9664;</button><input class="val" id="bv" type="number" value="0"><button id="br">&#9654;</button></div>
-  <div class="grp">Shift vertical <button id="yl">&#9664;</button><input class="val" id="yv" type="number" value="0" step="0.5"><button id="yr">&#9654;</button></div>
   <div class="grp">Rotate&deg; <button id="rl">&#9664;</button><input class="val" id="rot" type="number" value="0" step="0.5"><button id="rr">&#9654;</button></div>
   <div class="grp"><label><input type="checkbox" id="showseam" checked> show seam line</label>
                    <label><input type="checkbox" id="crop" checked> crop to box</label> <span class="hint" id="cropdim"></span></div>
   <div class="grp"><label><input type="checkbox" id="blend"> overlap blend</label></div>
-  <!-- Fixed defaults, not exposed: seam at the middle of the overlap,
+  <!-- Fixed defaults, not exposed: shift-y 0, seam at the middle of the overlap,
        smart seam (routes around moving objects), 6-band blend, exposure match. -->
   <div class="grp" id="framegrp">Frame <button id="fprev">&#9664;</button><input type="range" id="frange" min="0" value="0" style="vertical-align:middle;width:140px"><input class="val" id="fval" type="number" value="0"><span id="ftot" style="color:#9cf">/ ?</span><button id="fnext">&#9654;</button></div>
   <button id="stitch" disabled>Stitch all frames</button>
@@ -1475,9 +1474,9 @@ let OW=0, OH=0, SEAM0=0, TOTAL=1, VIDEO=false, loaded=false;
 const cv=document.getElementById('c'), ctx=cv.getContext('2d');
 const stepv=()=>{ return 1; };   // arrows nudge by 1
 const st=t=>{ document.getElementById('status').textContent=t; };
-const tv=document.getElementById('tv'), bv=document.getElementById('bv'), yv=document.getElementById('yv');
+const tv=document.getElementById('tv'), bv=document.getElementById('bv');
 const stitchBtn=document.getElementById('stitch');
-let sTop=0, sBot=0, sY=0, seam=0, pending=0;   // seam fixed at the middle of the overlap
+let sTop=0, sBot=0, sY=0, seam=0, pending=0;   // sY fixed; seam fixed at the middle of the overlap
 let rot=0, showSeam=true;   // rot = whole-panorama rotation (deg); showSeam toggles the red line
 const clmp=(v,lo,hi)=>{ return Math.max(lo,Math.min(hi,v)); };
 // Crop box (in OW/OH panorama coords). cropOn toggles it; drag body to move,
@@ -1492,7 +1491,7 @@ function drawRight(){
 }
 function render(){
   if(!loaded) return;
-  sTop=+tv.value||0; sBot=+bv.value||0; sY=+yv.value||0;   // the seam stays fixed
+  sTop=+tv.value||0; sBot=+bv.value||0;   // sY and the seam stay fixed
   ctx.setTransform(1,0,0,1,0,0); ctx.globalAlpha=1; ctx.clearRect(0,0,OW,OH);
   // Preview the whole-panorama rotation the same way the engine does: rotate about the
   // canvas centre. The crop box stays axis-aligned (drawn after we restore).
@@ -1531,9 +1530,7 @@ function drawCrop(){
 const nudge=(el,d)=>{ el.value=(+el.value||0)+d; changed(); };
 tl.onclick=()=>{ nudge(tv,-stepv()); }; tr.onclick=()=>{ nudge(tv,stepv()); };
 bl.onclick=()=>{ nudge(bv,-stepv()); }; br.onclick=()=>{ nudge(bv,stepv()); };
-// vertical shift: positive moves the right camera's picture down; arrows nudge 0.5 px
-yl.onclick=()=>{ nudge(yv,-0.5); }; yr.onclick=()=>{ nudge(yv,0.5); };
-[tv,bv,yv].forEach((el)=>{ el.oninput=changed; });
+[tv,bv].forEach(el=>{ el.oninput=changed; });
 // Whole-panorama rotation (levels a tilted field) + show/hide the red seam line.
 const rotEl=document.getElementById('rot');
 const setRot=v=>{ rot=Math.round(v*10)/10; if(rotEl) rotEl.value=rot; changed(); };
@@ -1633,9 +1630,9 @@ document.getElementById('import').onclick=async()=>{
 
 let polling=null;
 const pb=document.getElementById('pb'), pct=document.getElementById('pct');
-// fixed defaults: seam at the middle of the overlap, smart seam, 6-band blend, exposure match
+// fixed defaults: shift-y 0, seam at the middle of the overlap, smart seam, 6-band blend, exposure match
 const params=()=>{
-  let p='shifttop='+(+tv.value||0)+'&shiftbottom='+(+bv.value||0)+'&shifty='+(+yv.value||0)+'&degrees='+rot+'&bands=6&exposure=1&smartseam=1';
+  let p='shifttop='+(+tv.value||0)+'&shiftbottom='+(+bv.value||0)+'&shifty=0&degrees='+rot+'&bands=6&exposure=1&smartseam=1';
   if(cropOn && cropW>0) p+='&cropx='+Math.round(cropX)+'&cropy='+Math.round(cropY)+'&cropw='+Math.round(cropW)+'&croph='+Math.round(cropH);
   return p;
 };

@@ -339,17 +339,25 @@ from cam0 alone and is carried into cam1); the seam through the board is
 continuous.
 
 **Scene refinement (same day).** On real footage that solve left cam1 ~12 px
-low at the seam and tipped (~24 px per 1000 px across the overlap) - a ~0.3°
-tilt and ~1.4° roll error, plus a 4.6 mm height difference the mount doesn't
+low at the seam and tipped (~23 px per 1000 px across the overlap) - a ~0.3°
+tilt and ~1.2° roll error, plus a 4.6 mm height difference the mount doesn't
 have. With the board only ~1 m away and seen at the fisheye edges, a small tilt
 and a small vertical offset look alike, so the solver traded one for the other.
-With a horizontal baseline, *vertical* misalignment doesn't depend on distance,
-so it was measured on footage and only those two rotations (pitch at the seam,
-roll about the seam direction) were corrected; yaw was left exactly as solved.
-After it: vertical error ~0.2 px, no `--shift-y` needed, and the shear shrank
-from −14/+48 to +14/+20.5 (most of the old "shear" was the roll error). The
-correction and the original matrix are recorded under `scene_refinement` in
-the JSON. `translation_mm` is still the board value; the stitcher ignores it.
+The rotation was corrected from footage using only **parallax-free**
+measurements, so nothing tied to where the rig stands went into the calibration:
+
+| Correction | Measured from |
+|---|---|
+| pitch −0.29° | vertical offset at the seam column |
+| roll +1.24° | change of vertical offset across the overlap, after fitting out the parallax part (which grows toward the near rows) |
+| yaw −0.40° | horizontal offset on the far field just below the horizon |
+
+After it the cameras agree for a scene at infinity (vertical ~0.3 px, far-field
+horizontal ~0), and `--shift-top`/`--shift-bottom` carry only parallax - for
+the 2026-10-03 test position (~15-18 ft up) that was −3 / +8.4, `--shift-y` 0.
+Re-tune the shear whenever the rig moves; the calibration stays. The
+corrections and the original matrix are under `scene_refinement` in the JSON.
+`translation_mm` is still the board value; the stitcher ignores it.
 
 > **`calibrate.py` refuses to write `stereo_extrinsics.json` above 3 px RMS.**
 > That guard exists because the failure is silent: a bad extrinsic still
