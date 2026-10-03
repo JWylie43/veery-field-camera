@@ -13,33 +13,58 @@
   ],
   "rotation_matrix": [
     [
-      0.2640039716137648,
-      -0.012476063647041437,
-      -0.9644409006300145
+      0.26361105571479637,
+      -0.028337005522969295,
+      -0.96421274904604
     ],
     [
-      -0.019713203993853082,
-      0.9996376783071761,
-      -0.01832762114775922
+      0.0024081860816408244,
+      0.9995846478469587,
+      -0.028718155032456824
     ],
     [
-      0.9643201193382078,
-      0.023850784987375726,
-      0.26366237406014303
+      0.9646260477224979,
+      0.0052484194442938255,
+      0.26356980507753547
     ]
   ],
   "rotation_euler_deg": {
-    "pitch_x": 5.169,
-    "yaw_toe_y": -74.649,
-    "roll_z": -4.27
+    "pitch_x": 1.141,
+    "yaw_toe_y": -74.715,
+    "roll_z": 0.523
   },
-  "toe_in_angle_deg": 74.649,
-  "total_rotation_deg": 74.713,
+  "toe_in_angle_deg": 74.715,
+  "total_rotation_deg": 74.729,
   "board": {
     "squares_x": 7,
     "squares_y": 10,
     "square_mm": 71.0,
     "marker_mm": 53.0,
     "dictionary": "DICT_5X5_1000"
+  },
+  "scene_refinement": {
+    "date": "2026-10-03",
+    "what": "rotation_matrix corrected so cam1 lines up VERTICALLY with cam0 on real footage. Only the two rotations that move cam1 up/down in the overlap were changed - pitch about the horizontal axis at the seam, roll about the seam view direction - so yaw (horizontal alignment, which parallax also affects) is exactly as the board solve gave it; parallax is left to --shift-top/--shift-bottom.",
+    "pitch_correction_deg": -0.2915,
+    "roll_correction_deg": 1.3701,
+    "measured_on": "take_20261003_133914 frames 0 and 3000 (vertical offset across the overlap: -11.8 px at the seam, -24 px per 1000 px across -> ~0 after)",
+    "why": "with a horizontal baseline, vertical offsets are distance-independent, so they pin the rotation without the tilt-vs-offset trade-off the close-range board solve suffers from. translation_mm is still the board solve (its ~4.6 mm vertical component is that same artifact); the stitcher uses only rotation_matrix.",
+    "board_solve_rotation_matrix": [
+      [
+        0.2640039716137648,
+        -0.012476063647041437,
+        -0.9644409006300145
+      ],
+      [
+        -0.019713203993853082,
+        0.9996376783071761,
+        -0.01832762114775922
+      ],
+      [
+        0.9643201193382078,
+        0.023850784987375726,
+        0.26366237406014303
+      ]
+    ]
   }
 }

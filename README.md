@@ -131,8 +131,9 @@ lists "confirm against footage" as an open item; that was never done. Matching
 an A/B on real footage before a real game.
 
 `calibration/stereo_extrinsics.json` is the real housed-rig solve (2026-10-03:
-74.7° yaw, 1.5° residual tilt). Re-solve it if the mount is ever disturbed -
-see [§3](#3-calibrate).
+74.7° yaw), with its rotation then corrected on real footage so the cameras line
+up vertically (see "Scene refinement" in [§3](#3-calibrate)). Re-solve it if the
+mount is ever disturbed.
 
 ---
 
@@ -336,6 +337,19 @@ First housed solve (2026-10-03, 26 pairs): yaw 74.7 deg, 1.5 deg residual
 tilt, baseline 67.8 mm, 1.87 px RMS (an upper bound - each board pose comes
 from cam0 alone and is carried into cam1); the seam through the board is
 continuous.
+
+**Scene refinement (same day).** On real footage that solve left cam1 ~12 px
+low at the seam and tipped (~24 px per 1000 px across the overlap) - a ~0.3°
+tilt and ~1.4° roll error, plus a 4.6 mm height difference the mount doesn't
+have. With the board only ~1 m away and seen at the fisheye edges, a small tilt
+and a small vertical offset look alike, so the solver traded one for the other.
+With a horizontal baseline, *vertical* misalignment doesn't depend on distance,
+so it was measured on footage and only those two rotations (pitch at the seam,
+roll about the seam direction) were corrected; yaw was left exactly as solved.
+After it: vertical error ~0.2 px, no `--shift-y` needed, and the shear shrank
+from −14/+48 to +14/+20.5 (most of the old "shear" was the roll error). The
+correction and the original matrix are recorded under `scene_refinement` in
+the JSON. `translation_mm` is still the board value; the stitcher ignores it.
 
 > **`calibrate.py` refuses to write `stereo_extrinsics.json` above 3 px RMS.**
 > That guard exists because the failure is silent: a bad extrinsic still
