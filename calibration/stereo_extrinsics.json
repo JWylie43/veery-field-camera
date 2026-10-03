@@ -1,34 +1,45 @@
 {
-  "PLACEHOLDER": true,
-  "note": "design values, NOT a calibration - assumes perfect mounting. Replace by running calibrate.py on the housed rig.",
+  "model": "fisheye",
+  "orientation": "rot180",
+  "rms_reproj_error_px": 1.8663,
+  "stereo_views_used": 26,
+  "image_width": 3840,
+  "image_height": 2160,
+  "baseline_mm": 67.77,
+  "translation_mm": [
+    -53.2014,
+    4.7929,
+    -41.7061
+  ],
   "rotation_matrix": [
     [
-      0.27563735581699916,
-      0.0,
-      0.9612616959383189
+      0.2640039716137648,
+      -0.012476063647041437,
+      -0.9644409006300145
     ],
     [
-      0.0,
-      1.0,
-      0.0
+      -0.019713203993853082,
+      0.9996376783071761,
+      -0.01832762114775922
     ],
     [
-      -0.9612616959383189,
-      0.0,
-      0.27563735581699916
+      0.9643201193382078,
+      0.023850784987375726,
+      0.26366237406014303
     ]
   ],
-  "translation_mm": [
-    60.0,
-    0.0,
-    0.0
-  ],
-  "baseline_mm": 60.0,
-  "toe_in_angle_deg": 74.0,
   "rotation_euler_deg": {
-    "pitch_x": -0.0,
-    "yaw_toe_y": 74.0,
-    "roll_z": 0.0
+    "pitch_x": 5.169,
+    "yaw_toe_y": -74.649,
+    "roll_z": -4.27
   },
-  "orientation": "rot180"
+  "toe_in_angle_deg": 74.649,
+  "total_rotation_deg": 74.713,
+  "board": {
+    "squares_x": 7,
+    "squares_y": 10,
+    "square_mm": 71.0,
+    "marker_mm": 53.0,
+    "dictionary": "DICT_5X5_1000"
+  }
 }

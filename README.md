@@ -319,23 +319,42 @@ baseline scale will be wrong.
 What good output looks like: **RMS well under 1 px** (this rig solves at
 ~0.23 px) and ~104.5° horizontal FOV.
 
-To re-solve only the extrinsics against already-good intrinsics:
+To re-solve only the extrinsics against already-good intrinsics, from pairs
+taken on the panel's `/calib` page (`scp -r veery:~/calib-pairs images-pairs`):
 
 ```bash
-python3 calibrate.py --use-intrinsics . \
+python3 calibrate.py --use-intrinsics . --square-mm 71 --marker-mm 53 \
         --cam0-glob 'images-pairs/cam0_*.png' --cam1-glob 'images-pairs/cam1_*.png'
 ```
+
+`--square-mm`/`--marker-mm` are the board **as displayed** - measure a square
+on the screen every session (it changes with the viewer's zoom). 71/53 mm was
+the TV in full-screen Preview on 2026-10-03.
+
+First housed solve (2026-10-03, 26 pairs): yaw 74.7 deg, 1.5 deg residual
+tilt, baseline 67.8 mm, 1.87 px RMS (an upper bound - each board pose comes
+from cam0 alone and is carried into cam1); the seam through the board is
+continuous.
 
 > **`calibrate.py` refuses to write `stereo_extrinsics.json` above 3 px RMS.**
 > That guard exists because the failure is silent: a bad extrinsic still
 > produces a plausible-looking panorama. The usual cause is feeding it the two
 > *intrinsics* folders — those are independent per-camera shoots, both numbered
-> `img_NNN`, so sort-order pairing matches unrelated frames. Use `snap_pair.sh`
-> output. `--force-extrinsics` overrides, but you almost never want that.
+> `img_NNN`, so sort-order pairing matches unrelated frames. Use `/calib` (or
+> `snap_pair.sh`) pairs. `--force-extrinsics` overrides, but you almost never
+> want that.
+>
+> The stereo solve is fisheye-aware: corners are mapped through each camera's
+> fisheye model to normalized coordinates before `cv2.stereoCalibrate`, which
+> only knows the pinhole model (fed fisheye coefficients directly it gave
+> 28 px RMS and a 2.8 deg "toe-in" on good pairs).
 
-Eyeball the two sanity images it writes: straight lines straight in
-`camN_undistort_sample.jpg`, and the same feature on the same green line in
-`stereo_rectified_sample.jpg`.
+Eyeball the sanity images it writes: straight lines straight in
+`camN_undistort_sample.jpg`, and in `stereo_reprojection_sample.jpg` the red
+crosses (where the solved geometry puts each corner) inside the green circles
+(where it was detected) in BOTH halves. Then stitch one pair and look at the
+seam - that is the real test:
+`./build/StitchPipeline --source "../calibration/images-pairs/cam0_013.png::../calibration/images-pairs/cam1_013.png" --out-file pano.jpg`
 
 ---
 

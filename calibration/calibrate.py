@@ -46,7 +46,7 @@ correct.
 
 Outputs (in --out dir):
     cam0_intrinsics.json   cam1_intrinsics.json   stereo_extrinsics.json
-    <cam>_undistort_sample.jpg   stereo_rectified_sample.jpg
+    <cam>_undistort_sample.jpg   stereo_reprojection_sample.jpg
 """
 
 
@@ -220,6 +220,8 @@ def _calibrate_fisheye(name, all_obj, all_img, all_pts, recs_used, used,
           f"({'good' if cov > 0.8 else 'thin - add edge/corner shots'})")
     result = {
         "camera": name, "model": "fisheye",
+        # solved from images in the rig's saved (upright, rotated 180) orientation
+        "orientation": "rot180",
         "image_width": w, "image_height": h,
         "rms_reproj_error_px": round(float(rms), 4),
         "camera_matrix": K.tolist(),
@@ -266,6 +268,7 @@ def calibrate_extrinsics(records, board, size, KL, dL, KR, dR, cfg, out_dir):
     print("\n=== STEREO extrinsics (cam0 -> cam1) ===")
     chess = board.getChessboardCorners().astype(np.float32)   # (Ncorners, 3) in mm
     obj_pts, pts_l, pts_r = [], [], []
+    records_used = []
     used = 0
     for rec in records:
         if rec.get("cam0") is None or rec.get("cam1") is None:
@@ -285,6 +288,7 @@ def calibrate_extrinsics(records, board, size, KL, dL, KR, dR, cfg, out_dir):
         pts_r.append(np.array([map_r[int(i)] for i in common],
                               dtype=np.float32).reshape(-1, 1, 2))
         used += 1
+        records_used.append(rec)
         print(f"  {os.path.basename(rec['path']):28} shared corners: {len(common)}")
 
     if used < 6:
@@ -294,11 +298,43 @@ def calibrate_extrinsics(records, board, size, KL, dL, KR, dR, cfg, out_dir):
             print("  Too few for a reliable stereo solve; skipping extrinsics.")
             return None
 
-    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-6)
-    sflags = cv2.CALIB_FIX_INTRINSIC
-    rms, KL, dL, KR, dR, R, T, _, _ = cv2.stereoCalibrate(
-        obj_pts, pts_l, pts_r, KL, dL, KR, dR, size,
-        flags=sflags, criteria=crit)
+    # The lenses are FISHEYE, but cv2.stereoCalibrate only knows the pinhole +
+    # Brown model: handed fisheye coefficients it reads k1..k4 as k1,k2,p1,p2 and
+    # solves against the wrong projection (worst at the frame edges - exactly
+    # where the overlap is). So push every corner through the fisheye model to
+    # normalized (ideal pinhole) coordinates first, and solve the pose there with
+    # an identity camera and no distortion. The overlap sits well inside 90 deg
+    # off-axis, so normalized coordinates stay finite.
+    dL4, dR4 = dL.reshape(4, 1), dR.reshape(4, 1)
+    nrm_l = [cv2.fisheye.undistortPoints(p.astype(np.float64), KL, dL4).astype(np.float32)
+             for p in pts_l]
+    nrm_r = [cv2.fisheye.undistortPoints(p.astype(np.float64), KR, dR4).astype(np.float32)
+             for p in pts_r]
+    eye, nodist = np.eye(3), np.zeros((1, 5))
+    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 200, 1e-10)
+    _, _, _, _, _, R, T, _, _ = cv2.stereoCalibrate(
+        obj_pts, nrm_l, nrm_r, eye, nodist, eye, nodist, size,
+        flags=cv2.CALIB_FIX_INTRINSIC, criteria=crit)
+
+    # Report the error in real fisheye PIXELS: per view, pose the board in cam0,
+    # carry that pose through (R, T) into cam1, and reproject through each
+    # camera's own fisheye model.
+    sq, n_err, per_view = 0.0, 0, []
+    for obj, nl, pl, pr in zip(obj_pts, nrm_l, pts_l, pts_r):
+        _, rv, tv = cv2.solvePnP(obj, nl, eye, None)
+        R0 = cv2.Rodrigues(rv)[0]
+        rv1 = cv2.Rodrigues(R @ R0)[0]
+        tv1 = R @ tv + T.reshape(3, 1)
+        o = obj.astype(np.float64)
+        prj_l = cv2.fisheye.projectPoints(o, rv, tv, KL, dL4)[0].reshape(-1, 2)
+        prj_r = cv2.fisheye.projectPoints(o, rv1, tv1, KR, dR4)[0].reshape(-1, 2)
+        e = np.concatenate([np.linalg.norm(prj_l - pl.reshape(-1, 2), axis=1),
+                            np.linalg.norm(prj_r - pr.reshape(-1, 2), axis=1)])
+        sq += float(np.sum(e ** 2)); n_err += len(e)
+        per_view.append(float(np.sqrt(np.mean(e ** 2))))
+    rms = float(np.sqrt(sq / max(n_err, 1)))
+    worst = sorted(range(len(per_view)), key=lambda i: -per_view[i])[:3]
+    print("  worst views (px)  : " + ", ".join(f"#{i} {per_view[i]:.2f}" for i in worst))
 
     T = T.ravel()
     baseline = float(np.linalg.norm(T))                       # mm between camera centers
@@ -317,6 +353,9 @@ def calibrate_extrinsics(records, board, size, KL, dL, KR, dR, cfg, out_dir):
     print(f"  >> toe-in angle   : {toe:.2f} deg   (relative convergence of the cameras)")
 
     result = {
+        "model": "fisheye",
+        # solved from images in the rig's saved (upright, rotated 180) orientation
+        "orientation": "rot180",
         "rms_reproj_error_px": round(float(rms), 4),
         "stereo_views_used": used,
         "image_width": size[0], "image_height": size[1],
@@ -345,9 +384,10 @@ def calibrate_extrinsics(records, board, size, KL, dL, KR, dR, cfg, out_dir):
     if rms > MAX_STEREO_RMS_PX and not cfg.force_extrinsics:
         print(f"\n  !! REFUSING to write stereo_extrinsics.json: RMS {rms:.1f}px "
               f"exceeds {MAX_STEREO_RMS_PX}px.")
-        print( "     The cam0/cam1 images are almost certainly not SIMULTANEOUS "
-               "pairs of the\n     same board pose. Capture real pairs with "
-               "snap_pair.sh and re-run.")
+        print( "     Usual causes: the cam0/cam1 images are not SIMULTANEOUS pairs of"
+               "\n     the same board pose (capture them on the panel's /calib page),"
+               "\n     the intrinsics files are on the wrong cameras, or --square-mm /"
+               "\n     --marker-mm do not match the board as shown.")
         print( "     (Pass --force-extrinsics to write it anyway.)")
         return None
 
@@ -356,33 +396,43 @@ def calibrate_extrinsics(records, board, size, KL, dL, KR, dR, cfg, out_dir):
         json.dump(result, f, indent=2)
     print(f"  saved -> {out_json}")
 
-    _save_rectified_sample(records, size, KL, dL, KR, dR, R, T, out_dir)
+    _save_reprojection_sample(obj_pts, pts_l, pts_r, KL, dL4, KR, dR4, R, T,
+                              records_used, out_dir)
     return result
 
 
-def _save_rectified_sample(records, size, KL, dL, KR, dR, R, T, out_dir):
-    """Rectify the first both-visible frame and draw horizontal rulers. If the
-    stereo solve is good, matching features sit on the SAME horizontal line."""
+def _save_reprojection_sample(obj_pts, pts_l, pts_r, KL, dL4, KR, dR4, R, T,
+                              records_used, out_dir):
+    """Side-by-side of the pair with the most shared corners: GREEN circles are
+    the detected corners, RED crosses where the solved geometry puts them (board
+    posed in cam0, carried into cam1 by R,T). On a good solve the crosses sit in
+    the circles in BOTH images - cam1's are the real test, since nothing about
+    cam1 was fitted to that view on its own.
+
+    (A rectified-pair image is no use here: the cameras are ~74 deg apart, and
+    rectifying fisheyes that far apart onto one plane mostly shows stretching.)"""
     try:
-        pair = next((r for r in records
-                     if r.get("cam0") is not None and r.get("cam1") is not None), None)
-        if pair is None:
-            return
-        left, right = cv2.imread(pair["path"]), cv2.imread(pair["path_cam1"])
-        R1, R2, P1, P2, _, _, _ = cv2.stereoRectify(
-            KL, dL, KR, dR, size, R, T.reshape(3, 1), alpha=0)
-        ml = cv2.initUndistortRectifyMap(KL, dL, R1, P1, size, cv2.CV_16SC2)
-        mr = cv2.initUndistortRectifyMap(KR, dR, R2, P2, size, cv2.CV_16SC2)
-        rl = cv2.remap(left, ml[0], ml[1], cv2.INTER_LINEAR)
-        rr = cv2.remap(right, mr[0], mr[1], cv2.INTER_LINEAR)
-        combo = np.hstack([rl, rr])
-        for y in range(0, combo.shape[0], combo.shape[0] // 20):
-            cv2.line(combo, (0, y), (combo.shape[1], y), (0, 255, 0), 1)
-        out_img = os.path.join(out_dir, "stereo_rectified_sample.jpg")
-        cv2.imwrite(out_img, combo)
-        print(f"  saved -> {out_img}  (eyeball: same feature should land on the same green line)")
+        i = max(range(len(obj_pts)), key=lambda k: len(obj_pts[k]))
+        rec = records_used[i]
+        left, right = cv2.imread(rec["path"]), cv2.imread(rec["path_cam1"])
+        eye = np.eye(3)
+        nl = cv2.fisheye.undistortPoints(pts_l[i].astype(np.float64), KL, dL4)
+        _, rv, tv = cv2.solvePnP(obj_pts[i], nl, eye, None)
+        rv1 = cv2.Rodrigues(R @ cv2.Rodrigues(rv)[0])[0]
+        tv1 = R @ tv + T.reshape(3, 1)
+        o = obj_pts[i].astype(np.float64)
+        for img, det, (r, t, K, D) in ((left, pts_l[i], (rv, tv, KL, dL4)),
+                                       (right, pts_r[i], (rv1, tv1, KR, dR4))):
+            prj = cv2.fisheye.projectPoints(o, r, t, K, D)[0].reshape(-1, 2)
+            for (dx, dy), (px, py) in zip(det.reshape(-1, 2), prj):
+                cv2.circle(img, (int(dx), int(dy)), 14, (0, 255, 0), 3)
+                cv2.drawMarker(img, (int(px), int(py)), (0, 0, 255), cv2.MARKER_CROSS, 22, 3)
+        combo = np.hstack([left, right])
+        out_img = os.path.join(out_dir, "stereo_reprojection_sample.jpg")
+        cv2.imwrite(out_img, cv2.resize(combo, None, fx=0.5, fy=0.5))
+        print(f"  saved -> {out_img}  (red crosses should sit inside the green circles in BOTH halves)")
     except Exception as e:                               # noqa: BLE001 - sanity image only
-        print(f"  (rectified sample skipped: {e!r})")
+        print(f"  (reprojection sample skipped: {e!r})")
 
 
 def load_intrinsics(dirpath, name):

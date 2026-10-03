@@ -16,9 +16,11 @@ venv/
 # Calibration: keep the scripts + the cam0/cam1/stereo JSONs; ignore the
 # snapshot images and the generated board/sample images
 calibration/images-cam*/
+calibration/images-pairs/
 charuco_board.png
 *_undistort_sample.jpg
 *_rectified_sample.jpg
+*_reprojection_sample.jpg
 
 # Stitching: keep source (stitch_pipeline.cpp/CMakeLists/include/pair_check.py);
 # ignore build output and generated renders
