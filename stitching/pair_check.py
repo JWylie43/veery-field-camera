@@ -162,13 +162,16 @@ def main():
 
     print("\n== pairing ==")
     dframes = a["frames"] - b["frames"]
-    if dframes:
+    ts = timestamp_offset(left, right)
+    if not dframes:
+        print("  frame counts match")
+    elif ts and abs(dframes) <= abs(ts[0]) + 1:
+        print(f"  frame counts differ by {dframes} - explained by the start offset below "
+              f"(one camera's first frame came earlier)")
+    else:
         print(f"  ! frame counts differ by {dframes} "
               f"- the shorter file ends the stitch; check the longer one for a late start")
-    else:
-        print("  frame counts match")
 
-    ts = timestamp_offset(left, right)
     if ts:
         off, resid, t0, t1 = ts
         print(f"  timestamp offset: {off} frames   (EXACT - shared-clock take; starts "
@@ -193,7 +196,14 @@ def main():
 
     print(f"  {'brightness cross-check' if ts else 'best offset'}: {shift} frames   (correlation {corr:.3f}, "
           f"margin over next candidate {margin:.3f})")
-    if corr < 0.5:
+    if ts and (corr < 0.5 or margin < 0.05):
+        print("    weak - the scene lacks brightness changes for this method; that is fine,")
+        print("    the EXACT timestamp offset above is what the stitcher uses.")
+    elif ts and shift != ts[0]:
+        print(f"    ! confident but DISAGREES with the timestamp offset ({ts[0]}) - worth a look")
+    elif ts:
+        print("    agrees with the timestamp offset.")
+    elif corr < 0.5:
         print("    weak match - expected while the cameras FREE-RUN (they drift, so no")
         print("    single offset fits the whole take). With XVS genlock this should be")
         print("    a sharp peak; if it is not, the scene may simply lack brightness")
