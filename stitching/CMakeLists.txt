@@ -2,6 +2,11 @@ cmake_minimum_required(VERSION 3.5)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 project(StitchingApplication)
+# Default to an optimized build: with no build type CMake compiles WITHOUT optimization,
+# and the per-pixel loops here (blend, seam search, map building) run several times slower.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
 if(WIN32)
   set(OpenCV_DIR "C:/opencv/build")
 endif()

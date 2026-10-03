@@ -18,7 +18,7 @@
 //   video source (.mp4/.mkv/...) -> loop frames [start..end] -> stitched_video.mp4
 //   --tune  -> launch an interactive browser tuner (see below)
 //
-// cam1 alignment (applied as one affine before the hard-seam composite):
+// cam1 alignment (folded into cam1's remap table, with the rotation and crop):
 //   --shift-top N     horizontal shift of the TOP rows   (aligns the FAR edge)
 //   --shift-bottom N  horizontal shift of the BOTTOM rows (aligns the NEAR edge)
 //   --shift-y N       vertical shift of the whole image
@@ -30,14 +30,10 @@
 // to a live tuner where you adjust those values and click "Stitch all frames" to run
 // the full stitch (progress bar + done). One command; UI opens itself.
 //
-// Parallel video stitch (default ON):
-//   --jobs N   split the frame range across N child processes, then ffmpeg-concat
-//              the parts into the one --out-file. Defaults to 4. Each child keeps its
-//              own smart-seam continuity within its chunk (the seam only resets at the
-//              N-1 chunk joins). Separate processes (not threads) so each gets its own
-//              OpenCL context and the GPU scheduler overlaps them - the way to actually
-//              fill the GPU. Tune N to your GPU's saturation knee (watch GPU% + VRAM).
-//   --no-jobs  (or --jobs 1) run everything in this one process - no parallelism.
+// Video renders as a pipeline in ONE process (see FramePipeline): decode -> remap +
+// exposure -> seam -> blend -> encode, several frames in flight, worker threads taking
+// whichever stage has work. The smart seam is one continuous chain over the whole
+// range, and there is a single output file - nothing to split or join.
 //
 // Two-file takes (the recorder writes one file per camera):
 //   --source take_..._cam0.mkv   (or _cam1.mkv) finds the partner and pairs them in memory.
@@ -58,7 +54,7 @@
 //              pixels - it lowers pixel density, it does not crop (that is --crop).
 //              Implemented by shrinking the radius before the maps are built, so the
 //              frame is rendered once at the smaller size rather than downscaled after.
-//   Requires ffmpeg on PATH for the concat. Images and --tune always run single-process.
+//   ffmpeg on PATH is the encode path (hardware HEVC/H.264); without it OpenCV's writer is used.
 //
 // Warp device: the stitching/warp always runs on the CPU (the OpenCL/GPU warp was
 // measured slower - see the note in main). The video ENCODER still uses the GPU
@@ -90,6 +86,8 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
+#include <functional>
 #include <chrono>
 #include <csignal>
 #include "json.hpp"
@@ -105,12 +103,9 @@
   #include <netinet/in.h>
   #include <arpa/inet.h>
   #include <unistd.h>
-  #include <spawn.h>            // posix_spawn: launch parallel children concurrently
-  #include <sys/wait.h>        // waitpid
   using socket_t = int;
   #define CLOSESOCK close
   #define INVALID_SOCKET (-1)
-  extern char **environ;       // for posix_spawn (child inherits our environment)
 #endif
 
 #ifdef __APPLE__
@@ -136,7 +131,7 @@ static int runShell(string cmd);   // forward decl (defined near main); the enco
 // The stitch always re-encodes, so we hand raw frames to ffmpeg and let it use a
 // hardware H.264 encoder when one is available - detected generically, not tied to
 // any specific GPU. See chooseVideoEncoder().
-static string g_vencExplicit;      // --venc NAME: force a specific encoder (also parent->child in --jobs)
+static string g_vencExplicit;      // --venc NAME: force a specific encoder
 static bool   g_forceCpu = false;  // --cpu / --no-hwenc: force software libx264
 static string g_vbitrate  = "auto"; // --bitrate: explicit rate (e.g. "90M"), or "auto"
 // "auto" sizes the bitrate from the OUTPUT pixel rate instead of a fixed number, so a
@@ -159,29 +154,51 @@ static string resolveBitrate(const string &venc, int W, int H, double fps)
     return to_string(mbit) + "M";
 }
 
+// A camera's projection model: maps cylinder points back to its source pixels.
+struct CamModel
+{
+    double fx = 0, fy = 0, cx = 0, cy = 0;
+    double r[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};   // camera-from-left rotation, row-major
+    vector<double> D;
+    int w = 0, h = 0;                            // source frame size
+};
+
+// The full cylindrical canvas: its geometry (so any canvas point can be re-projected
+// into either camera) plus float remap tables over the whole canvas, which the tuner's
+// live preview draws from.
 struct StitchMaps
 {
-    UMat mapLx, mapLy, mapRx, mapRy;
+    Mat mapLx, mapLy, mapRx, mapRy;
     int OW = 0, OH = 0;
     int seam = 0;
     int ox0 = 0, ox1 = 0;   // overlap column range [ox0, ox1) where both cameras are valid
-    // Crop support: when a crop is applied the maps/OW/OH/seam/overlap are the cropped
-    // region, but the per-row shear is defined over the FULL height, so we keep the
-    // original height and the crop's top offset to reproduce it exactly.
-    int fullOH = 0;         // original (uncropped) canvas height; 0 = same as OH
-    int cropX = 0, cropY = 0;
-    // Rotate-then-crop (see viewMaps): when set, composite() stitches this map region
-    // and then applies `view` (a 2x3 output->stitched affine, WARP_INVERSE_MAP) to
-    // produce the outW x outH output. Empty view = the stitched region IS the output.
-    Mat view;
-    int outW = 0, outH = 0;
+    CamModel camL, camR;
+    double fcyl = 1, thetaMin = 0;   // canvas column x <-> angle thetaMin + x / fcyl
 };
 
-// Output frame size: the rotate+crop view when there is one, else the map region.
-static Size outSize(const StitchMaps &m)
+// The output view, in full-canvas coordinates: rotate the whole canvas by `degrees`
+// (clockwise as shown) about its centre, then cut out the box. w/h <= 0 = whole canvas.
+struct ViewBox
 {
-    return m.view.empty() ? Size(m.OW, m.OH) : Size(m.outW, m.outH);
-}
+    int x = 0, y = 0, w = 0, h = 0;
+    double degrees = 0;
+};
+
+// Per-render remap tables (see buildRenderMaps): shear + rotation + crop folded into
+// ONE table per camera, so a frame is one remap per camera straight into output pixels.
+// Each camera only covers the columns it can contribute to - left [0, sx1), right
+// [sx0, OW) - where [sx0, sx1) is the strip the seam is blended across.
+struct RenderMaps
+{
+    int OW = 0, OH = 0;           // output (crop box) size
+    Mat mapL1, mapL2;             // left table over [0, sx1)   (fixed point)
+    Mat mapR1, mapR2;             // right table over [sx0, OW) (fixed point)
+    int sx0 = 0, sx1 = 0;         // blend strip (widest the seam can need)
+    int margin = 0;               // blend reach either side of the seam (from the band count)
+    int bx0 = 0, bx1 = 0;         // seam band: columns where both cameras overlap on some row
+    Mat overlap;                  // CV_8U over the band: 1 where both cameras are valid
+    vector<float> home;           // per row: the seam's home column in output coordinates
+};
 
 // Right-image alignment (per-row horizontal shear + vertical shift) + seam blend.
 struct Align
@@ -198,9 +215,6 @@ static std::atomic<bool> g_busy{false};
 static std::atomic<bool> g_done{false};
 static std::mutex g_mu;
 static string g_result;
-// Per-process progress for a parallel (--jobs) render, surfaced to the tuner UI.
-static std::mutex g_partMu;
-static vector<int> g_partPct, g_partDone, g_partTotal;
 // The exact equivalent CLI command for the last/active stitch (shown in the tuner UI
 // and console) so you can reproduce a tuned render manually.
 static string g_cmd;
@@ -261,43 +275,53 @@ static inline void applyFisheye(double x, double y, const vector<double> &D,
     yd = y * scale;
 }
 
-static void buildCylMap(const Mat &K, const vector<double> &D, const Mat &R_cam_from_left,
-                        const vector<double> &theta, const vector<double> &hval,
-                        int w, int h, Mat &mapx, Mat &mapy, Mat &valid)
+static CamModel camModel(const Mat &K, const vector<double> &D, const Mat &R_cam_from_left, int w, int h)
+{
+    CamModel c;
+    c.fx = K.at<double>(0, 0); c.fy = K.at<double>(1, 1);
+    c.cx = K.at<double>(0, 2); c.cy = K.at<double>(1, 2);
+    for (int i = 0; i < 9; i++) c.r[i] = R_cam_from_left.at<double>(i / 3, i % 3);
+    c.D = D; c.w = w; c.h = h;
+    return c;
+}
+
+// Cylinder point (angle th, height hh) -> source pixel (u, v) of one camera. False if
+// the ray is behind the camera or lands outside its frame.
+static inline bool cylToCam(const CamModel &c, double th, double hh, float &u, float &v)
+{
+    double dx = sin(th), dy = hh, dz = cos(th);
+    const double *r = c.r;
+    double cxr = r[0] * dx + r[1] * dy + r[2] * dz;
+    double cyr = r[3] * dx + r[4] * dy + r[5] * dz;
+    double czr = r[6] * dx + r[7] * dy + r[8] * dz;
+    if (czr <= 1e-6) return false;
+    double xd, yd;
+    applyFisheye(cxr / czr, cyr / czr, c.D, xd, yd);
+    double uu = c.fx * xd + c.cx, vv = c.fy * yd + c.cy;
+    if (uu < 0 || uu >= c.w || vv < 0 || vv >= c.h) return false;
+    u = (float)uu; v = (float)vv;
+    return true;
+}
+
+static void buildCylMap(const CamModel &c, const vector<double> &theta, const vector<double> &hval,
+                        Mat &mapx, Mat &mapy, Mat &valid)
 {
     int OW = (int)theta.size(), OH = (int)hval.size();
     mapx.create(OH, OW, CV_32F);
     mapy.create(OH, OW, CV_32F);
     valid = Mat::zeros(OH, OW, CV_8U);
-    double fx = K.at<double>(0, 0), fy = K.at<double>(1, 1);
-    double cx = K.at<double>(0, 2), cy = K.at<double>(1, 2);
-    const Mat &R = R_cam_from_left;
-    double r00 = R.at<double>(0, 0), r01 = R.at<double>(0, 1), r02 = R.at<double>(0, 2);
-    double r10 = R.at<double>(1, 0), r11 = R.at<double>(1, 1), r12 = R.at<double>(1, 2);
-    double r20 = R.at<double>(2, 0), r21 = R.at<double>(2, 1), r22 = R.at<double>(2, 2);
-
-    for (int yy = 0; yy < OH; yy++)
-    {
-        double hh = hval[yy];
-        float *mx = mapx.ptr<float>(yy);
-        float *my = mapy.ptr<float>(yy);
-        uchar *vv = valid.ptr<uchar>(yy);
-        for (int xx = 0; xx < OW; xx++)
+    parallel_for_(Range(0, OH), [&](const Range &rows) {
+        for (int yy = rows.start; yy < rows.end; yy++)
         {
-            double th = theta[xx];
-            double dx = sin(th), dy = hh, dz = cos(th);
-            double cxr = r00 * dx + r01 * dy + r02 * dz;
-            double cyr = r10 * dx + r11 * dy + r12 * dz;
-            double czr = r20 * dx + r21 * dy + r22 * dz;
-            if (czr <= 1e-6) { mx[xx] = my[xx] = -1.f; continue; }
-            double xn = cxr / czr, yn = cyr / czr, xd, yd;
-            applyFisheye(xn, yn, D, xd, yd);
-            double u = fx * xd + cx, v = fy * yd + cy;
-            if (u >= 0 && u < w && v >= 0 && v < h)
-            { mx[xx] = (float)u; my[xx] = (float)v; vv[xx] = 1; }
-            else { mx[xx] = my[xx] = -1.f; }
+            float *mx = mapx.ptr<float>(yy), *my = mapy.ptr<float>(yy);
+            uchar *vv = valid.ptr<uchar>(yy);
+            for (int xx = 0; xx < OW; xx++)
+            {
+                if (cylToCam(c, theta[xx], hval[yy], mx[xx], my[xx])) vv[xx] = 1;
+                else mx[xx] = my[xx] = -1.f;
+            }
         }
-    }
+    });
 }
 
 // --scale renders the cylinder at a lower angular resolution (smaller radius)
@@ -324,9 +348,12 @@ static StitchMaps buildStitchMaps(const Mat &KL, const vector<double> &DL,
     for (int i = 0; i < m.OW; i++) theta[i] = thetaMin + i / fcyl;
     for (int i = 0; i < m.OH; i++) hval[i] = (i - m.OH / 2.0) / fcyl;
 
-    Mat mapLx, mapLy, mapRx, mapRy, okL, okR;
-    buildCylMap(KL, DL, Mat::eye(3, 3, CV_64F), theta, hval, w, h, mapLx, mapLy, okL);
-    buildCylMap(KR, DR, R, theta, hval, w, h, mapRx, mapRy, okR);
+    m.camL = camModel(KL, DL, Mat::eye(3, 3, CV_64F), w, h);
+    m.camR = camModel(KR, DR, R, w, h);
+    m.fcyl = fcyl; m.thetaMin = thetaMin;
+    Mat okL, okR;
+    buildCylMap(m.camL, theta, hval, m.mapLx, m.mapLy, okL);
+    buildCylMap(m.camR, theta, hval, m.mapRx, m.mapRy, okR);
 
     vector<int> overlapCols;
     for (int x = 0; x < m.OW; x++)
@@ -340,10 +367,6 @@ static StitchMaps buildStitchMaps(const Mat &KL, const vector<double> &DL,
              : (overlapCols.empty() ? m.OW / 2 : overlapCols[overlapCols.size() / 2]);
     m.ox0 = overlapCols.empty() ? 0 : overlapCols.front();
     m.ox1 = overlapCols.empty() ? m.OW : overlapCols.back() + 1;
-
-    mapLx.copyTo(m.mapLx); mapLy.copyTo(m.mapLy);
-    mapRx.copyTo(m.mapRx); mapRy.copyTo(m.mapRy);
-    m.fullOH = m.OH;   // reference height for the shear (unchanged by cropping)
 
     cout << "panorama " << m.OW << "x" << m.OH
          << ", right yaw " << yawR * 180.0 / CV_PI << " deg, hard seam @ " << m.seam
@@ -364,137 +387,141 @@ static StitchMaps buildStitchMaps(const Mat &KL, const vector<double> &DL,
     return m;
 }
 
-// Return a cropped view of the maps: ROI the remap tables and shift the seam/overlap
-// into crop-local coordinates. Everything downstream (warp, exposure, seam, blend,
-// output) then runs in the smaller cropped space, so rendering scales with the crop
-// area. The full height + crop origin are kept so the per-row shear is reproduced
-// exactly (see composite()). Crop rect is in full-canvas coordinates.
-static StitchMaps cropMaps(const StitchMaps &m, int cx, int cy, int cw, int ch)
+// Clamp a view box to the canvas; an empty box means the whole canvas.
+static ViewBox clampBox(const StitchMaps &m, ViewBox b)
 {
-    cx = max(0, min(cx, m.OW - 1));
-    cy = max(0, min(cy, m.OH - 1));
-    cw = max(1, min(cw, m.OW - cx));
-    ch = max(1, min(ch, m.OH - cy));
-    Rect r(cx, cy, cw, ch);
-    StitchMaps c = m;
-    c.mapLx = m.mapLx(r).clone(); c.mapLy = m.mapLy(r).clone();
-    c.mapRx = m.mapRx(r).clone(); c.mapRy = m.mapRy(r).clone();
-    c.OW = cw; c.OH = ch;
-    c.seam = max(0, min(m.seam - cx, cw));
-    c.ox0  = max(0, min(m.ox0 - cx, cw));
-    c.ox1  = max(0, min(m.ox1 - cx, cw));
-    c.fullOH = (m.fullOH > 0 ? m.fullOH : m.OH);
-    c.cropX = m.cropX + cx;
-    c.cropY = m.cropY + cy;
-    return c;
+    if (b.w <= 0 || b.h <= 0) { b.x = 0; b.y = 0; b.w = m.OW; b.h = m.OH; }
+    b.x = max(0, min(b.x, m.OW - 1));
+    b.y = max(0, min(b.y, m.OH - 1));
+    b.w = max(1, min(b.w, m.OW - b.x));
+    b.h = max(1, min(b.h, m.OH - b.y));
+    return b;
 }
 
-// The output view: ROTATE the whole panorama, THEN crop - exactly what the tuner
-// preview draws (it rotates the full canvas about its centre and lays the crop box
-// over the result). Positive degrees = clockwise as shown.
+// Build the render tables for one output view. Each output pixel's source is found by
+// walking the whole chain backwards in one go:
+//     output box -> undo the rotation (about the canvas centre) -> undo cam1's
+//     shear/shift (right only) -> cylinder -> fisheye -> source pixel
+// so a frame is resampled exactly ONCE, and only the box is ever rendered - rotating
+// no longer means stitching a larger region and warping it again.
 //
-// Rotating after a crop would pull empty space into the box's corners, and padding
-// the crop is a guess that fails at larger angles. Instead the box's four corners
-// are mapped back through the rotation, which gives the EXACT region of the
-// un-rotated panorama that lands inside the box, at any angle. Only that region is
-// stitched (seam, blend, shear and exposure work as for any crop), and one affine
-// then rotates it and cuts the box out at its exact size. No crop = the whole
-// canvas is the box. No rotation = a plain crop, as before.
-//
-// The cam1 shear/shift (Align) moves cam1's picture by up to max(|top|,|bottom|)
-// px sideways and |shiftY| px vertically, so a box edge can need cam1 picture
-// from just OUTSIDE the box - rendering only the box left a black strip there
-// (e.g. shift -40 -> up to 40 px at the right edge). The region is widened by
-// exactly those amounts, so it holds for any shear.
-static StitchMaps viewMaps(const StitchMaps &full, int cx, int cy, int cw, int ch,
-                           double degrees, const Align &a)
+// The seam's home column is a vertical line on the canvas: it belongs to the cameras
+// (where their views overlap), not to the output. It is carried through the same
+// rotation, so in the output it tilts with the picture and the seam stays on the same
+// camera-relative line at any angle - exactly what the tuner preview draws.
+static RenderMaps buildRenderMaps(const StitchMaps &m, ViewBox b, const Align &a)
 {
-    if (cw <= 0 || ch <= 0) { cx = 0; cy = 0; cw = full.OW; ch = full.OH; }
-    int mx = (int)ceil(max(fabs(a.shiftTop), fabs(a.shiftBottom)));
-    int my = (int)ceil(fabs(a.shiftY));
-    bool wholeBox = (cx == 0 && cy == 0 && cw == full.OW && ch == full.OH);
-    if (degrees == 0.0 && (wholeBox || (mx == 0 && my == 0)))
-        return wholeBox ? full : cropMaps(full, cx, cy, cw, ch);
-    double ph = degrees * CV_PI / 180.0, c = cos(ph), s = sin(ph);
-    double CX = full.OW / 2.0, CY = full.OH / 2.0;
-    // output point P (full-canvas coords) shows un-rotated point C + A(P - C),
-    // A = [c s; -s c] - the inverse of a clockwise (canvas y-down) rotation
-    auto src = [&](double px, double py) {
-        return Point2d(CX + c * (px - CX) + s * (py - CY), CY - s * (px - CX) + c * (py - CY));
-    };
-    double x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
-    for (Point2d P : {Point2d(cx, cy), Point2d(cx + cw, cy), Point2d(cx, cy + ch),
-                      Point2d(cx + cw, cy + ch)})
+    b = clampBox(m, b);
+    RenderMaps r;
+    r.OW = b.w; r.OH = b.h;
+    const int OW = r.OW, OH = r.OH;
+    const double ph = b.degrees * CV_PI / 180.0, c = cos(ph), s = sin(ph);
+    const double CX = m.OW / 2.0, CY = m.OH / 2.0, h0 = m.OH / 2.0;
+    // cam1 shear: content at canvas (X, Y) moves to (X + shiftTop + k*Y, Y + shiftY).
+    // The slope is defined over the full canvas height, so it is the same cropped or not.
+    const double k = (m.OH > 1) ? (a.shiftBottom - a.shiftTop) / (m.OH - 1) : 0.0;
+
+    Mat lx(OH, OW, CV_32F), ly(OH, OW, CV_32F), rx(OH, OW, CV_32F), ry(OH, OW, CV_32F);
+    Mat okL = Mat::zeros(OH, OW, CV_8U), okR = Mat::zeros(OH, OW, CV_8U);
+    parallel_for_(Range(0, OH), [&](const Range &rows) {
+        for (int v = rows.start; v < rows.end; v++)
+        {
+            float *plx = lx.ptr<float>(v), *ply = ly.ptr<float>(v);
+            float *prx = rx.ptr<float>(v), *pry = ry.ptr<float>(v);
+            uchar *ol = okL.ptr<uchar>(v), *orr = okR.ptr<uchar>(v);
+            double py = b.y + v - CY;
+            for (int u = 0; u < OW; u++)
+            {
+                double px = b.x + u - CX;
+                // output point shows the un-rotated canvas point C + A(P - C), A = [c s; -s c]
+                double X = CX + c * px + s * py, Y = CY - s * px + c * py;
+                if (cylToCam(m.camL, m.thetaMin + X / m.fcyl, (Y - h0) / m.fcyl, plx[u], ply[u])) ol[u] = 1;
+                else plx[u] = ply[u] = -1.f;
+                double Yr = Y - a.shiftY, Xr = X - a.shiftTop - k * Yr;
+                if (cylToCam(m.camR, m.thetaMin + Xr / m.fcyl, (Yr - h0) / m.fcyl, prx[u], pry[u])) orr[u] = 1;
+                else prx[u] = pry[u] = -1.f;
+            }
+        }
+    });
+
+    // Seam home line: canvas column m.seam, in output coordinates (one column per row).
+    r.home.resize(OH);
+    for (int v = 0; v < OH; v++)
+        r.home[v] = (float)((m.seam - CX - s * (b.y + v - CY)) / c + CX - b.x);
+    auto hm = minmax_element(r.home.begin(), r.home.end());
+    int hx0 = max(0, min(OW - 1, (int)floor(*hm.first)));
+    int hx1 = max(hx0 + 1, min(OW, (int)ceil(*hm.second) + 1));
+
+    // Seam search band: columns where both cameras are valid on at least one row.
+    Mat both = okL & okR, colAny;
+    cv::reduce(both, colAny, 0, REDUCE_MAX);
+    int bx0 = OW, bx1 = 0;
+    for (int u = 0; u < OW; u++) if (colAny.at<uchar>(0, u)) { bx0 = min(bx0, u); bx1 = u + 1; }
+    if (bx1 <= bx0) { bx0 = hx0; bx1 = hx1; }   // no overlap: a hard cut on the home line
+    r.bx0 = bx0; r.bx1 = bx1;
+    r.overlap = both.colRange(bx0, bx1).clone();
+
+    // Blend strip. Where the mask is constant across a level's whole kernel footprint
+    // the Laplacian blend reproduces the source exactly, so only the band (plus a
+    // margin wide enough for the coarsest level to settle) is ever blended; outside it
+    // each side is just its own camera. So each camera only needs rendering up to the
+    // far edge of the strip.
+    int margin = a.bands > 0 ? (4 << max(2, min(a.bands, 8))) : 0;
+    r.margin = margin;
+    r.sx0 = max(0, min(bx0, hx0) - margin);
+    r.sx1 = min(OW, max(bx1, hx1) + margin);
+    cout << "render " << OW << "x" << OH << ": overlap band " << bx0 << ".." << bx1
+         << ", blend strip " << r.sx0 << ".." << r.sx1 << " (" << (r.sx1 - r.sx0) << " px)\n";
+
+    // Fixed-point tables: OpenCV's remap is markedly faster with them (1/32 px steps).
+    convertMaps(lx.colRange(0, r.sx1), ly.colRange(0, r.sx1), r.mapL1, r.mapL2, CV_16SC2);
+    convertMaps(rx.colRange(r.sx0, OW), ry.colRange(r.sx0, OW), r.mapR1, r.mapR2, CV_16SC2);
+    return r;
+}
+
+// Tuner preview: each camera warped onto the full (un-rotated, un-sheared) canvas; the
+// browser applies shear/rotation/crop live on top.
+static void warpPreview(const Mat &fL, const Mat &fR, const StitchMaps &m, Mat &wL, Mat &wR)
+{
+    remap(fL, wL, m.mapLx, m.mapLy, INTER_LINEAR, BORDER_CONSTANT);
+    remap(fR, wR, m.mapRx, m.mapRy, INTER_LINEAR, BORDER_CONSTANT);
+}
+
+// Seam path for this frame: per row, the output column where the cut sits (left of it
+// = left camera). Smart seam: min-cost top-to-bottom path through the KNOWN overlap so
+// the cut weaves AROUND moving objects. Cost = image difference + a pull toward the
+// home line (the tuner's draggable bar, else the overlap centre - tilted with any
+// rotation) + a temporal term (stick to the previous frame's seam) so wind/noise
+// doesn't make the seam jitter frame-to-frame - it only moves when a player forces it.
+// The home pull only sets where the seam sits through flat regions. L/R are the
+// strip-local camera images.
+static vector<int> seamPath(const Mat &L, const Mat &R, const RenderMaps &rm, bool smart,
+                            vector<int> &prevSeam)
+{
+    const int OH = rm.OH, x0 = rm.bx0 - rm.sx0, bw = rm.bx1 - rm.bx0;
+    vector<int> cut(OH);
+    if (!smart || bw < 4)
     {
-        Point2d q = src(P.x, P.y);
-        x0 = min(x0, q.x); y0 = min(y0, q.y); x1 = max(x1, q.x); y1 = max(y1, q.y);
+        for (int y = 0; y < OH; y++) cut[y] = max(rm.sx0, min(rm.sx1, (int)lround(rm.home[y])));
+        return cut;
     }
-    // + the shear/shift margin, +2 px so bilinear sampling at the edge has its
-    // neighbours; clamp to the canvas
-    int bx = max(0, (int)floor(x0) - 2 - mx), by = max(0, (int)floor(y0) - 2 - my);
-    int bx1 = min(full.OW, (int)ceil(x1) + 2 + mx), by1 = min(full.OH, (int)ceil(y1) + 2 + my);
-    if (bx1 <= bx) { bx = 0; bx1 = full.OW; }   // box rotated wholly off-canvas: render it
-    if (by1 <= by) { by = 0; by1 = full.OH; }   // (black) rather than fail
-    StitchMaps v = cropMaps(full, bx, by, bx1 - bx, by1 - by);
-    // output pixel (u,v) -> stitched-region pixel: src(cx+u, cy+v) - (bx, by)
-    Point2d o = src(cx, cy);
-    v.view = (Mat_<double>(2, 3) << c, s, o.x - bx, -s, c, o.y - by);
-    v.outW = cw; v.outH = ch;
-    return v;
-}
-
-static void warpHalves(const UMat &frame, const StitchMaps &m, UMat &warpL, UMat &warpR)
-{
-    int w = frame.cols / 2, h = frame.rows;
-    UMat left = frame(Rect(0, 0, w, h)).clone();
-    UMat right = frame(Rect(w, 0, frame.cols - w, h)).clone();
-    remap(left, warpL, m.mapLx, m.mapLy, INTER_LINEAR, BORDER_CONSTANT);
-    remap(right, warpR, m.mapRx, m.mapRy, INTER_LINEAR, BORDER_CONSTANT);
-}
-
-// Multi-band (Laplacian pyramid) blend of A (left) and B (right) across a sharp seam
-// mask. Low frequencies blend over a wide band (smooth tone) and high frequencies over
-// a narrow band (edges stay sharp) - no ghosting/blur, unlike a linear feather.
-static UMat straightMask(int seam, int OW, int OH)
-{
-    Mat m = Mat::zeros(OH, OW, CV_32F);
-    int s = max(0, min(seam, OW));
-    if (s > 0) m(Rect(0, 0, s, OH)).setTo(1.0f);       // 1 = keep left, 0 = keep right
-    UMat u; m.copyTo(u); return u;
-}
-
-// Dynamic seam: min-cost vertical path through the KNOWN overlap [ox0,ox1) so the cut
-// weaves AROUND moving objects. Cost = image difference + an anchor bias (stay near the
-// chosen "home" column - the tuner's draggable bar, else the overlap centre) + a temporal
-// term (stick to the previous frame's seam) so wind/noise doesn't make the seam jitter
-// frame-to-frame - it only moves when a player forces it.
-static UMat computeSeamMask(const UMat &warpL, const UMat &right, int ox0, int ox1,
-                            int OW, int OH, vector<int> &prevSeam, int anchor = -1)
-{
-    int x0 = max(0, ox0), x1 = min(OW, ox1), bw = x1 - x0;
-    if (bw < 4) { prevSeam.assign(OH, (x0 + x1) / 2); return straightMask((x0 + x1) / 2, OW, OH); }
-    // The seam's preferred column: the tuner sets this by dragging the red bar (passed
-    // through as m.seam); with no choice it falls back to the geometric overlap centre.
-    // This only sets where the seam sits through flat regions - it still weaves around
-    // players wherever the image-difference cost outweighs this gentle pull.
-    const double center = (anchor >= 0)
-        ? max((double)x0, min((double)(x1 - 1), (double)anchor)) : (x0 + x1) / 2.0;
-    const float CB = 0.08f;   // pull toward the anchor/centre
+    const float CB = 0.08f;   // pull toward the home line
     const float TW = 0.8f;    // temporal stickiness
     bool temporal = ((int)prevSeam.size() == OH);
 
-    UMat lband = warpL(Rect(x0, 0, bw, OH)), rband = right(Rect(x0, 0, bw, OH));
-    Mat L, R; lband.copyTo(L); rband.copyTo(R);       // download only the overlap band
-    Mat gL, gR; cvtColor(L, gL, COLOR_BGR2GRAY); cvtColor(R, gR, COLOR_BGR2GRAY);
-    Mat cost; absdiff(gL, gR, cost); cost.convertTo(cost, CV_32F);
-    Mat bad = (gL < 5) | (gR < 5); cost.setTo(1e6f, bad);   // keep seam inside valid overlap
+    Mat gL, gR, cost;
+    cvtColor(L.colRange(x0, x0 + bw), gL, COLOR_BGR2GRAY);
+    cvtColor(R.colRange(x0, x0 + bw), gR, COLOR_BGR2GRAY);
+    absdiff(gL, gR, cost); cost.convertTo(cost, CV_32F);
+    cost.setTo(1e6f, rm.overlap == 0);      // keep the seam inside the real overlap
     for (int y = 0; y < OH; y++)
     {
         float *cp = cost.ptr<float>(y);
+        float center = max((float)rm.bx0, min((float)(rm.bx1 - 1), rm.home[y]));
         for (int x = 0; x < bw; x++)
         {
-            float gx = (float)(x0 + x);
-            cp[x] += CB * fabsf(gx - (float)center);
+            float gx = (float)(rm.bx0 + x);
+            cp[x] += CB * fabsf(gx - center);
             if (temporal) cp[x] += TW * fabsf(gx - (float)prevSeam[y]);
         }
     }
@@ -514,140 +541,359 @@ static UMat computeSeamMask(const UMat &warpL, const UMat &right, int ox0, int o
     }
     int cur = 0;
     { const float *last = M.ptr<float>(OH - 1); for (int x = 1; x < bw; x++) if (last[x] < last[cur]) cur = x; }
-    prevSeam.assign(OH, 0);
-    Mat mask = Mat::zeros(OH, OW, CV_32F);
     for (int y = OH - 1; y >= 0; y--)
     {
-        int px = x0 + cur;
-        prevSeam[y] = px;
-        if (px > 0) mask(Rect(0, y, px, 1)).setTo(1.0f);
+        cut[y] = rm.bx0 + cur;
         if (y > 0) cur = back.ptr<int>(y)[cur];
     }
-    UMat u; mask.copyTo(u); return u;
+    prevSeam = cut;
+    return cut;
 }
 
-static UMat multiBandBlend(const UMat &A8, const UMat &B8, const UMat &maskF, int bands)
+// pyrUp split into row bands across threads (OpenCV runs it on one thread). Each band
+// is upsampled from its own source rows plus a 2-row apron and the apron is cropped
+// off, so the result is identical to a single pyrUp.
+static void pyrUpPar(const Mat &src, Mat &dst, Size dsz)
+{
+    int n = max(1, min(getNumThreads(), src.rows / 32));
+    if (n <= 1) { pyrUp(src, dst, dsz); return; }
+    dst.create(dsz, src.type());
+    const int odd = 2 * src.rows - dsz.height;   // 1 when the output height is odd
+    parallel_for_(Range(0, n), [&](const Range &r) {
+        for (int t = r.start; t < r.end; t++)
+        {
+            int y0 = src.rows * t / n, y1 = src.rows * (t + 1) / n;
+            int a0 = max(0, y0 - 2), a1 = min(src.rows, y1 + 2);
+            int th = 2 * (a1 - a0) - (a1 == src.rows ? odd : 0);
+            Mat tmp;
+            pyrUp(src.rowRange(a0, a1), tmp, Size(dsz.width, th));
+            int d0 = 2 * y0, d1 = min(dsz.height, 2 * y1);
+            tmp.rowRange(d0 - 2 * a0, d1 - 2 * a0).copyTo(dst.rowRange(d0, d1));
+        }
+    });
+}
+
+// One level of the blend, fused: out = B + w*(A - B), with w the mask in 1/256ths
+// (0 = right, 256 = left). One pass reading the 1-channel mask once per pixel and
+// applying it to all three channels. Exact at w = 0 / 256.
+static void blendLevel16(const Mat &A, const Mat &B, const Mat &W, Mat &out)
+{
+    out.create(A.size(), CV_16SC3);
+    parallel_for_(Range(0, A.rows), [&](const Range &r) {
+        for (int y = r.start; y < r.end; y++)
+        {
+            const short *a = A.ptr<short>(y), *b = B.ptr<short>(y), *w = W.ptr<short>(y);
+            short *o = out.ptr<short>(y);
+            for (int x = 0; x < A.cols; x++)
+            {
+                int wt = w[x];
+                for (int c = 0; c < 3; c++)
+                {
+                    int i = 3 * x + c;
+                    o[i] = (short)(b[i] + (((a[i] - b[i]) * wt + 128) >> 8));
+                }
+            }
+        }
+    });
+}
+
+// Multi-band (Laplacian pyramid) blend of A (left) and B (right) across the seam mask
+// W (CV_16S, 0 = right .. 256 = left). Low frequencies blend over a wide band (smooth
+// tone) and high frequencies over a narrow band (edges stay sharp) - no ghosting/blur,
+// unlike a linear feather.
+//
+// Integer throughout: the Gaussian levels stay 8-bit and the Laplacian (detail) levels
+// are 16-bit, since detail is always within -255..255. Half the memory traffic of
+// float and twice the values per SIMD instruction. Where the mask is constant the
+// pyramid collapses back to the source exactly (same integer rounding both ways).
+static Mat multiBandBlend(const Mat &A8, const Mat &B8, const Mat &W, int bands)
 {
     bands = max(2, min(bands, 8));
-    UMat A, B;
-    A8.convertTo(A, CV_32FC3);
-    B8.convertTo(B, CV_32FC3);
-    vector<UMat> gA{A}, gB{B}, gM{maskF};
+    vector<Mat> gA{A8}, gB{B8}, gW{W};
     for (int i = 1; i < bands; i++)
     {
-        UMat da, db, dm;
-        pyrDown(gA[i - 1], da); pyrDown(gB[i - 1], db); pyrDown(gM[i - 1], dm);
-        gA.push_back(da); gB.push_back(db); gM.push_back(dm);
+        Mat da, db, dw;
+        pyrDown(gA[i - 1], da); pyrDown(gB[i - 1], db); pyrDown(gW[i - 1], dw);
+        gA.push_back(da); gB.push_back(db); gW.push_back(dw);
     }
-    auto blendLevel = [](const UMat &la, const UMat &lb, const UMat &m1) {
-        UMat m3, om, a_, b_, out;
-        cvtColor(m1, m3, COLOR_GRAY2BGR);
-        subtract(Scalar::all(1), m3, om);
-        multiply(la, m3, a_); multiply(lb, om, b_);
-        add(a_, b_, out);
-        return out;
-    };
-    vector<UMat> ls(bands);
-    ls[bands - 1] = blendLevel(gA[bands - 1], gB[bands - 1], gM[bands - 1]);
+    // coarsest level: the Gaussian images themselves
+    Mat ta, tb, res;
+    gA[bands - 1].convertTo(ta, CV_16S);
+    gB[bands - 1].convertTo(tb, CV_16S);
+    blendLevel16(ta, tb, gW[bands - 1], res);
     for (int i = bands - 2; i >= 0; i--)
     {
-        UMat ua, ub, la, lb;
-        pyrUp(gA[i + 1], ua, gA[i].size()); subtract(gA[i], ua, la);
-        pyrUp(gB[i + 1], ub, gB[i].size()); subtract(gB[i], ub, lb);
-        ls[i] = blendLevel(la, lb, gM[i]);
+        // Laplacian (detail) of each image at this level, blended, then added onto the
+        // upsampled coarser result - building and collapsing in a single sweep.
+        Mat ua, ub, la, lb, lev, up;
+        pyrUpPar(gA[i + 1], ua, gA[i].size()); subtract(gA[i], ua, la, noArray(), CV_16S);
+        pyrUpPar(gB[i + 1], ub, gB[i].size()); subtract(gB[i], ub, lb, noArray(), CV_16S);
+        blendLevel16(la, lb, gW[i], lev);
+        pyrUpPar(res, up, lev.size());
+        add(up, lev, res);
     }
-    UMat res = ls[bands - 1];
-    for (int i = bands - 2; i >= 0; i--) { UMat up; pyrUp(res, up, ls[i].size()); add(up, ls[i], res); }
-    UMat out; res.convertTo(out, CV_8UC3);
+    Mat out; res.convertTo(out, CV_8UC3);
     return out;
 }
 
-// Per-channel gain so the right image's brightness/color matches the left. Gains are
-// measured from the overlap band around the seam, then applied to the WHOLE right image.
-static void exposureMatch(const UMat &warpL, UMat &right, int seam, int OW, int OH)
+// Per-channel gain so the right image's brightness/color matches the left, measured
+// where both cameras see the scene near the home line (strip-local L/R). Returned as
+// a LUT so applying it to the whole right image is a single pass.
+static bool exposureLut(const Mat &L, const Mat &R, const RenderMaps &rm, Mat &lut)
 {
-    int W = min(200, OW / 8);
-    int x0 = max(0, seam - W), x1 = min(OW, seam + W);
-    if (x1 - x0 < 2) return;
-    Rect band(x0, 0, x1 - x0, OH);
-    UMat gl, gr, mL8, mR8, mask;
-    cvtColor(warpL(band), gl, COLOR_BGR2GRAY);
-    cvtColor(right(band), gr, COLOR_BGR2GRAY);
-    threshold(gl, mL8, 5, 255, THRESH_BINARY);
-    threshold(gr, mR8, 5, 255, THRESH_BINARY);
-    bitwise_and(mL8, mR8, mask);               // valid in BOTH (skip black wedges)
-    if (countNonZero(mask) < 100) return;
-    Scalar meanL = mean(warpL(band), mask);
-    Scalar meanR = mean(right(band), mask);
-    vector<UMat> ch; split(right, ch);
+    int W = min(200, rm.OW / 8);
+    auto hm = minmax_element(rm.home.begin(), rm.home.end());
+    int x0 = max(rm.bx0, (int)floor(*hm.first) - W), x1 = min(rm.bx1, (int)ceil(*hm.second) + W);
+    if (x1 - x0 < 2) return false;
+    Mat valid = rm.overlap.colRange(x0 - rm.bx0, x1 - rm.bx0);
+    if (countNonZero(valid) < 100) return false;
+    Rect band(x0 - rm.sx0, 0, x1 - x0, rm.OH);
+    Scalar meanL = mean(L(band), valid), meanR = mean(R(band), valid);
+    lut.create(1, 256, CV_8UC3);
     for (int c = 0; c < 3; c++)
     {
         double g = meanR[c] > 1e-3 ? meanL[c] / meanR[c] : 1.0;
         g = max(0.3, min(3.0, g));             // clamp to avoid extreme corrections
-        ch[c].convertTo(ch[c], CV_8U, g);      // saturating per-channel scale
+        for (int i = 0; i < 256; i++) lut.at<Vec3b>(0, i)[c] = saturate_cast<uchar>(i * g);
     }
-    merge(ch, right);
+    return true;
 }
 
-static UMat composite(const UMat &warpL, const UMat &warpR, const StitchMaps &m,
-                      const Align &a, vector<int> *prevSeam = nullptr)
+// One frame's working state as it moves through the stages below (and through the
+// video pipeline, which runs the stages on different frames at once).
+struct FrameWork
 {
-    UMat right = warpR;
-    if (a.shiftTop != 0.0 || a.shiftBottom != 0.0 || a.shiftY != 0.0)
-    {
-        // Per-row horizontal shear (top->bottom) + vertical shift, as one affine.
-        // The shear slope is defined over the FULL canvas height, and when cropped the
-        // top of the output is row `cropY` of the full frame - so the shift at the crop's
-        // top row is shiftTop + k*cropY. This keeps the shear identical whether cropped.
-        int foh = m.fullOH > 0 ? m.fullOH : m.OH;
-        double k = (foh > 1) ? (a.shiftBottom - a.shiftTop) / (foh - 1) : 0.0;
-        double shiftTopEff = a.shiftTop + k * m.cropY;
-        Mat T = (Mat_<double>(2, 3) << 1, k, shiftTopEff, 0, 1, a.shiftY);
-        warpAffine(warpR, right, T, Size(m.OW, m.OH));
-    }
-    if (a.exposure) exposureMatch(warpL, right, m.seam, m.OW, m.OH);
-    UMat mask;
-    if (a.smartSeam)
-    {
-        vector<int> local;
-        vector<int> &ps = prevSeam ? *prevSeam : local;   // temporal only within a video loop
-        mask = computeSeamMask(warpL, right, m.ox0, m.ox1, m.OW, m.OH, ps, m.seam);
-    }
-    else
-        mask = straightMask(m.seam, m.OW, m.OH);
-    UMat pano;
+    Mat fL, fR;          // decoded camera frames
+    Mat out;             // output frame; the left camera is rendered straight into it
+    Mat wR;              // right camera, output columns [sx0, OW)
+    vector<int> cut;     // seam column per row
+};
+
+// Stage 1 (any order): each camera remapped ONCE, only over the columns it contributes
+// to, straight into output coordinates (already sheared, rotated and cropped); then
+// the right camera's exposure matched to the left.
+static void remapStage(FrameWork &f, const RenderMaps &rm, const Align &a)
+{
+    f.out.create(rm.OH, rm.OW, CV_8UC3);
+    Mat outL = f.out.colRange(0, rm.sx1);
+    remap(f.fL, outL, rm.mapL1, rm.mapL2, INTER_LINEAR, BORDER_CONSTANT);
+    remap(f.fR, f.wR, rm.mapR1, rm.mapR2, INTER_LINEAR, BORDER_CONSTANT);
+    Mat lut;
+    if (a.exposure
+        && exposureLut(f.out.colRange(rm.sx0, rm.sx1), f.wR.colRange(0, rm.sx1 - rm.sx0), rm, lut))
+        LUT(f.wR, lut, f.wR);
+}
+
+// Stage 2 (strictly in frame order - the smart seam sticks to the previous frame's).
+static void seamStage(FrameWork &f, const RenderMaps &rm, const Align &a, vector<int> &prevSeam)
+{
+    f.cut = seamPath(f.out.colRange(rm.sx0, rm.sx1), f.wR.colRange(0, rm.sx1 - rm.sx0),
+                     rm, a.smartSeam, prevSeam);
+}
+
+// Stage 3 (any order): blend across this frame's seam and fill in the right camera.
+// Only THIS frame's seam needs blending: left of the path's leftmost column the mask
+// is all left camera, right of its rightmost all right camera, so the blend runs on
+// [path min - margin, path max + margin] - usually far narrower than the strip, which
+// has to allow for the seam being anywhere in the overlap.
+static void blendStage(FrameWork &f, const RenderMaps &rm, const Align &a)
+{
+    const int OW = rm.OW, OH = rm.OH;
+    auto pr = minmax_element(f.cut.begin(), f.cut.end());
+    int q0 = max(rm.sx0, *pr.first - rm.margin), q1 = min(rm.sx1, *pr.second + rm.margin);
+    if (q1 < OW) f.wR.colRange(q1 - rm.sx0, f.wR.cols).copyTo(f.out.colRange(q1, OW));
+    if (q1 <= q0) return;
+    Rect sub(q0, 0, q1 - q0, OH);
+    Mat A = f.out(sub), B = f.wR(Rect(q0 - rm.sx0, 0, q1 - q0, OH));
     if (a.bands > 0)
     {
-        pano = multiBandBlend(warpL, right, mask, a.bands);
+        Mat W(OH, q1 - q0, CV_16S, Scalar(0));
+        for (int y = 0; y < OH; y++)
+        {
+            int n = max(0, min(f.cut[y] - q0, q1 - q0));
+            if (n > 0) W(Rect(0, y, n, 1)).setTo(256);
+        }
+        multiBandBlend(A, B, W, a.bands).copyTo(A);
     }
-    else
+    else                                     // hard seam: right camera from the cut onward
     {
-        UMat mask8; mask.convertTo(mask8, CV_8U, 255.0);
-        pano = right.clone();
-        warpL.copyTo(pano, mask8);          // left where mask, right elsewhere
+        for (int y = 0; y < OH; y++)
+        {
+            int n = max(0, min(f.cut[y] - q0, q1 - q0));
+            if (n < q1 - q0) B(Rect(n, y, q1 - q0 - n, 1)).copyTo(A(Rect(n, y, q1 - q0 - n, 1)));
+        }
     }
-    if (!m.view.empty())                    // rotate, then crop (see viewMaps)
-    {
-        UMat out;
-        warpAffine(pano, out, m.view, outSize(m), INTER_LINEAR | WARP_INVERSE_MAP,
-                   BORDER_CONSTANT, Scalar());
-        return out;
-    }
-    return pano;
 }
+
+// One whole frame, stage after stage (stills; video runs the stages as a pipeline).
+static void renderFrame(FrameWork &f, const RenderMaps &rm, const Align &a, vector<int> &prevSeam)
+{
+    remapStage(f, rm, a);
+    seamStage(f, rm, a, prevSeam);
+    blendStage(f, rm, a);
+}
+
+// ---------------------------------------------------------------- frame pipeline
+// Worker threads and frame slots. The hardware HEVC encoder caps a 5923x1697 render at
+// ~57 fps on an M5 Pro, and 2 workers already reach it; 4 leaves headroom. More
+// workers only add threads competing for memory bandwidth.
+static const int PIPE_WORKERS = 4, PIPE_SLOTS = 8;
+
+// Video runs as a pipeline, several frames in flight at once:
+//
+//     decode  ->  remap + exposure  ->  seam path  ->  blend  ->  encode
+//     (order)     (any order)           (order)        (any)      (order)
+//
+// Ordered stages take frames strictly by sequence number: decode reads the files in
+// sequence, the smart seam needs the previous frame's seam, and the encoder needs
+// frames in order. The others take any frame that is ready, so frame 6 may be remapped
+// while frame 5 still is; it then simply waits at the seam stage until 5 has passed.
+//
+// A fixed set of worker threads each takes whatever task is ready, preferring the
+// stage nearest the encoder (finish frames before starting new ones), so workers
+// drift to wherever the work is - no per-stage thread counts. Frames live in a fixed
+// set of slots: decode only starts a frame when a slot is free, so memory is bounded
+// and a fast stage just waits for a slow one. One continuous seam history, one output.
+class FramePipeline
+{
+public:
+    // decode(f) fills f.fL/f.fR and returns false at the end; write(f, n) consumes the
+    // finished frame n (0-based, in order) and returns false to stop the run.
+    FramePipeline(int slots, int workers, const RenderMaps &rm, const Align &a,
+                  std::function<bool(FrameWork &)> decode,
+                  std::function<bool(FrameWork &, int)> write)
+        : slots_(max(2, slots)), workers_(max(1, workers)), rm_(rm), a_(a),
+          decode_(std::move(decode)), write_(std::move(write)) {}
+
+    // Runs to the end (or until write/an error stops it). Returns "" or the error.
+    string run()
+    {
+        vector<std::thread> ts;
+        for (int i = 0; i < workers_; i++) ts.emplace_back([this]() { work(); });
+        for (auto &t : ts) t.join();
+        return error_;
+    }
+
+private:
+    // a slot's state = the last stage it completed
+    enum State { FREE, DECODED, REMAPPED, SEAMED, BLENDED };
+    enum Task { NONE, DECODE, REMAP, SEAM, BLEND, WRITE };
+    struct Slot { FrameWork f; int seq = -1; State state = FREE; bool busy = false; };
+
+    // Next runnable task, nearest the encoder first. Called with mu_ held.
+    Task pick(int &si)
+    {
+        if (stop_) return NONE;
+        for (int i = 0; i < (int)s_.size(); i++)
+            if (!s_[i].busy && s_[i].state == BLENDED && s_[i].seq == nextWrite_) { si = i; return WRITE; }
+        for (int i = 0; i < (int)s_.size(); i++)
+            if (!s_[i].busy && s_[i].state == SEAMED) { si = i; return BLEND; }
+        for (int i = 0; i < (int)s_.size(); i++)
+            if (!s_[i].busy && s_[i].state == REMAPPED && s_[i].seq == nextSeam_) { si = i; return SEAM; }
+        for (int i = 0; i < (int)s_.size(); i++)
+            if (!s_[i].busy && s_[i].state == DECODED) { si = i; return REMAP; }
+        if (!eof_ && !decoding_)
+            for (int i = 0; i < (int)s_.size(); i++)
+                if (s_[i].state == FREE) { si = i; return DECODE; }
+        return NONE;
+    }
+
+    bool finished() const   // nothing left to start or finish. Called with mu_ held.
+    {
+        if (stop_) return true;
+        if (!eof_ || decoding_) return false;
+        for (auto &s : s_) if (s.state != FREE) return false;
+        return true;
+    }
+
+    void work()
+    {
+        std::unique_lock<std::mutex> lk(mu_);
+        if (s_.empty()) s_.resize(slots_);
+        for (;;)
+        {
+            int si = -1;
+            Task t = pick(si);
+            if (t == NONE)
+            {
+                if (finished()) { cv_.notify_all(); return; }
+                cv_.wait(lk);
+                continue;
+            }
+            Slot &s = s_[si];
+            s.busy = true;
+            if (t == DECODE) { decoding_ = true; s.seq = nextDecode_++; }
+            lk.unlock();
+            bool ok = true;
+            try
+            {
+                switch (t)
+                {
+                case DECODE: ok = decode_(s.f); break;
+                case REMAP:  remapStage(s.f, rm_, a_); break;
+                case SEAM:   seamStage(s.f, rm_, a_, prevSeam_); break;
+                case BLEND:  blendStage(s.f, rm_, a_); break;
+                case WRITE:  ok = write_(s.f, s.seq); break;
+                default: break;
+                }
+            }
+            catch (const std::exception &ex)
+            {
+                lk.lock();
+                if (error_.empty()) error_ = string("ERROR: frame ") + to_string(s.seq) + ": " + ex.what();
+                stop_ = true; s.busy = false;
+                if (t == DECODE) decoding_ = false;
+                cv_.notify_all();
+                return;
+            }
+            lk.lock();
+            s.busy = false;
+            switch (t)
+            {
+            case DECODE:
+                decoding_ = false;
+                if (ok) s.state = DECODED;
+                else { eof_ = true; s.state = FREE; s.seq = -1; nextDecode_--; }
+                break;
+            case REMAP: s.state = REMAPPED; break;
+            case SEAM:  s.state = SEAMED; nextSeam_++; break;
+            case BLEND: s.state = BLENDED; break;
+            case WRITE:
+                s.state = FREE; s.seq = -1; nextWrite_++;
+                if (!ok) stop_ = true;
+                break;
+            default: break;
+            }
+            cv_.notify_all();
+        }
+    }
+
+    const int slots_, workers_;
+    const RenderMaps &rm_;
+    const Align &a_;
+    std::function<bool(FrameWork &)> decode_;
+    std::function<bool(FrameWork &, int)> write_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    vector<Slot> s_;
+    vector<int> prevSeam_;   // the seam stage runs one frame at a time, in order
+    int nextDecode_ = 0, nextSeam_ = 0, nextWrite_ = 0;
+    bool decoding_ = false, eof_ = false, stop_ = false;
+    string error_;
+};
 
 // Seek to frame n. Tries an indexed jump first (instant, on a properly-indexed file
 // like a remuxed MKV) and only falls back to sequential grab for un-indexed files.
-// This is what makes --jobs actually parallel: each child jumps straight to its chunk
-// instead of grab-skipping from frame 0. Un-indexed input -> slow grab (remux to fix).
+// This is what makes --start fast: it jumps straight to the frame instead of
+// grab-skipping from frame 0. Un-indexed input -> slow grab (remux to fix).
 
 // ---------------------------------------------------------------- dual input
 // The rig records TWO independent files, one per camera. PairCapture opens both
-// and hands the rest of this program one frame with CAM0|CAM1 concatenated, so
-// nothing downstream (warpHalves, maps, composite) needs to know.
+// and hands back the LEFT and RIGHT frames of each pair as they decode - separately,
+// so each remap reads straight from its own camera's frame with no copies between.
 //
-// Pairing is driven by the FILENAME so that --jobs children and the tuner
-// inherit it with no extra plumbing:
+// Pairing is driven by the FILENAME so that the CLI and the tuner
+// share it with no extra plumbing:
 //     --source take_..._cam0.mkv       ->  also opens take_..._cam1.mkv (either half works;
 //                                          so do the /calib page's cam0_NNN / cam1_NNN)
 //     --source "a.mkv::b.mkv"          (explicit, any names)
@@ -907,32 +1153,30 @@ public:
     bool grab() { bool ok = a_.grab(); return b_.grab() && ok; }
 
     // retrieve() pairs with grab() for scrubbing: decode whatever grab() staged
-    bool retrieve(Mat &out)
+    bool retrieve(Mat &fa, Mat &fb)
     {
-        Mat fa, fb;
         if (!a_.retrieve(fa) || fa.empty()) return false;
         if (!b_.retrieve(fb) || fb.empty()) return false;
-        if (fa.rows != fb.rows || fa.type() != fb.type()) return false;
-        hconcat(fa, fb, out);
-        return true;
+        return samePair(fa, fb);
     }
 
-    bool read(Mat &out)
+    bool read(Mat &fa, Mat &fb)
     {
-        Mat fa, fb;
         if (!a_.read(fa) || fa.empty()) return false;
         if (!b_.read(fb) || fb.empty()) return false;
-        if (fa.rows != fb.rows || fa.type() != fb.type())
-        {
-            cerr << "pair mismatch: " << fa.cols << "x" << fa.rows
-                 << " vs " << fb.cols << "x" << fb.rows << " - cannot concatenate\n";
-            return false;
-        }
-        hconcat(fa, fb, out);
-        return true;
+        return samePair(fa, fb);
     }
 
 private:
+    // both halves share one set of maps, so they must match
+    static bool samePair(const Mat &fa, const Mat &fb)
+    {
+        if (fa.size() == fb.size() && fa.type() == fb.type()) return true;
+        cerr << "pair mismatch: " << fa.cols << "x" << fa.rows
+             << " vs " << fb.cols << "x" << fb.rows << "\n";
+        return false;
+    }
+
     VideoCapture a_, b_;
 };
 
@@ -952,33 +1196,30 @@ static bool seekFrame(Cap &cap, int n)
     return true;
 }
 
-// Read a STILL the same way PairCapture reads video: two files, one per camera,
-// hconcat'd into the CAM0|CAM1 frame the rest of the pipeline expects.
-static Mat readPairedImage(const string &source)
+// Read a STILL the same way PairCapture reads video: two files, one per camera.
+static bool readPairedImage(const string &source, Mat &fa, Mat &fb)
 {
     string L, R;
-    if (!resolvePairPaths(source, L, R)) return Mat();   // already reported why
-    Mat fa = imread(L), fb = imread(R);
-    if (fa.empty() || fb.empty()) return Mat();
-    if (fa.rows != fb.rows || fa.type() != fb.type())
+    if (!resolvePairPaths(source, L, R)) return false;   // already reported why
+    fa = imread(L); fb = imread(R);
+    if (fa.empty() || fb.empty()) return false;
+    if (fa.size() != fb.size() || fa.type() != fb.type())
     {
         cerr << "pair mismatch: " << fa.cols << "x" << fa.rows
-             << " vs " << fb.cols << "x" << fb.rows << " - cannot concatenate\n";
-        return Mat();
+             << " vs " << fb.cols << "x" << fb.rows << "\n";
+        return false;
     }
-    Mat out; hconcat(fa, fb, out); return out;
+    return true;
 }
 
-static string stitchImageFile(const string &source, StitchMaps &m,
+static string stitchImageFile(const string &source, const RenderMaps &rm,
                               const Align &a, const string &outDir, const string &outFile = "")
 {
-    Mat img = readPairedImage(source);
-    if (img.empty()) return "ERROR: cannot read image";
-    UMat uImg, wL, wR;
-    img.copyTo(uImg);
-    warpHalves(uImg, m, wL, wR);
-    UMat uPano = composite(wL, wR, m, a);
-    Mat pano; uPano.copyTo(pano);
+    FrameWork f;
+    if (!readPairedImage(source, f.fL, f.fR)) return "ERROR: cannot read image";
+    vector<int> prevSeam;
+    renderFrame(f, rm, a, prevSeam);
+    Mat &pano = f.out;
     string out = !outFile.empty() ? outFile : (outDir + "/pano.jpg");
     imwrite(out, pano);
     return out;
@@ -1007,7 +1248,7 @@ static bool encoderInitializes(const string &name, int w = 64, int h = 64)
 }
 
 // Pick the H.264 encoder for the ffmpeg output pipe. Precedence:
-//   1. an explicit --venc NAME (also how the parent hands its choice to --jobs children)
+//   1. an explicit --venc NAME
 //   2. unless --cpu: the first hardware encoder that initializes on this machine
 //        macOS  -> VideoToolbox;  else NVENC, then AMD AMF, then Intel QuickSync
 //   3. software libx264
@@ -1067,10 +1308,10 @@ static string buildEncodeCmd(const string &venc, int W, int H, double fps, const
     return c.str();
 }
 
-static string stitchVideoFile(const string &source, StitchMaps &m,
+static string stitchVideoFile(const string &source, const RenderMaps &rm,
                               const Align &a, int startFrame, int endFrame, int totalFrames,
                               const string &outDir, const string &outFile = "",
-                              std::atomic<int> *prog = nullptr, const string &progFile = "")
+                              std::atomic<int> *prog = nullptr)
 {
     PairCapture cap(source);
     if (!cap.isOpened()) return "ERROR: cannot open video";
@@ -1083,10 +1324,10 @@ static string stitchVideoFile(const string &source, StitchMaps &m,
     string out = !outFile.empty() ? outFile : (outDir + "/stitched_video.mp4");
 
     // Encode via an ffmpeg pipe (hardware HEVC when available, else libx264). ffmpeg
-    // is already required for the default --jobs concat. If it isn't
+    // is effectively required (it's also the HEVC path for wide panoramas). If it isn't
     // on PATH we fall back to OpenCV's own H.264 writer (avc1) so a bare install still
     // stitches - on macOS that path is itself VideoToolbox-backed.
-    Size osz = outSize(m);
+    Size osz(rm.OW, rm.OH);
     string venc = chooseVideoEncoder(osz.width, osz.height);
     bool useFfmpeg = ffmpegAvailable();
     FILE *pipe = nullptr;
@@ -1107,40 +1348,37 @@ static string stitchVideoFile(const string &source, StitchMaps &m,
     }
 
     seekFrame(cap, s);
-    Mat frame, pano;
-    UMat uFrame, wL, wR;
-    vector<int> prevSeam;   // carried across frames for a temporally stable smart seam
-    int written = 0;
-    for (int i = s; i <= e; i++)
-    {
-        if (!cap.read(frame) || frame.empty()) break;   // also stops at EOF
-        frame.copyTo(uFrame);
-        warpHalves(uFrame, m, wL, wR);
-        composite(wL, wR, m, a, &prevSeam).copyTo(pano);
+    // Run the frames through the pipeline (see FramePipeline). Slots = frames in
+    // flight; workers = threads taking stage tasks.
+    const int total = bounded ? (e - s + 1) : BIG;
+    int decoded = 0, written = 0;
+    auto decode = [&](FrameWork &f) {
+        if (decoded >= total || !cap.read(f.fL, f.fR)) return false;   // range end / EOF
+        ++decoded;
+        return true;
+    };
+    auto write = [&](FrameWork &f, int n) {
+        Mat &pano = f.out;                  // continuous 8UC3, ready to pipe
+        int i = s + n;
         if (pipe)
         {
-            if (pano.type() != CV_8UC3) pano.convertTo(pano, CV_8UC3);
-            if (!pano.isContinuous()) pano = pano.clone();
             size_t bytes = (size_t)pano.total() * pano.elemSize();
             if (fwrite(pano.data, 1, bytes, pipe) != bytes)
-            { cerr << "encoder pipe closed early (frame " << i << ") - see ffmpeg output above\n"; break; }
+            { cerr << "encoder pipe closed early (frame " << i << ") - see ffmpeg output above\n"; return false; }
         }
         else writer.write(pano);
         ++written;
         if (bounded)
         {
-            int pct = (int)(100.0 * (i - s + 1) / (e - s + 1));
+            int pct = (int)(100.0 * written / total);
             if (prog) prog->store(pct);
-            if (written % 30 == 0 || i == e)
-            {
-                cout << "  " << pct << "%  (frame " << i << ")\n";
-                // Dedicated per-process progress file the parent monitor reads: "pct done total".
-                if (!progFile.empty())
-                { ofstream pf(progFile, std::ios::trunc); if (pf) pf << pct << " " << (i - s + 1) << " " << (e - s + 1) << "\n"; }
-            }
+            if (written % 30 == 0 || i == e) cout << "  " << pct << "%  (frame " << i << ")\n";
         }
         else if (written % 30 == 0) cout << "  frame " << i << "\n";
-    }
+        return true;
+    };
+    string err = FramePipeline(PIPE_SLOTS, PIPE_WORKERS, rm, a, decode, write).run();
+    if (!err.empty()) cerr << err << "\n";
     cap.release();
     if (pipe)
     {
@@ -1148,6 +1386,7 @@ static string stitchVideoFile(const string &source, StitchMaps &m,
         if (rc != 0) return "ERROR: ffmpeg encoder exited " + to_string(rc) + " (encoder=" + venc + ")";
     }
     else writer.release();
+    if (!err.empty()) return err;
     return out + "  (" + to_string(written) + " frames)";
 }
 
@@ -1224,7 +1463,6 @@ static string tunerHtml()
   <span id="pct" style="margin-left:8px">0%</span>
   <button id="finish" style="display:none;margin-left:12px">Finish &amp; stop</button>
 </div>
-<div id="parts" style="padding:0 10px 10px;display:none;font-size:.9em;line-height:1.7"></div>
 <div id="cmdwrap" style="display:none;padding:0 10px 10px">
   <div style="font-size:.8em;color:#9cf;margin-bottom:4px">Equivalent CLI command for these settings (click to select, then copy):</div>
   <textarea id="cmdbox" readonly onclick="this.select()" style="width:100%;height:64px;font-family:monospace;font-size:.78em;background:#111;color:#dfe;border:1px solid #444;border-radius:6px;padding:6px;box-sizing:border-box"></textarea>
@@ -1430,7 +1668,6 @@ stitchBtn.onclick=async()=>{
   document.getElementById('prog').style.display='block';
   document.getElementById('finish').style.display='none';
   pb.value=0; pct.textContent='0%';
-  document.getElementById('parts').style.display='none';
   st('Stitching all frames → '+out+' …');
   try{ const r=await fetch('/stitch?'+params());
        const t=await r.text();
@@ -1443,12 +1680,6 @@ stitchBtn.onclick=async()=>{
       pb.value=p.percent; pct.textContent=p.percent+'%';
       if(p.cmd){ document.getElementById('cmdwrap').style.display='block';
                  document.getElementById('cmdbox').value=p.cmd; }
-      const pe=document.getElementById('parts');
-      if(p.parts && p.parts.length){
-        pe.style.display='block';
-        pe.innerHTML=p.parts.map((x,i)=>'process '+i+': '+x.done+'/'+x.total+' ('+x.pct+'%) '
-          +'<progress max="100" value="'+x.pct+'" style="width:160px;vertical-align:middle"></progress>').join('<br>');
-      }
       if(p.done){
         clearInterval(polling); polling=null;
         stitchBtn.disabled=false;
@@ -1543,13 +1774,6 @@ static void openBrowser(const string &url)
 #endif
 }
 
-// Read a child's "pct done total" progress file (best-effort; false if not ready).
-static bool readProg(const string &path, int &pct, int &done, int &total)
-{
-    ifstream f(path);
-    return (bool)(f >> pct >> done >> total);
-}
-
 static string exePath();   // forward decl (defined below, near main)
 
 // Build the exact, copy-pasteable CLI command that reproduces a stitch with these
@@ -1558,7 +1782,7 @@ static string exePath();   // forward decl (defined below, near main)
 static string buildCliCommand(const string &source, const string &calibDir,
                               double degrees, int seamArg, const Align &a,
                               const string &cropArg, int startFrame, int endFrame,
-                              int jobs, const string &outFile)
+                              const string &outFile)
 {
     auto q = [](const string &s) { return "\"" + s + "\""; };
     string exe = exePath(); if (exe.empty()) exe = "StitchPipeline";
@@ -1576,23 +1800,16 @@ static string buildCliCommand(const string &source, const string &calibDir,
     if (!cropArg.empty())     c += " --crop " + q(cropArg);
     if (startFrame > 0)       c += " --start " + to_string(startFrame);
     if (endFrame >= 0)        c += " --end " + to_string(endFrame);
-    c += " --jobs " + to_string(jobs) + " --out-file " + q(outFile);
+    c += " --out-file " + q(outFile);
     return c;
 }
-
-// Forward decl: the tuner routes video renders through the parallel path too.
-static int runParallelJobs(const string &source, const string &calibDir,
-                           double degrees, int seamArg, const Align &a,
-                           const string &cropArg, int startFrame, int endFrame,
-                           const string &outFile, int jobs, std::atomic<int> *prog = nullptr,
-                           int panoW = 64, int panoH = 64);
 
 static void runTuneServer(const Mat &KL, const vector<double> &DL,
                           const Mat &KR, const vector<double> &DR, const Mat &R,
                           double degrees, int startFrame, int endFrame,
                           const string &outDir, const string &initSource,
                           const string &initOutFile, int port,
-                          const string &calibDir, int jobs)
+                          const string &calibDir)
 {
 #ifdef _WIN32
     WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -1613,20 +1830,19 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
     // "" on success or an error message.
     auto loadSource = [&](const string &path) -> string {
         bool isVid = isVideoFile(path);
-        Mat frame; int tf = 1;
-        if (!isVid) { frame = readPairedImage(path); }
+        Mat fL, fR; int tf = 1;
+        if (!isVid) { readPairedImage(path, fL, fR); }
         else
         {
             PairCapture cap(path);
             if (!cap.isOpened()) return "cannot open video";
             tf = (int)cap.get(CAP_PROP_FRAME_COUNT);
             if (tf < 1 || tf > 100000000) { double fps = cap.get(CAP_PROP_FPS); tf = probeFrames(path, fps > 0 ? fps : 30.0); }
-            cap.read(frame); cap.release();
+            cap.read(fL, fR); cap.release();
         }
-        if (frame.empty()) return "cannot read source";
-        StitchMaps mm = buildStitchMaps(KL, DL, KR, DR, R, frame.cols / 2, frame.rows, -1);
-        UMat uF, wL, wR; frame.copyTo(uF); warpHalves(uF, mm, wL, wR);
-        Mat mL, mR; wL.copyTo(mL); wR.copyTo(mR);
+        if (fL.empty() || fR.empty()) return "cannot read source";
+        StitchMaps mm = buildStitchMaps(KL, DL, KR, DR, R, fL.cols, fL.rows, -1);
+        Mat mL, mR; warpPreview(fL, fR, mm, mL, mR);
         vector<uchar> bL, bR; vector<int> q = {IMWRITE_JPEG_QUALITY, 85};
         imencode(".jpg", mL, bL, q); imencode(".jpg", mR, bR, q);
         m = mm; video = isVid; totalFrames = tf; source = path; loaded = true;
@@ -1649,7 +1865,7 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
 
     // Stitch settings from a /stitch or /command query. One parser for both, so the
     // command shown before a stitch is exactly the one the stitch runs.
-    auto parseStitch = [&](const string &query, Align &a, StitchMaps &mm,
+    auto parseStitch = [&](const string &query, Align &a, StitchMaps &mm, ViewBox &vb,
                            string &cropStr, int &seamVal, double &dg) {
         a.shiftTop = !qparam(query, "shifttop").empty() ? stod(qparam(query, "shifttop")) : 0;
         a.shiftBottom = !qparam(query, "shiftbottom").empty() ? stod(qparam(query, "shiftbottom")) : 0;
@@ -1658,8 +1874,8 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
         a.exposure = qparam(query, "exposure") == "1";
         a.smartSeam = qparam(query, "smartseam") == "1";
         string ss = qparam(query, "seam");
-        StitchMaps full = m;
-        if (!ss.empty()) full.seam = stoi(ss);
+        mm = m;
+        if (!ss.empty()) mm.seam = stoi(ss);
         seamVal = ss.empty() ? -1 : stoi(ss);
         // Optional crop (full-canvas coords): restrict all work to this region.
         int cw = !qparam(query, "cropw").empty() ? stoi(qparam(query, "cropw")) : 0;
@@ -1672,7 +1888,7 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
         // Rotation of the finished panorama (tuner's Rotate control -> --degrees);
         // falls back to whatever was passed on the command line when the param is absent.
         dg = !qparam(query, "degrees").empty() ? stod(qparam(query, "degrees")) : degrees;
-        mm = viewMaps(full, cx, cy, cw, chh, dg, a);   // rotate, then crop
+        vb = clampBox(mm, ViewBox{cx, cy, cw, chh, dg});   // rotate, then crop
     };
 
     // Preload a source passed on the command line (`--source x --tune`).
@@ -1749,12 +1965,11 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
             else if (g_busy) { body = "busy"; }
             else
             {
-                Align a; StitchMaps mm; string cropStr; int seamVal; double dg;
-                parseStitch(query, a, mm, cropStr, seamVal, dg);
+                Align a; StitchMaps mm; ViewBox vb; string cropStr; int seamVal; double dg;
+                parseStitch(query, a, mm, vb, cropStr, seamVal, dg);
                 if (!cropStr.empty()) cout << "[stitch] crop " << cropStr << "\n";
                 g_busy = true; g_done = false; g_percent = 0;
                 { lock_guard<mutex> lk(g_mu); g_result.clear(); }
-                { lock_guard<mutex> lk(g_partMu); g_partPct.clear(); g_partDone.clear(); g_partTotal.clear(); }
                 cout << "[stitch] top=" << a.shiftTop << " bottom=" << a.shiftBottom
                      << " y=" << a.shiftY << " seam=" << mm.seam << " -> " << outFile << " ...\n";
                 int tf = totalFrames;
@@ -1765,25 +1980,15 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
                 {
                     string fo = of.empty() ? (outDir + "/stitched_video.mp4") : of;
                     string cmd = buildCliCommand(src, calib, dg, seamVal, a, cropStr,
-                                                 startFrame, (vid ? endRes : -1), (vid ? jobs : 1), fo);
+                                                 startFrame, (vid ? endRes : -1), fo);
                     { lock_guard<mutex> lk(g_mu); g_cmd = cmd; }
                     cout << "[stitch] equivalent CLI command:\n  " << cmd << "\n";
                 }
-                std::thread([mm, a, src, vid, dg, startFrame, endFrame, endRes, tf,
-                             outDir, of, seamVal, cropStr, calib, jobs]() mutable {
-                    string res;
-                    if (vid && jobs > 1 && endRes >= startFrame)   // parallel video render
-                    {
-                        string fo = of.empty() ? (outDir + "/stitched_video.mp4") : of;
-                        int rc = runParallelJobs(src, calib, dg, seamVal, a, cropStr,
-                                                 startFrame, endRes, fo, jobs, &g_percent,
-                                                 outSize(mm).width, outSize(mm).height);
-                        res = rc == 0 ? fo : string("ERROR: parallel stitch failed (see console)");
-                    }
-                    else                                           // single-process (image, or --no-jobs)
-                        res = vid
-                            ? stitchVideoFile(src, mm, a, startFrame, endFrame, tf, outDir, of, &g_percent)
-                            : stitchImageFile(src, mm, a, outDir, of);
+                std::thread([mm, vb, a, src, vid, startFrame, endFrame, tf, outDir, of]() {
+                    RenderMaps rm = buildRenderMaps(mm, vb, a);
+                    string res = vid
+                        ? stitchVideoFile(src, rm, a, startFrame, endFrame, tf, outDir, of, &g_percent)
+                        : stitchImageFile(src, rm, a, outDir, of);
                     { lock_guard<mutex> lk(g_mu); g_result = res; }
                     g_percent = 100; g_done = true; g_busy = false;
                     cout << "[stitch] done -> " << res << "\n";
@@ -1799,11 +2004,11 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
             string cmd;
             if (loaded && !outFile.empty())
             {
-                Align a; StitchMaps mm; string cropStr; int seamVal; double dg;
-                parseStitch(query, a, mm, cropStr, seamVal, dg);
+                Align a; StitchMaps mm; ViewBox vb; string cropStr; int seamVal; double dg;
+                parseStitch(query, a, mm, vb, cropStr, seamVal, dg);
                 int endRes = endFrame >= 0 ? endFrame : (totalFrames > 0 ? totalFrames - 1 : -1);
                 cmd = buildCliCommand(source, calibDir, dg, seamVal, a, cropStr, startFrame,
-                                      (video ? endRes : -1), (video ? jobs : 1), outFile);
+                                      (video ? endRes : -1), outFile);
             }
             body = "{\"cmd\":\"" + jsonEscape(cmd) + "\"}";
         }
@@ -1816,19 +2021,17 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
                 int n = 0; string ns = qparam(query, "n");
                 if (!ns.empty()) n = stoi(ns);
                 if (n < 0) n = 0;
-                Mat frame;
+                Mat fL, fR;
                 // sequential positioning (seeking is unreliable). Grab forward from the
                 // current position; only re-open when scrubbing backward.
                 if (!frameCap.isOpened() || n < frameCapPos)
                 { frameCap.release(); frameCap.open(source); frameCapPos = -1; }
                 while (frameCapPos < n) { if (!frameCap.grab()) break; frameCapPos++; }
-                if (frameCapPos == n) frameCap.retrieve(frame);
-                if (frame.empty()) { body = "{\"error\":\"cannot read frame\"}"; }
+                if (frameCapPos == n) frameCap.retrieve(fL, fR);
+                if (fL.empty() || fR.empty()) { body = "{\"error\":\"cannot read frame\"}"; }
                 else
                 {
-                    UMat uF, wL, wR; frame.copyTo(uF);
-                    warpHalves(uF, m, wL, wR);
-                    Mat mL, mR; wL.copyTo(mL); wR.copyTo(mR);
+                    Mat mL, mR; warpPreview(fL, fR, m, mL, mR);
                     vector<uchar> bL, bR; vector<int> q = {IMWRITE_JPEG_QUALITY, 85};
                     imencode(".jpg", mL, bL, q);
                     imencode(".jpg", mR, bR, q);
@@ -1848,14 +2051,7 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
               << ",\"done\":" << (g_done ? "true" : "false")
               << ",\"percent\":" << g_percent.load()
               << ",\"cmd\":\"" << jsonEscape(cmd) << "\""
-              << ",\"result\":\"" << jsonEscape(res) << "\",\"parts\":[";
-            {
-                lock_guard<mutex> lk(g_partMu);
-                for (size_t i = 0; i < g_partPct.size(); i++)
-                    j << (i ? "," : "") << "{\"pct\":" << g_partPct[i]
-                      << ",\"done\":" << g_partDone[i] << ",\"total\":" << g_partTotal[i] << "}";
-            }
-            j << "]}";
+              << ",\"result\":\"" << jsonEscape(res) << "\"}";
             body = j.str();
         }
         else if (path == "/quit")
@@ -1989,258 +2185,6 @@ static int runShell(string cmd)
     return std::system(cmd.c_str());
 }
 
-// Clean teardown of parallel children when the PARENT is stopped. Without this,
-// killing the parent orphaned the workers (re-parented to init) and they kept
-// rendering and writing part files. POSIX: each child is spawned into its OWN
-// process group and a SIGINT/SIGTERM handler kills each group (-pgid), taking that
-// child's sh + StitchPipeline + ffmpeg with it. Windows: children are assigned to a
-// Job Object with KILL_ON_JOB_CLOSE, so they die automatically when the parent's
-// handle closes (i.e. when the parent exits or is killed).
-// Caveat: nothing can catch SIGKILL / `kill -9` on the parent - that still orphans.
-#ifndef _WIN32
-static pid_t g_childPgids[256];
-static volatile sig_atomic_t g_nChildPgids = 0;
-static struct sigaction g_prevSigint, g_prevSigterm;
-static void parentTeardownHandler(int sig)
-{
-    for (int i = 0; i < g_nChildPgids; i++)
-        if (g_childPgids[i] > 0) kill(-g_childPgids[i], SIGKILL);   // kill each child's whole group
-    struct sigaction dfl = {}; dfl.sa_handler = SIG_DFL;
-    sigaction(sig, &dfl, nullptr);
-    raise(sig);                                                     // die with the original signal
-}
-#endif
-
-// Launch every command concurrently and wait for them all; rc[i] gets each exit
-// code. This is the parallel-jobs workhorse and must NOT use std::system(): on
-// macOS the C library serializes concurrent system() calls (it holds a global
-// lock across the child's whole run for its SIGINT/SIGQUIT/SIGCHLD handling), so
-// system()-on-threads made `--jobs` run one child AT A TIME. We spawn real
-// processes instead - posix_spawn on POSIX, CreateProcess on Windows - so the N
-// children genuinely run in parallel. (Windows' system() didn't have the lock,
-// which is why --jobs already parallelized there; this keeps that behavior.)
-static void runShellsConcurrent(const vector<string> &cmds, vector<int> &rc)
-{
-    int n = (int)cmds.size();
-#ifdef _WIN32
-    // Kill-on-close job: if the parent dies for any reason, the children die too.
-    HANDLE job = CreateJobObjectA(nullptr, nullptr);
-    if (job)
-    {
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {};
-        jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(job, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
-    }
-    vector<HANDLE> procs(n, nullptr);
-    for (int i = 0; i < n; i++)
-    {
-        string full = "cmd /c \"" + cmds[i] + "\"";
-        vector<char> buf(full.begin(), full.end()); buf.push_back('\0');
-        STARTUPINFOA si; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
-        PROCESS_INFORMATION pi; ZeroMemory(&pi, sizeof(pi));
-        // CREATE_SUSPENDED so we can put the child in the job BEFORE it spawns its
-        // own children (StitchPipeline + ffmpeg), so they inherit the job too.
-        if (CreateProcessA(nullptr, buf.data(), nullptr, nullptr, FALSE,
-                           CREATE_SUSPENDED, nullptr, nullptr, &si, &pi))
-        {
-            if (job) AssignProcessToJobObject(job, pi.hProcess);
-            ResumeThread(pi.hThread);
-            procs[i] = pi.hProcess; CloseHandle(pi.hThread);
-        }
-        else { rc[i] = -1; }
-    }
-    for (int i = 0; i < n; i++)
-    {
-        if (!procs[i]) continue;
-        WaitForSingleObject(procs[i], INFINITE);
-        DWORD code = 1; GetExitCodeProcess(procs[i], &code);
-        rc[i] = (int)code; CloseHandle(procs[i]);
-    }
-    if (job) CloseHandle(job);          // children have exited; releasing the job is safe
-#else
-    // Install the teardown handler and spawn each child into its own process group.
-    int tracked = (n <= 256) ? n : 256;
-    g_nChildPgids = 0;
-    struct sigaction sa = {};
-    sa.sa_handler = parentTeardownHandler;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGINT,  &sa, &g_prevSigint);
-    sigaction(SIGTERM, &sa, &g_prevSigterm);
-
-    vector<pid_t> pids(n, -1);
-    for (int i = 0; i < n; i++)
-    {
-        const char *argv[] = { "/bin/sh", "-c", cmds[i].c_str(), nullptr };
-        posix_spawnattr_t attr;
-        posix_spawnattr_init(&attr);
-        posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
-        posix_spawnattr_setpgroup(&attr, 0);        // child leads its own group (pgid == pid)
-        pid_t pid = -1;
-        int r = posix_spawn(&pid, "/bin/sh", nullptr, &attr,
-                            const_cast<char *const *>(argv), environ);
-        posix_spawnattr_destroy(&attr);
-        if (r == 0)
-        {
-            pids[i] = pid;
-            if (i < tracked) { g_childPgids[g_nChildPgids] = pid; g_nChildPgids = g_nChildPgids + 1; }
-        }
-        else rc[i] = -1;
-    }
-    for (int i = 0; i < n; i++)
-    {
-        if (pids[i] <= 0) continue;
-        int status = 0;
-        if (waitpid(pids[i], &status, 0) < 0) { rc[i] = -1; continue; }
-        rc[i] = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-    }
-    g_nChildPgids = 0;                              // all reaped; restore prior handlers
-    sigaction(SIGINT,  &g_prevSigint,  nullptr);
-    sigaction(SIGTERM, &g_prevSigterm, nullptr);
-#endif
-}
-
-// Parallel stitch: split [startFrame..endFrame] across `jobs` child processes (each
-// this same exe with --jobs 1 over its sub-range -> its own temp part), run them
-// concurrently, then ffmpeg-concat the parts (in order) into `outFile`. Child
-// processes rather than threads so each has its own OpenCL context and the GPU
-// scheduler can overlap them. Returns 0 on success. The smart seam resets at each
-// chunk boundary (fresh prevSeam per child) - the only cost of the split.
-static int runParallelJobs(const string &source, const string &calibDir,
-                           double degrees, int seamArg, const Align &a,
-                           const string &cropArg, int startFrame, int endFrame,
-                           const string &outFile, int jobs, std::atomic<int> *prog,
-                           int panoW, int panoH)
-{
-    auto q = [](const string &s) { return "\"" + s + "\""; };   // quote for the shell
-
-    string exe = exePath();
-    if (exe.empty()) { cerr << "jobs: cannot locate own executable.\n"; return -1; }
-
-    int total = endFrame - startFrame + 1;
-    if (jobs > total) jobs = total;                 // never more jobs than frames
-    int per = (total + jobs - 1) / jobs;            // ceil, so chunks tile the range
-
-    // Resolve the encoder ONCE in the parent and pin it for every child via --venc, so
-    // all parts share identical codec params (required for the lossless -c copy concat).
-    string resolvedEnc = chooseVideoEncoder(panoW, panoH);
-    cout << "jobs: encoder " << resolvedEnc << " @ "
-         << resolveBitrate(resolvedEnc, panoW, panoH, 30.0)
-         << (g_vbitrate == "auto" ? " auto" : "") << " for all parts\n";
-
-    fs::path op(outFile);
-    string stem = op.stem().string();
-    string ext = op.extension().empty() ? ".mp4" : op.extension().string();
-    fs::path dir = op.parent_path();
-
-    vector<string> parts, logs, progs, cmds;
-    vector<int> rangeS, rangeE;
-    for (int i = 0; i < jobs; i++)
-    {
-        int s = startFrame + i * per;
-        if (s > endFrame) break;
-        int e = min(s + per - 1, endFrame);
-        string part = (dir / (stem + ".part" + to_string(i) + ext)).string();
-        string log = (dir / (stem + ".part" + to_string(i) + ".log")).string();
-        string prg = (dir / (stem + ".part" + to_string(i) + ".prog")).string();
-        parts.push_back(part);
-        logs.push_back(log);
-        progs.push_back(prg);
-        rangeS.push_back(s);
-        rangeE.push_back(e);
-        cmds.push_back(
-            q(exe) + " --source " + q(source) + " --calib-dir " + q(calibDir)
-            + " --degrees " + to_string(degrees) + " --seam " + to_string(seamArg)
-            + " --shift-top " + to_string(a.shiftTop) + " --shift-bottom " + to_string(a.shiftBottom)
-            + " --shift-y " + to_string(a.shiftY) + " --bands " + to_string(a.bands)
-            + (a.exposure ? "" : " --no-exposure") + (a.smartSeam ? "" : " --no-smart-seam")
-            + (cropArg.empty() ? "" : " --crop " + q(cropArg))
-            + " --pair-offset " + to_string(g_pairOffset)
-            + (g_scale != 1.0 ? " --scale " + to_string(g_scale) : "")
-            + " --jobs 1 --start " + to_string(s) + " --end " + to_string(e)
-            + " --venc " + q(resolvedEnc) + " --bitrate " + q(g_vbitrate)
-            + " --progress-file " + q(prg)
-            + " --out-file " + q(part) + " > " + q(log) + " 2>&1");
-    }
-
-    int n = (int)cmds.size();
-    cout << "jobs: splitting frames " << startFrame << ".." << endFrame
-         << " across " << n << " parallel process(es)\n";
-    // Top-level equivalent command (what you'd run by hand to reproduce this):
-    cout << "jobs: equivalent single command:\n  "
-         << buildCliCommand(source, calibDir, degrees, seamArg, a, cropArg,
-                            startFrame, endFrame, jobs, outFile) << "\n";
-    for (int i = 0; i < n; i++)
-    {
-        cout << "  part " << i << ": frames " << rangeS[i] << ".." << rangeE[i]
-             << "   (progress -> " << logs[i] << ")\n";
-        cout << "    cmd: " << cmds[i] << "\n";   // the exact child command spawned
-    }
-    cout << "Working... (per-process progress below; also in each .log)\n";
-
-    { lock_guard<mutex> lk(g_partMu); g_partPct.assign(n, 0); g_partDone.assign(n, 0); g_partTotal.assign(n, 0); }
-
-    // Monitor: poll each child's .prog file, update shared per-part state (for the tuner
-    // UI + the overall prog bar), and print a live per-process line to the console.
-    std::atomic<bool> running{true};
-    std::thread mon([&]() {
-        while (running.load())
-        {
-            int sum = 0;
-            {
-                lock_guard<mutex> lk(g_partMu);
-                for (int i = 0; i < n; i++)
-                {
-                    int p = 0, d = 0, t = 0;
-                    if (readProg(progs[i], p, d, t)) { g_partPct[i] = p; g_partDone[i] = d; g_partTotal[i] = t; }
-                    sum += g_partPct[i];
-                }
-            }
-            if (prog) prog->store(n ? sum / n : 0);
-            {
-                ostringstream ln; ln << "\rjobs:";
-                lock_guard<mutex> lk(g_partMu);
-                for (int i = 0; i < n; i++) ln << "  p" << i << " " << g_partPct[i] << "%";
-                cout << ln.str() << std::flush;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        }
-    });
-
-    vector<int> rc(n, -1);
-    runShellsConcurrent(cmds, rc);          // real parallel processes (see the note there)
-    running = false; mon.join();
-    { lock_guard<mutex> lk(g_partMu); for (int i = 0; i < n; i++) g_partPct[i] = 100; }
-    cout << "\n";
-
-    bool ok = true;
-    for (int i = 0; i < n; i++)
-    {
-        std::error_code ec;
-        if (rc[i] != 0 || !fs::exists(parts[i], ec))
-        { cerr << "jobs: part " << i << " failed (exit " << rc[i] << "); see " << logs[i] << "\n"; ok = false; }
-    }
-    if (!ok) { cerr << "jobs: a part failed - not concatenating; parts left on disk.\n"; return 1; }
-
-    // Lossless join of the parts (all identical codec/size/fps) via ffmpeg concat.
-    fs::path listPath = dir / (stem + ".concat.txt");
-    {
-        ofstream lf(listPath.string());
-        for (const auto &p : parts)
-        { string fp = p; std::replace(fp.begin(), fp.end(), '\\', '/'); lf << "file '" << fp << "'\n"; }
-    }
-    cout << "jobs: concatenating " << n << " parts -> " << outFile << "\n";
-    int crc = runShell("ffmpeg -y -f concat -safe 0 -i " + q(listPath.string()) + " -c copy " + q(outFile));
-    if (crc != 0) { cerr << "jobs: ffmpeg concat failed (exit " << crc << "). Is ffmpeg on PATH? Parts kept.\n"; return 1; }
-
-    std::error_code ec;
-    for (const auto &p : parts) fs::remove(p, ec);
-    for (const auto &l : logs) fs::remove(l, ec);
-    for (const auto &pg : progs) fs::remove(pg, ec);
-    fs::remove(listPath, ec);
-    cout << "jobs: done -> " << outFile << "\n";
-    return 0;
-}
-
 int main(int argc, char **argv)
 {
 #ifndef _WIN32
@@ -2266,20 +2210,16 @@ int main(int argc, char **argv)
     a.smartSeam = !hasArg(argc, argv, "--no-smart-seam");  // on by default
     int port = stoi(argVal(argc, argv, "--port", "8090"));
     bool tune = hasArg(argc, argv, "--tune");
-    int jobs = stoi(argVal(argc, argv, "--jobs", "4"));    // parallel child processes (video); default 4
-    if (hasArg(argc, argv, "--no-jobs")) jobs = 1;         // force everything into this one process
-    string cropArg = argVal(argc, argv, "--crop", "");     // read early; child processes need it too
+    string cropArg = argVal(argc, argv, "--crop", "");
     {   // --pair-offset N pins the offset; "auto" (the default) estimates it
         string po = argVal(argc, argv, "--pair-offset", "auto");
         if (po != "auto") { g_pairOffset = stoi(po); g_pairAuto = false; g_pairResolved = true; }
     }
     g_scale = stod(argVal(argc, argv, "--scale", "1.0"));
     if (g_scale <= 0.05 || g_scale > 1.0) { cerr << "--scale must be in (0.05, 1]\n"; return 1; }
-    string progFile = argVal(argc, argv, "--progress-file", "");  // a child writes its progress here (parallel)
 
     // Video-encoder selection (globals consumed by chooseVideoEncoder / stitchVideoFile).
-    // --cpu / --no-hwenc force libx264; --venc names a specific encoder (also how the
-    // parent hands its resolved pick to --jobs children); --bitrate sets -b:v.
+    // --cpu / --no-hwenc force libx264; --venc names a specific encoder; --bitrate sets -b:v.
     g_forceCpu   = hasArg(argc, argv, "--cpu") || hasArg(argc, argv, "--no-hwenc");
     g_vencExplicit = argVal(argc, argv, "--venc", "");
     g_vbitrate   = argVal(argc, argv, "--bitrate", "auto");
@@ -2319,15 +2259,15 @@ int main(int argc, char **argv)
     // so `source` may be empty here (empty page until the user imports).
     if (source.empty() || tune)
     {
-        runTuneServer(KL, DL, KR, DR, R, degrees, startFrame, endFrame, outDir, source, outFile, port, calibDir, jobs);
+        runTuneServer(KL, DL, KR, DR, R, degrees, startFrame, endFrame, outDir, source, outFile, port, calibDir);
         return 0;
     }
 
     // Headless batch stitch of a source given on the command line.
     bool video = isVideoFile(source);
-    Mat frame;
+    Mat fL, fR;
     int totalFrames = 1;
-    if (!video) frame = readPairedImage(source);
+    if (!video) readPairedImage(source, fL, fR);
     else
     {
         PairCapture cap(source);
@@ -2342,58 +2282,28 @@ int main(int argc, char **argv)
                 totalFrames = probeFrames(source, fps > 0 ? fps : 30.0);
             }
             if (startFrame > 0) seekFrame(cap, startFrame);
-            cap.read(frame);
+            cap.read(fL, fR);
             cap.release();
         }
     }
-    if (frame.empty()) { cerr << "Cannot read source: " << source << endl; return 1; }
+    if (fL.empty() || fR.empty()) { cerr << "Cannot read source: " << source << endl; return 1; }
 
-    // Parallel path: split the video across `jobs` child processes, then concat into
-    // the single --out-file. Video only; images and the tuner always run single-process.
-    if (video && jobs > 1)
-    {
-        string finalOut = !outFile.empty() ? outFile : (outDir + "/stitched_video.mp4");
-        int endResolved = endFrame >= 0 ? endFrame : (totalFrames > 0 ? totalFrames - 1 : -1);
-        if (endResolved >= startFrame)
-        {
-            // size the panorama up front: the parent resolves ONE encoder for all
-            // children, and that choice depends on the output dimensions.
-            // The crop must be applied FIRST - the children each encode the cropped
-            // frame, so sizing the encoder on the full canvas picked HEVC for outputs
-            // that were comfortably inside H.264's 4096 limit once cropped.
-            StitchMaps pm = buildStitchMaps(KL, DL, KR, DR, R,
-                                            frame.cols / 2, frame.rows, seamArg);
-            {
-                int cx = 0, cy = 0, cw = 0, ch = 0;
-                if (!cropArg.empty())
-                    sscanf(cropArg.c_str(), "%d,%d,%d,%d", &cx, &cy, &cw, &ch);
-                pm = viewMaps(pm, cx, cy, cw, ch, degrees, a);
-            }
-            int rc = runParallelJobs(source, calibDir, degrees, seamArg, a, cropArg,
-                                     startFrame, endResolved, finalOut, jobs, nullptr,
-                                     outSize(pm).width, outSize(pm).height);
-            return rc;
-        }
-        cerr << "jobs: couldn't determine frame count; running single-process.\n";
-    }
-
-    StitchMaps m = buildStitchMaps(KL, DL, KR, DR, R, frame.cols / 2, frame.rows, seamArg);
+    StitchMaps m = buildStitchMaps(KL, DL, KR, DR, R, fL.cols, fL.rows, seamArg);
 
     // Optional --crop "x,y,w,h" (full-canvas coords) and --degrees: rotate the whole
-    // panorama, then crop - one view (see viewMaps).
-    {
-        int cx = 0, cy = 0, cw = 0, ch = 0;
-        if (!cropArg.empty()
-            && sscanf(cropArg.c_str(), "%d,%d,%d,%d", &cx, &cy, &cw, &ch) == 4 && cw > 0 && ch > 0)
-            cout << "crop " << cw << "x" << ch << " @ (" << cx << "," << cy << ")\n";
-        m = viewMaps(m, cx, cy, cw, ch, degrees, a);
-        if (degrees != 0.0)
-            cout << "rotate " << degrees << " deg (clockwise), then crop -> "
-                 << outSize(m).width << "x" << outSize(m).height << "\n";
-    }
+    // panorama, then crop - folded with cam1's shear into one table per camera
+    // (see buildRenderMaps).
+    ViewBox vb;
+    vb.degrees = degrees;
+    if (!cropArg.empty()
+        && sscanf(cropArg.c_str(), "%d,%d,%d,%d", &vb.x, &vb.y, &vb.w, &vb.h) == 4 && vb.w > 0 && vb.h > 0)
+        cout << "crop " << vb.w << "x" << vb.h << " @ (" << vb.x << "," << vb.y << ")\n";
+    RenderMaps rm = buildRenderMaps(m, vb, a);
+    if (degrees != 0.0)
+        cout << "rotate " << degrees << " deg (clockwise), then crop -> " << rm.OW << "x" << rm.OH << "\n";
 
-    string result = video ? stitchVideoFile(source, m, a, startFrame, endFrame, totalFrames, outDir, outFile, nullptr, progFile)
-                          : stitchImageFile(source, m, a, outDir, outFile);
+    string result = video ? stitchVideoFile(source, rm, a, startFrame, endFrame, totalFrames, outDir, outFile, nullptr)
+                          : stitchImageFile(source, rm, a, outDir, outFile);
     cout << (video ? "video -> " : "image -> ") << result << "\n";
     return 0;
 }

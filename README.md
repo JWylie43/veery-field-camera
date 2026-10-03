@@ -436,7 +436,7 @@ rig is to the touchline.
 
 ```bash
 ./build/StitchPipeline --source take_TS_cam0_seekable.mkv \
-    --shift-top 4 --shift-bottom 20 --jobs 6 --out-file stitched.mp4
+    --shift-top 4 --shift-bottom 20 --out-file stitched.mp4
 ```
 
 | Flag | Meaning |
@@ -453,7 +453,6 @@ rig is to the touchline.
 | `--no-exposure` | skip matching cam1's brightness to cam0 |
 | `--bitrate auto\|90M` | output rate (default `auto`, ~0.20 bpp) |
 | `--venc <name>` / `--no-hwenc` | pick or disable the hardware encoder |
-| `--jobs N` / `--no-jobs` | parallel processes (default 4) |
 | `--calib-dir <dir>` | calibration folder (default: found by walking up) |
 | `--out-file <path>` / `--out <dir>` | output |
 | `--tune` | open the browser tuner |
@@ -467,14 +466,19 @@ rig is to the touchline.
     --start 2700 --end 5400 --out-file clip_1m30-3m.mp4     # 1:30 → 3:00
 ```
 
-### 5d. Parallel stitch
+### 5d. How a video render runs
 
-`--jobs N` splits the range across N processes and `ffmpeg`-concats the parts.
-It is only fast on an **indexed** file — point it at the remuxed `_seekable`
-pair. Each child logs `seek: indexed jump … (fast)` (good) or
-`grab-skipping … (SLOW; remux)` (the input is not indexed).
+One process, as a pipeline: decode → remap + exposure → seam → blend → encode,
+with several frames in flight and worker threads picking up whichever stage has
+work. Decode, seam and encode take frames strictly in order (the smart seam
+follows the previous frame's seam), so the seam is one continuous chain over the
+whole range and the output is a single file — there is nothing to tune.
 
-Tune `N` upward until CPU or GPU hits ~90–100% or VRAM fills, then stop.
+On an M5 Pro a 5923×1697 crop renders at ~55 fps (just under 2× real time). That
+is the hardware HEVC encoder's ceiling at that size (~57 fps, quality-first
+settings); the stitching itself runs faster. `--start` jumps straight to its frame on an
+**indexed** file (the remuxed `_seekable` pair); otherwise it logs
+`grab-skipping … (SLOW; remux)`.
 
 ### 5e. Panorama size
 
@@ -487,15 +491,14 @@ for fewer pixels at the same field of view, or `--crop` to actually crop.
 
 ## 6. Verify the output
 
-Confirm no frames were lost — especially comparing a `--jobs` run against
-`--no-jobs`:
+Confirm no frames were lost:
 
 ```bash
 ffprobe -v error -count_frames -select_streams v:0 \
         -show_entries stream=nb_read_frames -of csv=p=0 stitched.mp4
 ```
 
-The two counts should match, and land near `fps × seconds`.
+The count should land near `fps × seconds` (or `end − start + 1`).
 
 ---
 
