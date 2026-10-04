@@ -19,3 +19,13 @@ target_link_libraries(StitchPipeline ${OpenCV_LIBS})
 if(WIN32)
   target_link_libraries(StitchPipeline ws2_32)   # sockets for the --tune web UI
 endif()
+
+# Director: the virtual-camera editor (cut points, steer a 16:9 box, render).
+# Its page (director.html) is read at run time from next to the executable or
+# from this folder, so page edits need no rebuild.
+add_executable(Director director.cpp)
+target_link_libraries(Director ${OpenCV_LIBS})
+target_compile_definitions(Director PRIVATE DIRECTOR_SRC_DIR="${PROJECT_SOURCE_DIR}")
+if(WIN32)
+  target_link_libraries(Director ws2_32)
+endif()

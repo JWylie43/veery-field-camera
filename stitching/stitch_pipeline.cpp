@@ -87,6 +87,7 @@
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
+#include <future>
 #include <functional>
 #include <chrono>
 #include <csignal>
@@ -103,6 +104,7 @@
   #include <netinet/in.h>
   #include <arpa/inet.h>
   #include <unistd.h>
+  #include <fcntl.h>               // FD_CLOEXEC on child-process pipes
   using socket_t = int;
   #define CLOSESOCK close
   #define INVALID_SOCKET (-1)
@@ -116,8 +118,10 @@
   #define popen _popen
   #define pclose _pclose
   #define PIPE_WMODE "wb"        // binary: Windows text mode would mangle raw frames with CRLF
+  #define PIPE_RMODE "rb"
 #else
   #define PIPE_WMODE "w"         // POSIX popen only takes "r"/"w"; no 'b' flag
+  #define PIPE_RMODE "r"
 #endif
 
 using json = nlohmann::json;
@@ -663,6 +667,8 @@ static bool exposureLut(const Mat &L, const Mat &R, const RenderMaps &rm, Mat &l
 // video pipeline, which runs the stages on different frames at once).
 struct FrameWork
 {
+    Mat yuvL, yuvR;      // raw decoded camera frames (YUV 4:2:0), straight off the decoders
+    std::function<void(FrameWork &)> toBgr;   // fills fL/fR from yuvL/yuvR (set by the decoder)
     Mat fL, fR;          // decoded camera frames
     Mat out;             // output frame; the left camera is rendered straight into it
     Mat wR;              // right camera, output columns [sx0, OW)
@@ -674,6 +680,9 @@ struct FrameWork
 // the right camera's exposure matched to the left.
 static void remapStage(FrameWork &f, const RenderMaps &rm, const Align &a)
 {
+    // colour conversion happens here, on many frames in parallel, rather than in the
+    // one-at-a-time decode stage where it capped the whole pipeline
+    if (f.toBgr) f.toBgr(f);
     f.out.create(rm.OH, rm.OW, CV_8UC3);
     Mat outL = f.out.colRange(0, rm.sx1);
     remap(f.fL, outL, rm.mapL1, rm.mapL2, INTER_LINEAR, BORDER_CONSTANT);
@@ -1091,6 +1100,217 @@ static int estimatePairOffset(const string &lp, const string &rp,
     return best;
 }
 
+// One video file decoded by ffmpeg into BGR frames, with the colour conversion
+// spelled out from the file's own tags. OpenCV's reader (and ffmpeg's default
+// conversion) decode these cameras' FULL-range BT.709 video as if it were
+// limited-range BT.601: contrast stretched (highlights clipped, shadows crushed)
+// and hues pushed toward green - off by up to 6 levels per channel, 28.7 dB from
+// the correct image (measured 2026-10-04). Here the range and matrix come from
+// ffprobe and are passed to the converter explicitly; seeks are frame-exact.
+// The subset of cv::VideoCapture the stitcher uses: open / read / grab+retrieve /
+// get (FPS, FRAME_COUNT, POS_FRAMES) / set (POS_FRAMES).
+// A pipe to/from a child process must not leak into OTHER children started later:
+// a decoder that inherited another decoder's pipe keeps it "open", so that one
+// never sees its reader go away and never exits (a hang at the end of a render).
+static void noInherit(FILE *f)
+{
+#ifndef _WIN32
+    if (f) fcntl(fileno(f), F_SETFD, FD_CLOEXEC);
+#else
+    (void)f;
+#endif
+}
+
+class FfmpegVideo
+{
+public:
+    ~FfmpegVideo() { release(); }
+
+    bool open(const string &path)
+    {
+        release();
+        string out = runCmd("ffprobe -v error -select_streams v:0 -show_entries "
+                            "stream=width,height,r_frame_rate,nb_frames,color_range,color_space "
+                            "-of json \"" + path + "\"");
+        try
+        {
+            json j = json::parse(out);
+            auto &s = j.at("streams").at(0);
+            w_ = s.value("width", 0); h_ = s.value("height", 0);
+            string r = s.value("r_frame_rate", "30/1");
+            size_t sl = r.find('/');
+            double num = stod(r.substr(0, sl)), den = sl == string::npos ? 1.0 : stod(r.substr(sl + 1));
+            fps_ = den > 0 ? num / den : 30.0;
+            frames_ = s.contains("nb_frames") ? stoi(s["nb_frames"].get<string>()) : 0;
+            range_ = s.value("color_range", string()) == "pc" ? "pc" : "tv";
+            string cs = s.value("color_space", string());
+            // untagged HD video is BT.709 by convention; SD-era tags map to BT.601
+            matrix_ = (cs == "smpte170m" || cs == "bt470bg") ? "bt601" : "bt709";
+            setCoefficients();
+        }
+        catch (...) { w_ = h_ = 0; return false; }
+        if (w_ <= 0 || h_ <= 0) { w_ = h_ = 0; return false; }
+        path_ = path; pos_ = 0;
+        return true;
+    }
+    bool isOpened() const { return w_ > 0; }
+    void release()
+    {
+        if (pipe_) { pclose(pipe_); pipe_ = nullptr; }
+        w_ = h_ = 0; path_.clear(); staged_ = false;
+    }
+
+    double get(int prop) const
+    {
+        if (prop == CAP_PROP_FPS) return fps_;
+        if (prop == CAP_PROP_FRAME_COUNT) return frames_;
+        if (prop == CAP_PROP_POS_FRAMES) return pos_;
+        if (prop == CAP_PROP_FRAME_WIDTH) return w_;
+        if (prop == CAP_PROP_FRAME_HEIGHT) return h_;
+        return 0;
+    }
+    // Only seeking is supported: the next frame read is frame `v`, exactly.
+    bool set(int prop, double v)
+    {
+        if (prop != CAP_PROP_POS_FRAMES || !isOpened()) return false;
+        if (pipe_) { pclose(pipe_); pipe_ = nullptr; }
+        pos_ = max(0, (int)llround(v));
+        staged_ = false;
+        return true;
+    }
+
+    // Start the decoder process now (normally it starts on the first read). Two
+    // processes must not be started from two threads at once - see noInherit.
+    bool ensureStarted() { return isOpened() && (pipe_ || start()); }
+
+    bool grab() { staged_ = readInto(stage_); return staged_; }
+    bool retrieve(Mat &out)
+    {
+        if (!staged_) return false;
+        stage_.copyTo(out);
+        return true;
+    }
+    bool read(Mat &out) { staged_ = false; return readInto(out); }
+
+private:
+    bool start()
+    {
+        // input -ss is frame-accurate when decoding; the half-frame back-off makes
+        // the first frame delivered exactly pos_
+        double t = max(0.0, (pos_ - 0.5) / fps_);
+        ostringstream c;
+        // -loglevel fatal: closing a decoder early (a preview frame, a seek) is normal
+        // and ffmpeg would otherwise report it as a broken-pipe error
+        c << "ffmpeg -hide_banner -loglevel fatal";
+#ifdef __APPLE__
+        // hardware decode leaves the CPU to the stitch (bit-identical to software
+        // decoding; measured 46 -> 53 fps on an M5 Pro)
+        c << " -hwaccel videotoolbox";
+#endif
+        // raw YUV 4:2:0 through the pipe (half the bytes of BGR - the pipes were the
+        // bottleneck), converted to BGR here with the file's own range and matrix
+        c << " -ss " << std::fixed << std::setprecision(6) << t << " -i \"" << path_ << "\" -map 0:v:0"
+          << " -f rawvideo -pix_fmt yuv420p -";
+        pipe_ = popen(c.str().c_str(), PIPE_RMODE);
+        noInherit(pipe_);
+        return pipe_ != nullptr;
+    }
+    bool readInto(Mat &out)
+    {
+        if (!readYuv(yuv_)) return false;
+        toBgr(yuv_, out);
+        return true;
+    }
+
+public:
+    // The next frame as raw YUV 4:2:0 (one row of bytes: Y, then U, then V).
+    bool readYuv(Mat &yuv)
+    {
+        if (!isOpened()) return false;
+        if (!pipe_ && !start()) return false;
+        const int cw = (w_ + 1) / 2, ch = (h_ + 1) / 2;
+        const size_t n = (size_t)w_ * h_ + 2 * (size_t)cw * ch;
+        yuv.create(1, (int)n, CV_8U);
+        if (fread(yuv.data, 1, n, pipe_) != n) return false;
+        ++pos_;
+        return true;
+    }
+private:
+
+    // Y'CbCr -> R'G'B' for the file's range + matrix (fixed point, 16 fractional
+    // bits). Chroma is interpolated with the standard 4:2:0 siting: co-sited with
+    // even luma columns, halfway between luma rows.
+    void setCoefficients()
+    {
+        double kr = matrix_ == "bt601" ? 0.299 : 0.2126, kb = matrix_ == "bt601" ? 0.114 : 0.0722;
+        double kg = 1 - kr - kb;
+        bool full = range_ == "pc";
+        double ys = full ? 1.0 : 255.0 / 219.0, cs = full ? 1.0 : 255.0 / 224.0;
+        yoff_ = full ? 0 : 16;
+        const double F = 65536.0;
+        ky_  = (int)lround(ys * F);
+        kcr_ = (int)lround(cs * 2 * (1 - kr) * F);
+        kcb_ = (int)lround(cs * 2 * (1 - kb) * F);
+        kgb_ = (int)lround(cs * 2 * (1 - kb) * kb / kg * F);
+        kgr_ = (int)lround(cs * 2 * (1 - kr) * kr / kg * F);
+    }
+public:
+    void toBgr(const Mat &yuv, Mat &out) const
+    {
+        out.create(h_, w_, CV_8UC3);
+        const int W = w_, H = h_, cw = (W + 1) / 2, ch = (H + 1) / 2;
+        const uchar *Yp = yuv.data, *Up = Yp + (size_t)W * H, *Vp = Up + (size_t)cw * ch;
+        // 32-bit fixed point throughout (all terms < 2^28), branch-free inner loops
+        // so the compiler vectorises them: the per-pixel version was the stitcher's
+        // biggest CPU cost.
+        const int ky = ky_, kcr = kcr_, kcb = kcb_, kgb = kgb_, kgr = kgr_, yoff = yoff_;
+        // blocks of ~32 rows per task: the row buffers below are allocated once per
+        // block (handing out single rows re-allocated and zero-filled them per row)
+        parallel_for_(Range(0, H), [&](const Range &rows) {
+            vector<int> ut(cw + 1), vt(cw + 1), rc(W), gc(W), bc(W), yt(W);
+            for (int y = rows.start; y < rows.end; y++)
+            {
+                // vertical: 3/4 of the nearer chroma row + 1/4 of the other (x4)
+                int a = y >> 1, b = (y & 1) ? min(a + 1, ch - 1) : max(a - 1, 0);
+                const uchar *ua = Up + (size_t)a * cw, *ub = Up + (size_t)b * cw;
+                const uchar *va = Vp + (size_t)a * cw, *vb = Vp + (size_t)b * cw;
+                for (int i = 0; i < cw; i++) { ut[i] = 3 * ua[i] + ub[i]; vt[i] = 3 * va[i] + vb[i]; }
+                ut[cw] = ut[cw - 1]; vt[cw] = vt[cw - 1];
+                // horizontal: even columns take the sample, odd ones the mean (x8 total),
+                // folded straight into each channel's chroma term
+                for (int i = 0; i < cw; i++)
+                {
+                    int cbE = 2 * ut[i] - 1024, crE = 2 * vt[i] - 1024;
+                    int cbO = ut[i] + ut[i + 1] - 1024, crO = vt[i] + vt[i + 1] - 1024;
+                    int x = 2 * i;
+                    rc[x] = kcr * crE; gc[x] = -kgb * cbE - kgr * crE; bc[x] = kcb * cbE;
+                    if (x + 1 < W) { rc[x + 1] = kcr * crO; gc[x + 1] = -kgb * cbO - kgr * crO; bc[x + 1] = kcb * cbO; }
+                }
+                const uchar *yr = Yp + (size_t)y * W;
+                for (int x = 0; x < W; x++) yt[x] = ky * 8 * (yr[x] - yoff) + (1 << 18);
+                uchar *o = out.ptr<uchar>(y);
+                for (int x = 0; x < W; x++)
+                {
+                    int B = (yt[x] + bc[x]) >> 19, G = (yt[x] + gc[x]) >> 19, R = (yt[x] + rc[x]) >> 19;
+                    o[3 * x]     = (uchar)std::min(255, std::max(0, B));
+                    o[3 * x + 1] = (uchar)std::min(255, std::max(0, G));
+                    o[3 * x + 2] = (uchar)std::min(255, std::max(0, R));
+                }
+            }
+        }, std::max(1.0, H / 32.0));
+    }
+
+private:
+    string path_, range_ = "tv", matrix_ = "bt709";
+    int w_ = 0, h_ = 0, frames_ = 0, pos_ = 0;
+    int ky_ = 0, kcr_ = 0, kcb_ = 0, kgb_ = 0, kgr_ = 0, yoff_ = 16;
+    Mat yuv_;
+    double fps_ = 30.0;
+    FILE *pipe_ = nullptr;
+    Mat stage_;
+    bool staged_ = false;
+};
+
 class PairCapture
 {
 public:
@@ -1121,8 +1341,8 @@ public:
         int off = pairOffsetLR();
         int skipB = off > 0 ? off : 0;
         int skipA = off < 0 ? -off : 0;
-        for (int i = 0; i < skipA; i++) a_.grab();
-        for (int i = 0; i < skipB; i++) b_.grab();
+        if (skipA) a_.set(CAP_PROP_POS_FRAMES, skipA);
+        if (skipB) b_.set(CAP_PROP_POS_FRAMES, skipB);
         cout << "  paired input: " << std::filesystem::path(L).filename().string()
              << " + " << std::filesystem::path(R).filename().string();
         if (g_pairOffset) cout << "  (offset " << g_pairOffset << " frames)";
@@ -1135,8 +1355,8 @@ public:
 
     double get(int prop) const
     {
-        double va = const_cast<VideoCapture &>(a_).get(prop);
-        double vb = const_cast<VideoCapture &>(b_).get(prop);
+        double va = a_.get(prop);
+        double vb = b_.get(prop);
         // the pair is only as long as its shorter half
         if (prop == CAP_PROP_FRAME_COUNT) return min(va, vb);
         return va;
@@ -1160,10 +1380,33 @@ public:
         return samePair(fa, fb);
     }
 
+    // Raw YUV from both cameras (read in parallel, like read()); toBgr() converts them
+    // later - the video pipeline does that in its parallel stage.
+    bool readYuv(Mat &ya, Mat &yb)
+    {
+        if (!a_.ensureStarted() || !b_.ensureStarted()) return false;
+        auto other = std::async(std::launch::async, [&]() { return b_.readYuv(yb); });
+        bool okA = a_.readYuv(ya);
+        bool okB = other.get();
+        return okA && okB;
+    }
+    void toBgr(const Mat &ya, const Mat &yb, Mat &fa, Mat &fb) const
+    {
+        a_.toBgr(ya, fa);
+        b_.toBgr(yb, fb);
+    }
+
+    // The two cameras are separate decoder processes, so pull both frames at once:
+    // reading them one after the other left one pipe idle while the other drained.
     bool read(Mat &fa, Mat &fb)
     {
-        if (!a_.read(fa) || fa.empty()) return false;
-        if (!b_.read(fb) || fb.empty()) return false;
+        // start both decoders from THIS thread first (never two process launches
+        // at once), then read the two pipes in parallel
+        if (!a_.ensureStarted() || !b_.ensureStarted()) return false;
+        auto other = std::async(std::launch::async, [&]() { return b_.read(fb) && !fb.empty(); });
+        bool okA = a_.read(fa) && !fa.empty();
+        bool okB = other.get();
+        if (!okA || !okB) return false;
         return samePair(fa, fb);
     }
 
@@ -1177,7 +1420,7 @@ private:
         return false;
     }
 
-    VideoCapture a_, b_;
+    FfmpegVideo a_, b_;
 };
 
 template <class Cap>
@@ -1303,7 +1546,11 @@ static string buildEncodeCmd(const string &venc, int W, int H, double fps, const
     if (venc == "libx264") c << " -preset medium";
     // Pin output format so every encoder tags color the same way (avoids the AMF
     // bt470bg->bt709 drift) and stays broadly playable; faststart for progressive play.
-    c << " -pix_fmt yuv420p -colorspace bt709 -color_primaries bt709 -color_trc bt709"
+    // The BGR->YUV 4:2:0 conversion uses swscale's accurate rounding + full chroma
+    // interpolation: the default fast path darkened the panorama ~2 levels and cost
+    // ~7 dB on a round trip (43.7 -> 50.5 dB, measured on a camera frame 2026-10-04).
+    c << " -sws_flags accurate_rnd+full_chroma_int+full_chroma_inp"
+      << " -pix_fmt yuv420p -colorspace bt709 -color_primaries bt709 -color_trc bt709"
       << " -movflags +faststart " << q(out);
     return c.str();
 }
@@ -1338,6 +1585,7 @@ static string stitchVideoFile(const string &source, const RenderMaps &rm,
              << resolveBitrate(venc, osz.width, osz.height, fps)
              << (g_vbitrate == "auto" ? " auto" : "") << ")\n";
         pipe = popen(buildEncodeCmd(venc, osz.width, osz.height, fps, out).c_str(), PIPE_WMODE);
+        noInherit(pipe);
         if (!pipe) useFfmpeg = false;   // couldn't spawn - fall back below
     }
     if (!useFfmpeg)
@@ -1353,7 +1601,8 @@ static string stitchVideoFile(const string &source, const RenderMaps &rm,
     const int total = bounded ? (e - s + 1) : BIG;
     int decoded = 0, written = 0;
     auto decode = [&](FrameWork &f) {
-        if (decoded >= total || !cap.read(f.fL, f.fR)) return false;   // range end / EOF
+        if (decoded >= total || !cap.readYuv(f.yuvL, f.yuvR)) return false;   // range end / EOF
+        f.toBgr = [&cap](FrameWork &w) { cap.toBgr(w.yuvL, w.yuvR, w.fL, w.fR); return; };
         ++decoded;
         return true;
     };
@@ -1918,6 +2167,18 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
     {
         socket_t cl = accept(srv, nullptr, nullptr);
         if (cl == INVALID_SOCKET) continue;
+        // One connection at a time, so an idle one must not block the rest: browsers
+        // open speculative connections that never send a request, and the tuner sat
+        // waiting on those (the page looked frozen). Give each 2 s to send its request.
+        {
+#ifdef _WIN32
+            DWORD ms = 2000;
+            setsockopt(cl, SOL_SOCKET, SO_RCVTIMEO, (const char *)&ms, sizeof(ms));
+#else
+            timeval tv{2, 0};
+            setsockopt(cl, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+        }
 
         string req; char buf[4096];
         for (;;)
