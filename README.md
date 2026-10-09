@@ -361,6 +361,23 @@ Re-tune the shear whenever the rig moves; the calibration stays. The
 corrections and the original matrix are under `scene_refinement` in the JSON.
 `translation_mm` is still the board value; the stitcher ignores it.
 
+**Re-checking alignment on new footage.** The mount can settle by a fraction
+of a degree between sessions (2026-10-08: −11 px vertical at the seam after a
+week in the same housing), which shear can't fix. Check each new session's first
+take - ~5 s, nothing is written:
+
+```bash
+.venv/bin/python calibration/refine_extrinsics.py --check ~/Desktop/veery-takes/take_TS_cam0.mkv
+```
+
+It prints the vertical offset at the seam, the vertical tilt across the overlap,
+the far-field horizontal offset, the shear for that rig position, and a verdict.
+If it says `needs --apply`, run the same with `--apply`: it solves the tilt /
+roll / yaw correction from parallax-free measurements only (as above), backs up
+`stereo_extrinsics.json` (`.bak-<time>`), writes the new rotation with an entry
+in `refinement_history`, and re-measures (~10 s). `--keep-yaw` corrects tilt and
+roll only. Needs a daytime take with textured ground in the overlap.
+
 > **`calibrate.py` refuses to write `stereo_extrinsics.json` above 3 px RMS.**
 > That guard exists because the failure is silent: a bad extrinsic still
 > produces a plausible-looking panorama. The usual cause is feeding it the two
