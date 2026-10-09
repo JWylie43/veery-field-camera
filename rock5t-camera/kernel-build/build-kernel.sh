@@ -10,7 +10,7 @@
 # (split overlay, rk_cam_defer_enable, modules-load ordering) unnecessary.
 #
 # Run ON the Rock (native aarch64 build, ~1-2h). To build on any other machine
-# (Mac, Linux, Windows) use build-kernel-docker.sh instead - same kernel.
+# (Mac, Linux) use build-kernel-docker.sh instead - same kernel.
 #
 #   ./build-kernel.sh            # clone + patch + build
 #   ./build-kernel.sh install    # dpkg -i the built debs + u-boot-update
