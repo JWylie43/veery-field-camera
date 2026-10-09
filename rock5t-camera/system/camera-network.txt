@@ -1,0 +1,17 @@
+# camera-network.txt - the rig's Wi-Fi, read ONCE at the next boot, then renamed to
+# camera-network.applied.txt (passwords blanked). On the card's "config" partition
+# (visible on a Mac after flashing); on the Rock it is /config/.
+#
+# WIFI_NAME + WIFI_PASSWORD   a network to join (home, club...): set up only when BOTH
+#                             are filled in, and joined first whenever it is in range.
+# HOTSPOT_NAME                the Rock's own network, started when the Wi-Fi above is not
+#                             in range (or always, with no Wi-Fi set): join it from a phone
+#                             and open http://10.43.0.1:8080. Blank = no hotspot.
+# HOTSPOT_PASSWORD            CHANGE IT: the default is the same on every image. Blank =
+#                             an OPEN hotspot (anyone nearby can join and use the recorder
+#                             panel); otherwise at least 8 characters.
+# Quote names with spaces, e.g. WIFI_NAME="Gilly's Garden"
+WIFI_NAME=""
+WIFI_PASSWORD=""
+HOTSPOT_NAME="VeeryCam"
+HOTSPOT_PASSWORD="changeme123"

@@ -17,6 +17,8 @@
 #   3. camera overlay      tells the board both cameras are attached + the genlock roles
 #   4. IQ tuning file      the camera tuning the 3A daemon loads
 #   5. 3A service fix      Radxa's rkaiq_3A.service kills its own daemon at start
+#  5b. network settings    the service that applies /config/camera-network.txt (Wi-Fi +
+#                          hotspot) at boot - the file itself only ships on the image
 #   6. recorder service    the web panel (recorder/server.py), started at every boot
 # Then it asks to reboot if the kernel / overlay / tuning changed (the camera checks
 # can only pass on the camera kernel), and otherwise runs the checks.
@@ -168,6 +170,23 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
     REBOOT=1
   fi
   sudo systemctl enable rkaiq_3A >/dev/null 2>&1
+
+  # ---------------------------------------------------------------- 5b. network settings
+  # /config/camera-network.txt (Wi-Fi + hotspot), applied at boot by camera-network.service
+  step "5b. Network settings (camera-network.txt)"
+  if same "$HERE/system/camera-network" /usr/local/sbin/camera-network \
+     && same "$HERE/system/camera-network.service" /etc/systemd/system/camera-network.service; then
+    ok "installed"
+  else
+    sudo install -m 755 "$HERE/system/camera-network" /usr/local/sbin/camera-network
+    sudo install -m 644 "$HERE/system/camera-network.service" /etc/systemd/system/camera-network.service
+    sudo systemctl daemon-reload
+    did "installed camera-network (applies /config/camera-network.txt at boot)"
+  fi
+  sudo systemctl enable camera-network >/dev/null 2>&1
+  # The template is NOT dropped in here: its default hotspot (open unless a password is
+  # set) would appear next to a Rock's existing networks. To use it on this Rock: copy
+  # rock5t-camera/system/camera-network.txt to /config/, fill it in, reboot.
 
   # ---------------------------------------------------------------- 6. recorder
   # The unit file has a @REPO_DIR@ placeholder; the installed copy gets this

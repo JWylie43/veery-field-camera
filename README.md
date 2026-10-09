@@ -156,8 +156,44 @@ mount is ever disturbed.
 **On the Rock — a fresh one: flash the rig image.** Download
 `rock5t-camera-image-N.img.xz` from this repo's [Releases](../../releases)
 (the newest `image-N`), flash it to the Rock's SD card or NVMe with any image
-flasher (balenaEtcher, Raspberry Pi Imager — the same way as Radxa's image),
-connect the cameras and power on. That's all: the first boot creates the
+flasher (balenaEtcher, Raspberry Pi Imager — the same way as Radxa's image).
+
+**Before the first boot, set up its Wi-Fi:** when flashing finishes, the card's
+small `config` partition shows up on the Mac like a USB stick (if it doesn't,
+re-insert the card; if macOS offers to initialise a disk it can't read, click
+*Ignore*). Open **`camera-network.txt`** on it and fill in:
+
+```
+WIFI_NAME="Gilly's Garden"     # a network to join: home, club... (quotes for spaces)
+WIFI_PASSWORD="..."
+HOTSPOT_NAME="VeeryCam"        # the Rock's own network, for the field (default)
+HOTSPOT_PASSWORD="..."         # default changeme123 - change it; blank = an OPEN hotspot
+```
+
+The first boot reads it **once** and sets up NetworkManager:
+
+- **Wi-Fi** — only when both `WIFI_NAME` and `WIFI_PASSWORD` are filled in. Priority
+  100: the Rock joins it whenever it is in range. If it can't connect (out of range,
+  wrong password), it moves on to the hotspot.
+- **Hotspot** — whenever `HOTSPOT_NAME` is set (default `VeeryCam`, password
+  `changeme123` — the same on every image, so change it): a 2.4 GHz
+  network the Rock creates itself, priority −10, so it starts only when no
+  higher-priority network connects. Join it from a phone or laptop and open
+  `http://10.43.0.1:8080`. With `HOTSPOT_PASSWORD` blank it is **open**: anyone nearby
+  can join and use the recorder panel. Blank `HOTSPOT_NAME` = no hotspot.
+- With no Wi-Fi set there is no home network to prefer: the hotspot runs at every boot
+  (or use Ethernet). Networks added later with `sudo nmtui` get priority 0 — above the
+  hotspot, below the Wi-Fi — unless you set otherwise
+  (`sudo nmcli connection modify "<name>" connection.autoconnect-priority <n>`).
+
+The Rock never joins other networks on its own, open or not. While the hotspot is
+running it rejoins the Wi-Fi at the next boot (or `sudo nmcli connection up "<name>"`).
+After applying, the file becomes `camera-network.applied.txt` with the passwords
+blanked (they're kept on the Rock, not on the card); to apply new settings later, put a
+filled-in `camera-network.txt` back on the `config` partition (on the Rock:
+`/config/`) and reboot, or use `sudo nmtui`. What happened: `journalctl -u camera-network`.
+
+Then connect the cameras and power on. That's all: the first boot creates the
 `radxa` user (password `radxa` — change it), and the recorder comes up at
 `http://<rock-ip>:8080` (or `http://veery.local:8080`). To confirm everything,
 on the Rock:
@@ -205,8 +241,10 @@ recorder. Re-running it is always safe; on a finished Rock it changes nothing.
 `--check` only checks; `--yes` reboots without asking. Re-run it after pulling
 changes to the tuning or the overlay.
 
-It doesn't flash the OS, set the hostname (this rig's is `veery`, hence
-`veery.local`) or configure the field hotspot.
+It doesn't flash the OS or set the hostname (this rig's is `veery`, hence
+`veery.local`). It installs the service that applies `camera-network.txt` but not the
+file itself — copy `rock5t-camera/system/camera-network.txt` to `/config/`, fill it in
+and reboot to use it.
 
 **Tested Rock setup** — the rig image is built on exactly this; when setting up
 from Radxa's image, flash the same one (`rsdk-r7`). The camera kernel is built

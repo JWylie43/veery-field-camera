@@ -1,0 +1,16 @@
+[Unit]
+# Applies /config/camera-network.txt (Wi-Fi + hotspot) - see /usr/local/sbin/camera-network.
+# Runs at every boot but only acts when /config/camera-network.txt exists (it renames it
+# after applying, so normally only the first boot).
+Description=Camera rig Wi-Fi and hotspot from /config/camera-network.txt
+After=NetworkManager.service local-fs.target
+Wants=NetworkManager.service
+# (no ConditionPathExists: /config is an automount, which systemd itself must not trigger
+#  while deciding conditions - the script checks for the file instead)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/camera-network
+
+[Install]
+WantedBy=multi-user.target

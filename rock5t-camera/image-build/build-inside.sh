@@ -116,6 +116,13 @@ chmod 755 "$R/usr/local/sbin/rig-firstboot"
 subst "$HERE/image-build/firstboot/rig-firstboot.service" > "$R/etc/systemd/system/rig-firstboot.service"
 in_image systemctl enable recorder.service rig-firstboot.service >/dev/null 2>&1
 
+# ------------------------------------------------------------------ network settings
+log "Network settings (camera-network.txt on the config partition)"
+install -m 755 "$HERE/system/camera-network" "$R/usr/local/sbin/camera-network"
+install -m 644 "$HERE/system/camera-network.service" "$R/etc/systemd/system/camera-network.service"
+in_image systemctl enable camera-network.service >/dev/null 2>&1
+cp "$HERE/system/camera-network.txt" "$R/config/camera-network.txt"   # the blank template
+
 if [ -n "${RIG_HOSTNAME:-}" ]; then
   log "Hostname $RIG_HOSTNAME"
   echo "$RIG_HOSTNAME" > "$R/etc/hostname"

@@ -16,6 +16,7 @@ It is Radxa's stock image — the exact build the rig was developed on — with 
 | ffmpeg, exfatprogs and the other packages `setup.sh` installs | |
 | a git checkout of this repo, ending up in `/home/radxa/<repo>` | so the Rock can `git pull` |
 | the recorder service, enabled | starts at every boot |
+| `camera-network.txt` on the `config` partition + the service that applies it | Wi-Fi and hotspot (default `VeeryCam` / `changeme123`), filled in before the first boot, read once |
 | the hostname, if built with `RIG_HOSTNAME=` | |
 
 What Radxa's own first boot does is unchanged: it creates the `radxa` user (password
