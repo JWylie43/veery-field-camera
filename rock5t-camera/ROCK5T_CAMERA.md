@@ -3,8 +3,8 @@
 **Status: working.** Both IMX477s image through the full ISP path at 4K30 and
 record to hardware HEVC. Driver is built into a custom kernel
 (`6.1.84-8-rk2410-imx477`, `CONFIG_VIDEO_IMX477=y`), overlay and IQ file are
-installed, intrinsics are solved. The open item is the stereo extrinsics, which
-are still placeholder design values — see the README.
+installed, intrinsics are solved, and the stereo extrinsics are calibrated and
+refined on footage (docs/calibration.md).
 
 This file is the **bring-up log**: a dated record of what was tried, what broke
 and why, kept because none of it is recoverable from the code. Newest entries

@@ -19,7 +19,7 @@ WORK="$HERE/work"; OUT="$HERE/out"
 mkdir -p "$WORK" "$OUT"
 
 # ---- the base image: Radxa's ROCK 5T Debian 12 KDE build rsdk-r7 (2026-07-06), the
-#      one the rig was developed and tested on (see "Tested Rock setup" in the README)
+#      one the rig was developed and tested on (see "Tested setup" in docs/rock.md)
 RADXA_TAG=rsdk-r7
 RADXA_FILE=rock-5t_bookworm_kde_r7.output_512.img.xz
 RADXA_SHA512=0dbb83e55c2afb6225e39502794f02cc53257baa2f4703bbc25e59879f7995b7af9da88ac7b35cbad6d761b14eaba95fc089c0e29b3ddd2fdd61c835ee908516

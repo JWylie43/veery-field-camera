@@ -86,7 +86,7 @@ studio/
 ├── library.py            scans the takes folder (pairs, stitched videos, frame-timing check)
 ├── preview.py            the stitch page's frames
 ├── rig.py                take files, calibration, pairing and the stitcher's geometry
-├── refine_extrinsics.py  per-take alignment (also usable on its own, see the main README)
+├── refine_extrinsics.py  per-take alignment (also usable on its own, see docs/calibration.md)
 ├── static/               index.html (takes), stitch.html, edit.html (the Director's editor), studio.css
 ├── native/               the C++ tools: stitch_pipeline.cpp, director.cpp, CMakeLists.txt, include/json.hpp
 ├── studio.command        start Studio (Python packages: ../requirements.txt, set up by ../setup.sh)

@@ -246,7 +246,7 @@ esac
   && ok "genlock enabled" || warn "imx477 genlock parameter not Y"
 
 # Radxa's camera software has to match the kernel's camera drivers, and the IQ file
-# is written for this rkaiq version's format - see "Tested Rock setup" in the README.
+# is written for this rkaiq version's format - see "Tested setup" in docs/rock.md.
 step "Radxa camera software (tested versions)"
 for pv in "camera-engine-rkaiq 6.8.0-rk3588" "librockchip-mpp1 1.5.0-1" "gstreamer1.0-rockchip1 1.14-4"; do
   p="${pv% *}"; want="${pv#* }"
