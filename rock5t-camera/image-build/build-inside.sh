@@ -48,6 +48,11 @@ log "Copy Radxa's image ($BASE_IMAGE) and grow its root partition by $GROW_MB MB
 cp --sparse=always /work/radxa.img "$IMG"
 truncate -s +"${GROW_MB}M" "$IMG"
 sgdisk -e "$IMG" >/dev/null                          # backup GPT header -> the new end
+# The config partition (FAT, where camera-network.txt is edited) is typed "Linux
+# filesystem" in Radxa's layout, so a Mac or PC won't mount it after flashing. Type it as
+# a standard data partition instead; the Rock mounts it by filesystem UUID (fstab), so
+# nothing changes there.
+sgdisk -t 1:0700 "$IMG" >/dev/null
 echo ", +" | sfdisk --no-reread --no-tell-kernel -N 3 "$IMG" >/dev/null 2>&1
 ROOT=$(loop_of 3)
 e2fsck -fy "$ROOT" >/dev/null || true
