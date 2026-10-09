@@ -26,17 +26,17 @@ Built kernels are published as **GitHub Releases** (`kernel-N`, with the two
 
 `rock5t-camera/setup.sh` does this for you (and the rest of the Rock's setup) - it
 installs the release named by `KREL`/`KREV` at its top. To do it by hand: on the Mac, download the two `.deb` files from the repo's Releases page
-(e.g. `kernel-6`), or with the GitHub CLI:
+(e.g. `kernel-1`), or with the GitHub CLI:
 
 ```
-gh release download kernel-6 --repo JWylie43/veery-field-camera --dir ~/Desktop/kernel-6
-scp ~/Desktop/kernel-6/*.deb radxa@<rock-ip>:~/
+gh release download kernel-1 --repo JWylie43/veery-field-camera --dir ~/Desktop/kernel-1
+scp ~/Desktop/kernel-1/*.deb radxa@<rock-ip>:~/
 ```
 
 Then on the Rock:
 
 ```
-sudo dpkg -i ~/linux-image-*-imx477-6_arm64.deb ~/linux-headers-*-imx477-6_arm64.deb
+sudo dpkg -i ~/linux-image-*-imx477-1_arm64.deb ~/linux-headers-*-imx477-1_arm64.deb
 sudo u-boot-update && sudo reboot
 ```
 
@@ -44,12 +44,12 @@ Check with `uname -v` (build number) and `cat /sys/module/imx477/parameters/genl
 
 ## Build on any machine (Docker) - recommended
 
-Mac (Apple Silicon or Intel), Linux (arm64 or x86-64), or Windows with
-Docker Desktop. Nothing to install but Docker:
+Mac (Apple Silicon or Intel) or Linux (arm64 or x86-64). Nothing to install but
+Docker:
 
 ```
 cd rock5t-camera/kernel-build
-REV=7 ./build-kernel-docker.sh        # bump REV every build
+REV=2 ./build-kernel-docker.sh        # the next kernel's number: released as kernel-2
 ```
 
 The packages land in `kernel-build/out/` (ignored by git). The first build
@@ -89,20 +89,6 @@ gh release create kernel-N rock5t-camera/kernel-build/out/linux-image-*-imx477-N
 
 (or on github.com: Releases → Draft a new release → tag `kernel-N` → attach
 the two `.deb` files → Publish).
-
-## After the new kernel boots
-
-Remove the stock-kernel workaround stack (harmless but obsolete):
-
-```
-sudo rm -f /etc/modules-load.d/imx477.conf /etc/modprobe.d/imx477-order.conf
-sudo rm -f /lib/firmware/rock5t-cam-enable*.dtbo
-sudo rm -f /lib/modules/6.1.84-8-rk2410/extra/imx477.ko \
-           /lib/modules/6.1.84-8-rk2410/extra/rk_cam_defer_enable.ko
-```
-
-(Those files belong to the old kernel's module tree anyway — the new
-kernel never loads them.)
 
 ## Radxa kernel updates
 

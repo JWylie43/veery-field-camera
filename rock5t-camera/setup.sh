@@ -41,7 +41,7 @@ REPO_DIR="$(cd "$HERE/.." && pwd)"
 
 # ---- the camera kernel this rig runs (bump both together when publishing kernel-N+1)
 KREL="6.1.84-8-rk2410-imx477"                    # its `uname -r`
-KREV=6                                           # the GitHub release: kernel-$KREV
+KREV=1                                           # the GitHub release: kernel-$KREV
 KPKG_VER="$KREL-$KREV"                           # the .deb package version
 
 OVERLAY_SRC="$HERE/overlay/rock-5t-dual-rpi-hq-imx477.dts"

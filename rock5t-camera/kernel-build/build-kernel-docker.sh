@@ -1,13 +1,14 @@
 #!/bin/bash
 # build-kernel-docker.sh - build the IMX477 kernel packages on ANY machine with
-# Docker: Apple Silicon Mac, arm64 Linux, x86-64 Linux, Windows (Docker Desktop
-# + WSL2). No toolchain on the host; everything runs in a Debian container.
+# Docker: Apple Silicon Mac, arm64 Linux, x86-64 Linux. No toolchain on the host;
+# everything runs in a Debian container.
 #
-#     REV=7 ./build-kernel-docker.sh
+#     REV=2 ./build-kernel-docker.sh
 #
-# REV is the package revision - bump it every build (6 = the kernel released
-# as kernel-6). The two .debs land in kernel-build/out/; install them on the
-# Rock as described in README.md.
+# REV is the kernel's number: the package revision inside the .debs AND the GitHub
+# release they are published as (kernel-REV). Bump it for every kernel you publish,
+# and set KREV to match at the top of rock5t-camera/setup.sh. The two .debs land in
+# kernel-build/out/.
 #
 # What makes this the SAME kernel as the one on the Rock:
 #   - Radxa's source pinned to one commit (KERNEL_COMMIT below), not a branch
@@ -78,7 +79,7 @@ if [ "${1:-}" = "--inside" ]; then
 fi
 
 # ---------------------------------------------------------------------- host
-: "${REV:?set the package revision, e.g.  REV=7 $0}"
+: "${REV:?set the kernel number, e.g.  REV=2 $0}"
 HERE="$(cd "$(dirname "$0")" && pwd)"     # kernel-build/
 REPO="$(cd "$HERE/.." && pwd)"            # rock5t-camera/
 OUT="${OUT:-$HERE/out}"

@@ -258,8 +258,8 @@ software differs.
 
 | | Version |
 |---|---|
-| Radxa OS image | ROCK 5T Debian 12 (bookworm) KDE, release [`rsdk-r7`](https://github.com/radxa-build/rock-5t/releases/tag/rsdk-r7) (2026-07-06) |
-| Kernel | `6.1.84-8-rk2410-imx477` (release `kernel-6`), from Radxa's `6.1.84-8-rk2410` |
+| Radxa OS image | ROCK 5T Debian 12 (bookworm) KDE, release `rsdk-r7` (2026-07-06) — mirrored unmodified as this repo's release [`radxa-rsdk-r7`](../../releases/tag/radxa-rsdk-r7) (Radxa's original: [radxa-build/rock-5t](https://github.com/radxa-build/rock-5t/releases/tag/rsdk-r7)) |
+| Kernel | `6.1.84-8-rk2410-imx477` (release [`kernel-1`](../../releases/tag/kernel-1)), from Radxa's `6.1.84-8-rk2410` |
 | 3A daemon / ISP tuning | `camera-engine-rkaiq` 6.8.0-rk3588 |
 | Hardware encoder | `librockchip-mpp1` 1.5.0-1, `gstreamer1.0-rockchip1` 1.14-4, `libv4l-rkmpp` 1.7.0-1 |
 | Boot | `u-boot-menu` 4.2.2, `u-boot-rock-5t` 2017.09-64-455bd2a, `rsetup` 0.4.27 |

@@ -36,8 +36,9 @@ RIG_HOSTNAME=veery rock5t-camera/image-build/build-image.sh 1
 ```
 
 The number is the image revision. The first run downloads Radxa's image (1.4 GB,
-checked against Radxa's checksum) and the kernel release into `work/`; later builds
-reuse them. The result is `out/rock5t-camera-image-1.img.xz` (~1.5 GB) plus a
+checked against Radxa's checksum) and the kernel into `work/` — both from this repo's
+own releases (`radxa-rsdk-r7`, an unmodified mirror of Radxa's file; `kernel-N`), so
+the build needs nothing outside this repo. Later builds reuse them. The result is `out/rock5t-camera-image-1.img.xz` (~1.5 GB) plus a
 `.sha256`. `work/` and `out/` are not committed. `ALLOW_DIRTY=1` builds from
 uncommitted changes, for testing only.
 
@@ -54,8 +55,9 @@ gh release create image-1 rock5t-camera/image-build/out/rock5t-camera-image-1.im
 
 GitHub allows 2 GB per file; the image is ~1.5 GB.
 
-Keep the `kernel-N` release the image was built from: the build downloads it, and
-`setup.sh` uses it to update a Rock that is already running.
+Keep the `kernel-N` release the image was built from (the build downloads it, and
+`setup.sh` uses it to update a Rock that is already running) and the `radxa-rsdk-r7`
+release (the base every image is built on).
 
 ## When to build a new image
 

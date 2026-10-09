@@ -6,8 +6,9 @@
 #     RIG_HOSTNAME=myrig rock5t-camera/image-build/build-image.sh 1  # also set the Rock's hostname
 # The number is the image revision (the GitHub release is image-<N>). See README.md here.
 #
-# It takes Radxa's stock image (downloaded once, checked against Radxa's checksum) and
-# this repo's camera kernel release (named by KREL/KREV in rock5t-camera/setup.sh), and
+# It takes Radxa's stock image and this repo's camera kernel - both from this repo's own
+# GitHub releases (radxa-rsdk-r7, a mirror of Radxa's file checked against Radxa's
+# checksum; kernel-N, named by KREL/KREV in rock5t-camera/setup.sh) - and
 # builds inside Docker (build-inside.sh). The repo must be committed - the image carries
 # a git checkout of it - unless ALLOW_DIRTY=1 (test builds only).
 set -euo pipefail
@@ -22,7 +23,8 @@ mkdir -p "$WORK" "$OUT"
 RADXA_TAG=rsdk-r7
 RADXA_FILE=rock-5t_bookworm_kde_r7.output_512.img.xz
 RADXA_SHA512=0dbb83e55c2afb6225e39502794f02cc53257baa2f4703bbc25e59879f7995b7af9da88ac7b35cbad6d761b14eaba95fc089c0e29b3ddd2fdd61c835ee908516
-RADXA_URL="https://github.com/radxa-build/rock-5t/releases/download/$RADXA_TAG/$RADXA_FILE"
+# mirrored as this repo's release radxa-$RADXA_TAG (Radxa's original:
+# https://github.com/radxa-build/rock-5t/releases/tag/rsdk-r7); URL set below, from the remote
 
 # ---- the camera kernel: the same release setup.sh installs
 eval "$(grep -E '^(KREL|KREV)=' "$REPO/rock5t-camera/setup.sh")"
@@ -34,6 +36,7 @@ if [ -n "$(git -C "$REPO" status --porcelain)" ] && [ "${ALLOW_DIRTY:-0}" != 1 ]
 fi
 REPO_URL="$(git -C "$REPO" remote get-url origin)"
 SLUG="$(printf '%s' "$REPO_URL" | sed -E 's#^(https://github.com/|git@github.com:)##; s#\.git$##')"
+RADXA_URL="https://github.com/$SLUG/releases/download/radxa-$RADXA_TAG/$RADXA_FILE"
 
 echo "==> Radxa image $RADXA_FILE"
 if [ ! -f "$WORK/radxa.img" ]; then
