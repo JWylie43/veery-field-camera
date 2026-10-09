@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stitch · Veery Studio</title>
+<link rel="stylesheet" href="/static/studio.css">
+<style>
+  #controls { display:flex; gap:10px; align-items:center; flex-wrap:wrap; padding:8px 12px; background:var(--panel);
+              border-bottom:1px solid var(--line); position:sticky; top:0; z-index:3; }
+  .grp { display:flex; gap:6px; align-items:center; border:1px solid var(--line); padding:4px 8px; border-radius:7px; }
+  .val { width:64px; text-align:center; font-variant-numeric:tabular-nums; }
+  #frange { width:180px; padding:0; vertical-align:middle; }
+  #outName { width:260px; }
+  #stitchBtn { background:var(--ok); border-color:var(--ok); color:#fff; font-weight:700; }
+  #wrap { overflow:auto; background:#000; }
+  #c { display:block; max-width:100%; background:#000; cursor:default; }
+  #info { padding:8px 12px; display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  #jobBox { padding:8px 12px; border-bottom:1px solid var(--line); display:none; }
+  #jobBox progress { width:320px; vertical-align:middle; }
+  #cmd { width:100%; height:60px; font:12px ui-monospace, Menlo, monospace; margin-top:6px; display:none; }
+  #rangeTxt { min-width:170px; }
+</style>
+</head>
+<body>
+<div id="top">
+  <a href="/" class="back">← Takes</a>
+  <b id="takeName">…</b>
+  <span id="alignChip" class="chip"></span>
+  <span id="pairChip" class="chip"></span>
+  <span class="grow"></span>
+  <span id="status" class="muted">Preparing the preview…</span>
+</div>
+<div id="busyBanner" class="banner" hidden></div>
+<div id="controls">
+  <div class="grp">Shift far (top) <button id="tl">◀</button><input class="val" id="tv" type="number" value="0" step="0.5"><button id="tr">▶</button></div>
+  <div class="grp">Shift near (bottom) <button id="bl">◀</button><input class="val" id="bv" type="number" value="0" step="0.5"><button id="br">▶</button></div>
+  <div class="grp">Rotate° <button id="rl">◀</button><input class="val" id="rot" type="number" value="0" step="0.1"><button id="rr">▶</button></div>
+  <div class="grp"><label><input type="checkbox" id="showseam" checked> seam line</label>
+                   <label><input type="checkbox" id="crop" checked> crop to box</label> <span class="muted" id="cropdim"></span></div>
+  <div class="grp"><label><input type="checkbox" id="blend"> overlap blend</label></div>
+  <div class="grp">Frame <button id="fprev" title="Previous frame (,)">◀</button><input type="range" id="frange" min="0" value="0"><input class="val" id="fval" type="number" value="0"><span id="ftot" class="muted">/ ?</span><button id="fnext" title="Next frame (.)">▶</button></div>
+  <div class="grp"><button id="inBtn" title="Start the stitch at this frame">In ← here</button><button id="outBtn" title="End the stitch at this frame">Out ← here</button><button id="clrBtn" title="Whole take">Whole take</button><span id="rangeTxt" class="muted"></span></div>
+  <div class="grp">Output <input id="outName" type="text" spellcheck="false"></div>
+  <button id="stitchBtn" disabled>Stitch</button>
+  <span class="muted">←/→ shift both</span>
+</div>
+<div id="jobBox">
+  <progress id="pb" max="100" value="0"></progress>
+  <span id="jobStage" style="margin-left:8px"></span>
+  <button id="cancelBtn" style="margin-left:10px">Cancel</button>
+  <span id="jobDone"></span>
+  <textarea id="cmd" readonly onclick="this.select()"></textarea>
+</div>
+<div id="wrap"><canvas id="c"></canvas></div>
+<div id="info" class="muted"></div>
+<script>
+'use strict';
+const $ = (id) => { return document.getElementById(id); };
+const TAKE = decodeURIComponent(location.pathname.split('/')[2] || '');
+const API = '/api/takes/' + encodeURIComponent(TAKE);
+const cv = $('c'), ctx = cv.getContext('2d');
+const tv = $('tv'), bv = $('bv'), rotEl = $('rot');
+let OW = 0, OH = 0, SEAM = 0, TOTAL = 1, FPS = 30, loaded = false, info = null;
+let rot = 0, showSeam = true, cropOn = true;
+let cropX = 0, cropY = 0, cropW = 0, cropH = 0, dragMode = null, dragStart = null, cropStart = null;
+let curFrame = 0, inF = null, outF = null;
+let job = null, jobPoll = null, otherStitch = null;
+const imgL = new Image(), imgR = new Image();
+let pending = 0;
+const clmp = (v, lo, hi) => { return Math.max(lo, Math.min(hi, v)); };
+const st = (t, cls) => { $('status').textContent = t; $('status').className = cls || 'muted'; return; };
+const clock = (f) => { const s = f / FPS; return Math.floor(s / 60) + ':' + ('0' + Math.floor(s % 60)).slice(-2); };
+
+// ------------------------------------------------------------------ drawing (as the stitcher's tuner)
+const both = () => { if (--pending <= 0) { pending = 0; render(); } return; };
+imgL.onload = both; imgR.onload = both;
+imgL.onerror = imgR.onerror = () => { st('could not load that frame', 'bad'); pending = 0; return; };
+const drawRight = () => {
+  const sTop = +tv.value || 0, sBot = +bv.value || 0;
+  const k = (OH > 1) ? (sBot - sTop) / (OH - 1) : 0;          // per-row shear slope
+  ctx.save(); ctx.transform(1, 0, k, 1, sTop, 0); ctx.drawImage(imgR, 0, 0); ctx.restore();
+  return;
+};
+const render = () => {
+  if (!loaded) return;
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.clearRect(0, 0, OW, OH);
+  // rotate the whole panorama about the canvas centre, as the stitcher does; the crop box
+  // stays axis-aligned (drawn after the restore)
+  ctx.save();
+  if (rot) { ctx.translate(OW / 2, OH / 2); ctx.rotate(rot * Math.PI / 180); ctx.translate(-OW / 2, -OH / 2); }
+  if ($('blend').checked) {
+    ctx.globalAlpha = 0.5; ctx.drawImage(imgL, 0, 0); drawRight(); ctx.globalAlpha = 1;
+  } else {
+    ctx.drawImage(imgL, 0, 0);
+    ctx.save(); ctx.beginPath(); ctx.rect(SEAM, 0, OW - SEAM, OH); ctx.clip(); drawRight(); ctx.restore();
+  }
+  if (showSeam) {
+    ctx.strokeStyle = '#f33'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(SEAM, 0); ctx.lineTo(SEAM, OH); ctx.stroke();
+  }
+  ctx.restore();
+  if (cropOn) drawCrop();
+  return;
+};
+const drawCrop = () => {
+  if (cropW <= 0) { cropX = Math.round(OW * 0.05); cropY = Math.round(OH * 0.05); cropW = Math.round(OW * 0.9); cropH = Math.round(OH * 0.9); }
+  cropX = clmp(cropX, 0, OW - 1); cropY = clmp(cropY, 0, OH - 1);
+  cropW = clmp(cropW, 1, OW - cropX); cropH = clmp(cropH, 1, OH - cropY);
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';                       // dim everything outside the box
+  ctx.fillRect(0, 0, OW, cropY);
+  ctx.fillRect(0, cropY + cropH, OW, OH - (cropY + cropH));
+  ctx.fillRect(0, cropY, cropX, cropH);
+  ctx.fillRect(cropX + cropW, cropY, OW - (cropX + cropW), cropH);
+  ctx.strokeStyle = '#ff0'; ctx.lineWidth = 2; ctx.strokeRect(cropX, cropY, cropW, cropH);
+  const hs = Math.max(10, OW * 0.01); ctx.fillStyle = '#ff0';
+  ctx.fillRect(cropX - hs / 2, cropY - hs / 2, hs, hs);                 // top-left handle
+  ctx.fillRect(cropX + cropW - hs / 2, cropY + cropH - hs / 2, hs, hs); // bottom-right handle
+  ctx.restore();
+  $('cropdim').textContent = Math.round(cropW) + '×' + Math.round(cropH);
+  return;
+};
+
+// ------------------------------------------------------------------ controls
+const nudge = (el, d) => { el.value = Math.round(((+el.value || 0) + d) * 10) / 10; render(); return; };
+$('tl').onclick = () => { nudge(tv, -1); return; }; $('tr').onclick = () => { nudge(tv, 1); return; };
+$('bl').onclick = () => { nudge(bv, -1); return; }; $('br').onclick = () => { nudge(bv, 1); return; };
+[tv, bv].forEach((el) => { el.oninput = render; return; });
+const setRot = (v) => { rot = Math.round(v * 10) / 10; rotEl.value = rot; render(); return; };
+rotEl.oninput = () => { rot = +rotEl.value || 0; render(); return; };
+$('rl').onclick = () => { setRot((+rotEl.value || 0) - 0.1); return; };
+$('rr').onclick = () => { setRot((+rotEl.value || 0) + 0.1); return; };
+$('showseam').onchange = () => { showSeam = $('showseam').checked; render(); return; };
+$('blend').onchange = render;
+$('crop').onchange = (e) => { cropOn = e.target.checked; if (!cropOn) $('cropdim').textContent = ''; render(); return; };
+
+// crop box: drag the body to move it, the yellow corner handles to resize it
+const toCanvas = (e) => { return { x:e.offsetX * OW / cv.clientWidth, y:e.offsetY * OH / cv.clientHeight }; };
+cv.onmousedown = (e) => {
+  if (!loaded || !cropOn) return;
+  const p = toCanvas(e);
+  const hs = Math.max(14, OW * 0.016);
+  const nBR = Math.abs(p.x - (cropX + cropW)) < hs && Math.abs(p.y - (cropY + cropH)) < hs;
+  const nTL = Math.abs(p.x - cropX) < hs && Math.abs(p.y - cropY) < hs;
+  if (nBR) dragMode = 'br'; else if (nTL) dragMode = 'tl';
+  else if (p.x > cropX && p.x < cropX + cropW && p.y > cropY && p.y < cropY + cropH) dragMode = 'move';
+  else dragMode = null;
+  if (dragMode) { dragStart = p; cropStart = { x:cropX, y:cropY, w:cropW, h:cropH }; e.preventDefault(); }
+  return;
+};
+cv.onmousemove = (e) => {
+  if (!dragMode) return;
+  const p = toCanvas(e);
+  const dx = p.x - dragStart.x, dy = p.y - dragStart.y;
+  if (dragMode === 'move') { cropX = clmp(cropStart.x + dx, 0, OW - cropW); cropY = clmp(cropStart.y + dy, 0, OH - cropH); }
+  else if (dragMode === 'br') { cropW = clmp(cropStart.w + dx, 20, OW - cropX); cropH = clmp(cropStart.h + dy, 20, OH - cropY); }
+  else if (dragMode === 'tl') {
+    const nx = clmp(cropStart.x + dx, 0, cropStart.x + cropStart.w - 20), ny = clmp(cropStart.y + dy, 0, cropStart.y + cropStart.h - 20);
+    cropW = cropStart.w + (cropStart.x - nx); cropH = cropStart.h + (cropStart.y - ny); cropX = nx; cropY = ny;
+  }
+  render();
+  return;
+};
+addEventListener('mouseup', () => { dragMode = null; return; });
+addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT') return;          // typing in the boxes works normally
+  if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+    const d = e.key === 'ArrowLeft' ? -1 : 1;
+    tv.value = (+tv.value || 0) + d; bv.value = (+bv.value || 0) + d; render(); e.preventDefault();
+  } else if (e.key === ',') loadFrame(curFrame - 1);
+  else if (e.key === '.') loadFrame(curFrame + 1);
+  return;
+});
+
+// ------------------------------------------------------------------ frames + range
+const frange = $('frange'), fval = $('fval');
+let frameTimer = null;
+const loadFrame = (n) => {
+  if (!loaded) return;
+  n = clmp(parseInt(n, 10) || 0, 0, TOTAL - 1);
+  curFrame = n; frange.value = n; fval.value = n;
+  clearTimeout(frameTimer);
+  frameTimer = setTimeout(() => {                    // slider drags: only the frame you stop on
+    st('loading frame ' + n + '…');
+    pending = 2;
+    imgL.src = API + '/frame/' + n + '/L.jpg';
+    imgR.src = API + '/frame/' + n + '/R.jpg';
+    imgR.addEventListener('load', () => { st('frame ' + n + ' / ' + TOTAL + '  (' + clock(n) + ')'); return; }, { once:true });
+    return;
+  }, 120);
+  return;
+};
+$('fprev').onclick = () => { loadFrame(curFrame - 1); return; };
+$('fnext').onclick = () => { loadFrame(curFrame + 1); return; };
+frange.oninput = () => { loadFrame(frange.value); return; };
+fval.onchange = () => { loadFrame(fval.value); return; };
+const showRange = () => {
+  const a = inF === null ? 0 : inF, b = outF === null ? TOTAL - 1 : outF;
+  $('rangeTxt').textContent = (inF === null && outF === null ? 'whole take: ' : 'frames ' + a + '–' + b + ': ') +
+    (b - a + 1) + ' frames, ' + clock(b - a + 1);
+  return;
+};
+$('inBtn').onclick = () => { inF = curFrame; if (outF !== null && outF < inF) outF = null; showRange(); return; };
+$('outBtn').onclick = () => { outF = curFrame; if (inF !== null && inF > outF) inF = null; showRange(); return; };
+$('clrBtn').onclick = () => { inF = null; outF = null; showRange(); return; };
+
+// ------------------------------------------------------------------ stitch job
+const settings = () => {
+  return { degrees:rot, shift_top:+tv.value || 0, shift_bottom:+bv.value || 0,
+           crop:cropOn && cropW > 0 ? [Math.round(cropX), Math.round(cropY), Math.round(cropW), Math.round(cropH)] : null,
+           start:inF === null ? 0 : inF, end:outF };
+};
+const startStitch = async (overwrite) => {
+  const body = { take:TAKE, out:$('outName').value.trim(), overwrite:!!overwrite, settings:settings() };
+  $('stitchBtn').disabled = true;
+  let r, j;
+  try { r = await fetch('/api/jobs/stitch', { method:'POST', body:JSON.stringify(body) }); j = await r.json(); }
+  catch (e) { st('Studio server is not running (start studio/studio.command again)', 'bad'); updateButtons(); return; }
+  if (j.exists) {
+    updateButtons();
+    if (confirm(j.exists + ' already exists in the takes folder. Replace it?')) startStitch(true);
+    return;
+  }
+  if (!r.ok || j.error) { st(j.error || ('error ' + r.status), 'bad'); updateButtons(); return; }
+  watch(j.job);
+  return;
+};
+$('stitchBtn').onclick = () => { startStitch(false); return; };
+$('cancelBtn').onclick = async () => {
+  if (job && confirm('Cancel this stitch? The partial output is removed.')) await fetch('/api/jobs/' + job.id + '/cancel', { method:'POST' });
+  return;
+};
+const watch = (id) => {
+  clearInterval(jobPoll);
+  $('jobBox').style.display = 'block'; $('jobDone').textContent = '';
+  const tick = async () => {
+    try { job = await (await fetch('/api/jobs/' + id)).json(); } catch (e) { return; }
+    $('pb').value = job.percent || 0;
+    $('jobStage').textContent = (job.percent != null ? job.percent + '% · ' : '') + (job.stage || job.status);
+    if (job.cmd) { $('cmd').style.display = 'block'; $('cmd').value = job.cmd.map((a) => { return /[\s"'$]/.test(a) ? "'" + a + "'" : a; }).join(' '); }
+    const live = job.status === 'running' || job.status === 'queued';
+    $('cancelBtn').style.display = live ? '' : 'none';
+    if (!live) {
+      clearInterval(jobPoll); jobPoll = null;
+      if (job.status === 'done') {
+        const out = job.result ? job.result.output : '';
+        $('jobDone').innerHTML = ' ✅ <a href="/edit/' + encodeURIComponent(out) + '">Edit ' + out + ' →</a>';
+        st('stitched → ' + out, 'ok');
+      } else {
+        $('jobDone').textContent = ' ' + (job.error || job.status);
+        st('stitch ' + job.status, job.status === 'cancelled' ? 'warn' : 'bad');
+      }
+      job = null;
+    }
+    updateButtons();
+    return;
+  };
+  tick();
+  jobPoll = setInterval(tick, 1000);
+  return;
+};
+// another take's stitch blocks this one (one at a time); checked every few seconds
+const checkOthers = async () => {
+  let jobs = [];
+  try { jobs = (await (await fetch('/api/jobs')).json()).jobs; } catch (e) { return; }
+  const live = jobs.filter((x) => { return x.kind === 'stitch' && (x.status === 'running' || x.status === 'queued'); });
+  const mine = live.find((x) => { return x.target === TAKE; });
+  if (mine && !jobPoll) watch(mine.id);
+  otherStitch = live.find((x) => { return x.target !== TAKE; }) || null;
+  $('busyBanner').hidden = !otherStitch;
+  if (otherStitch) {
+    $('busyBanner').textContent = otherStitch.title + ' is running (' + (otherStitch.percent || 0) +
+      '%) — one stitch at a time, so Stitch is off until it finishes. You can set this one up meanwhile.';
+  }
+  updateButtons();
+  return;
+};
+const updateButtons = () => {
+  $('stitchBtn').disabled = !loaded || !!job || !!otherStitch || !(info && info.tools.stitcher_ok);
+  return;
+};
+
+// ------------------------------------------------------------------ load
+(async () => {
+  $('takeName').textContent = TAKE;
+  document.title = TAKE + ' · Stitch · Veery Studio';
+  const r = await fetch(API + '/info');
+  info = await r.json();
+  if (!r.ok) { st(info.error || 'cannot open this take', 'bad'); return; }
+  OW = info.ow; OH = info.oh; SEAM = info.seam; TOTAL = info.total; FPS = info.fps;
+  cv.width = OW; cv.height = OH;
+  if (info.align) {
+    tv.value = info.align.shift_top; bv.value = info.align.shift_bottom;
+    const c = info.align.corrections || {};
+    $('alignChip').textContent = 'Alignment: ' + info.align.file + ' (' + info.align.date + ') · pitch ' +
+      (c.pitch || 0).toFixed(2) + '° roll ' + (c.roll || 0).toFixed(2) + '° yaw ' + (c.yaw || 0).toFixed(2) + '°';
+    $('alignChip').className = 'chip ok';
+  } else {
+    $('alignChip').textContent = 'Alignment: base calibration (this take has no .align.json — run Align from the list for its own)';
+    $('alignChip').className = 'chip warn';
+  }
+  $('pairChip').textContent = 'Pair offset ' + (info.pairing.offset > 0 ? '+' : '') + info.pairing.offset + ' (' + info.pairing.method + ')';
+  $('pairChip').title = info.pairing.detail;
+  $('outName').value = info.default_out;
+  frange.max = TOTAL - 1; fval.max = TOTAL - 1;
+  $('ftot').textContent = '/ ' + TOTAL;
+  $('info').textContent = 'Panorama ' + OW + '×' + OH + ' · ' + TOTAL + ' frames (' + clock(TOTAL) + ') at ' + FPS + ' fps · ' +
+    info.cam0 + ' + ' + info.cam1 + (info.swap ? ' (cam1 is the left camera)' : '') +
+    ' · the preview is the stitcher\'s warp; the stitch adds the smart seam, 6-band blend and exposure match.';
+  if (!info.tools.stitcher_ok) st('StitchPipeline is not built — see the README', 'bad');
+  else if (!info.tools.stitcher_metadata) st('StitchPipeline is an old build: rebuild it so the video records its settings (and opens in the editor)', 'warn');
+  loaded = true;
+  showRange();
+  loadFrame(0);
+  await checkOthers();
+  setInterval(checkOthers, 3000);
+  return;
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,1075 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Edit · Veery Studio</title>
+<style>
+  :root { --bg:#14161a; --panel:#1d2026; --line:#2c313a; --fg:#e6e8eb; --dim:#8b929c;
+          --accent:#4aa3ff; --ok:#3fb950; --warn:#d6a33a; --bad:#e5534b; --rec:#ff3b30; }
+  * { box-sizing:border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+               font:13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  button, select, input { font:inherit; color:var(--fg); background:#2a2f37; border:1px solid #3a404a;
+                          border-radius:5px; padding:4px 9px; }
+  button:hover { background:#333943; }
+  button:disabled { opacity:.45; }
+  button.on { background:var(--accent); border-color:var(--accent); color:#fff; }
+  #bar { display:flex; align-items:center; gap:10px; padding:8px 12px; background:var(--panel);
+         border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  #bar .grow { flex:1; }
+  #backLink { color:var(--accent); text-decoration:none; font-weight:600; }
+  #vname { color:var(--dim); max-width:340px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #status { color:var(--dim); min-width:200px; }
+  #status.warn { color:var(--warn); } #status.bad { color:var(--bad); } #status.ok { color:var(--ok); }
+  #stage { position:relative; background:#000; }
+  #v { display:block; width:100%; height:auto; }
+  #ov { position:absolute; left:0; top:0; cursor:crosshair; }
+  #big { display:none; margin:0 auto; background:#000; }
+  #stage.outView #big { display:block; }
+  #stage.outView #v { position:absolute; right:10px; top:10px; width:30%; z-index:2;
+                      border:1px solid #555; box-shadow:0 2px 12px #000; }
+  #stage.outView #ov { z-index:3; }
+  #empty { padding:80px 20px; text-align:center; color:var(--dim); }
+  #transport { display:flex; align-items:center; gap:10px; padding:6px 12px; background:var(--panel);
+               border-top:1px solid var(--line); }
+  #tc { font-variant-numeric:tabular-nums; min-width:210px; }
+  #recInd { font-weight:600; min-width:150px; }
+  #tl { display:block; width:100%; height:46px; cursor:pointer; background:#101216; }
+  #bottom { display:grid; grid-template-columns: 1fr 300px 400px; gap:12px; padding:10px 12px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:7px; padding:10px; min-height:120px; }
+  .card h3 { margin:0 0 8px; font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); }
+  #plist { max-height:260px; overflow:auto; }
+  #plist table { width:100%; border-collapse:collapse; }
+  #plist td { padding:4px 6px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  #plist tr { cursor:pointer; }
+  #plist tr.sel td { background:#24364d; }
+  .st-framed { color:var(--ok); } .st-unframed { color:var(--warn); } .st-retake { color:var(--bad); }
+  .row { display:flex; gap:6px; align-items:center; margin:6px 0; flex-wrap:wrap; }
+  .row label { color:var(--dim); }
+  input[type=range] { width:140px; padding:0; }
+  #pvwrap { position:relative; }
+  #pv { width:100%; aspect-ratio:16/9; background:#000; display:block; border-radius:4px; }
+  .kbd { display:inline-block; min-width:18px; padding:0 5px; border:1px solid #555; border-radius:4px;
+         background:#2a2f37; text-align:center; font-size:12px; }
+  .modal { position:fixed; inset:0; background:#000a; display:flex; align-items:center; justify-content:center; z-index:20; }
+  .modal[hidden] { display:none; }
+  .modal .box { background:var(--panel); border:1px solid var(--line); border-radius:9px; padding:18px 22px;
+                width:min(620px, 92vw); max-height:86vh; overflow:auto; }
+  .modal h2 { margin:0 0 12px; font-size:16px; }
+  .help td { padding:3px 10px 3px 0; vertical-align:top; }
+  progress { width:100%; height:14px; }
+  .muted { color:var(--dim); }
+</style>
+</head>
+<body>
+<div id="bar">
+  <a id="backLink" href="/" title="Back to the takes folder (the edit is saved)">← Takes</a>
+  <span id="vname">no video loaded</span>
+  <button id="tabCut" class="on">1 · Cut</button>
+  <button id="tabFrame">2 · Frame</button>
+  <label class="muted">Output
+    <select id="outRes">
+      <option value="2560x1440">1440p (2560×1440)</option>
+      <option value="1920x1080">1080p (1920×1080)</option>
+      <option value="3840x2160">4K (3840×2160)</option>
+    </select></label>
+  <span class="grow"></span>
+  <span id="status"></span>
+  <button id="undoBtn" title="Undo (Cmd/Ctrl+Z)">Undo</button>
+  <button id="renderBtn">Render…</button>
+  <button id="helpBtn">Keys ?</button>
+</div>
+
+<div id="stage">
+  <div id="empty">Loading the video… <span class="kbd">?</span> shows the keys.</div>
+  <canvas id="big"></canvas>
+  <video id="v" muted playsinline preload="auto"></video>
+  <canvas id="ov"></canvas>
+</div>
+
+<div id="transport">
+  <button id="playBtn" title="Space">▶ Play</button>
+  <span id="tc">--:--.-- · frame –</span>
+  <label class="muted">Speed
+    <select id="speed">
+      <option value="0.25">0.25×</option><option value="0.5">0.5×</option>
+      <option value="1" selected>1×</option><option value="1.5">1.5×</option><option value="2">2×</option>
+    </select></label>
+  <button id="viewBtn" title="V">View: overview</button>
+  <button id="prevPtBtn" title="Play the selected point as it will render">▶ Preview point</button>
+  <button id="prevAllBtn" title="Play all points back to back">▶ Preview all</button>
+  <span class="grow" style="flex:1"></span>
+  <span id="zoomInd" class="muted"></span>
+  <button id="zoomReset" title="Box back to the output size, 1:1 (0, or double-click the video). Shift+0: widest box">Reset zoom (1:1)</button>
+  <span id="recInd"></span>
+</div>
+<canvas id="tl"></canvas>
+
+<div id="bottom">
+  <div class="card">
+    <h3>Points <span id="pcount" class="muted"></span></h3>
+    <div id="plist"><table><tbody id="ptbody"></tbody></table></div>
+    <div id="cutHint" class="muted" style="margin-top:6px">Cut: play or scrub, press <span class="kbd">I</span> at the start of a point and <span class="kbd">O</span> at its end.</div>
+  </div>
+  <div class="card" id="selCard">
+    <h3>Selected point</h3>
+    <div id="selNone" class="muted">None selected — click a point in the list or on the timeline.</div>
+    <div id="selBody" hidden>
+      <div class="row"><b id="selName"></b><span id="selStatus"></span></div>
+      <div class="row"><label>Label</label><input id="selLabel" type="text" placeholder="e.g. goal" style="flex:1"></div>
+      <div class="row muted" id="selRange"></div>
+      <div class="row">
+        <button id="setInBtn" title="Move this point's In to the playhead">In ← here</button>
+        <button id="setOutBtn" title="Move this point's Out to the playhead">Out ← here</button>
+        <button id="delBtn" title="Delete (Backspace)">Delete</button>
+      </div>
+      <div class="row" id="takeRow">
+        <button id="takeBtn" title="R / Enter">● Record take</button>
+        <button id="prevTakeBtn" title="Swap back to the previous take (the current one is kept)">↺ Previous take</button>
+        <button id="clearTakeBtn" title="Set the take aside (kept in this point's history)">Clear take</button>
+      </div>
+      <div class="row muted" id="takeInfo">
+      </div>
+      <div class="row"><label>Smoothing</label><input id="sigma" type="range" min="0" max="1.5" step="0.05"><span id="sigmaV" class="muted"></span></div>
+      <div class="row"><label>Steady</label><input id="dead" type="range" min="0" max="60" step="1"><span id="deadV" class="muted"></span></div>
+    </div>
+  </div>
+  <div class="card">
+    <h3>Output monitor <span id="pvInfo" class="muted"></span></h3>
+    <div id="pvwrap"><canvas id="pv" width="640" height="360"></canvas></div>
+  </div>
+</div>
+
+<div class="modal" id="help" hidden><div class="box">
+  <h2>Keys</h2>
+  <table class="help">
+    <tr><td><span class="kbd">Space</span></td><td>Play / pause (during a take: abandon it)</td></tr>
+    <tr><td><span class="kbd">←</span> <span class="kbd">→</span></td><td>Step one frame &nbsp; (<span class="kbd">Shift</span>: one second, <span class="kbd">Alt</span>: ten seconds)</td></tr>
+    <tr><td><span class="kbd">J</span> <span class="kbd">L</span></td><td>Jump back / forward 5 s</td></tr>
+    <tr><td><span class="kbd">1</span> <span class="kbd">2</span></td><td>Cut mode / Frame mode</td></tr>
+    <tr><td><span class="kbd">V</span></td><td>Overview ↔ big output view</td></tr>
+    <tr><td><span class="kbd">[</span> <span class="kbd">]</span></td><td>Select previous / next point (jumps to its In)</td></tr>
+    <tr><td><span class="kbd">P</span></td><td>Preview the selected point as it will render</td></tr>
+    <tr><td><span class="kbd">Cmd/Ctrl+Z</span></td><td>Undo a Cut edit (add / delete / move a point) &nbsp; (<span class="kbd">Shift</span>: redo). Takes are never undone — see "Previous take".</td></tr>
+    <tr><td colspan="2"><b>Cut</b></td></tr>
+    <tr><td><span class="kbd">I</span> / <span class="kbd">O</span></td><td>Mark In / Out at the playhead — In then Out makes a point. Points can't overlap.</td></tr>
+    <tr><td><span class="kbd">Esc</span></td><td>Clear a pending In</td></tr>
+    <tr><td><span class="kbd">Backspace</span></td><td>Delete the selected point</td></tr>
+    <tr><td colspan="2"><b>Frame</b></td></tr>
+    <tr><td><span class="kbd">R</span> / <span class="kbd">Enter</span></td><td>Record a take of the selected point: pre-roll, then recording runs In → Out automatically</td></tr>
+    <tr><td>Mouse</td><td>Box follows the mouse left/right; its bottom stays on its line</td></tr>
+    <tr><td><span class="kbd">Shift</span> + mouse</td><td>Also move the box up/down</td></tr>
+    <tr><td>Scroll</td><td>Zoom the box, ~4% per notch (<span class="kbd">Alt</span>: finer). The readout under the video shows the zoom.</td></tr>
+    <tr><td><span class="kbd">−</span> <span class="kbd">=</span></td><td>Zoom out / in by 2%</td></tr>
+    <tr><td><span class="kbd">0</span> / double-click</td><td>Reset zoom to 1:1 — box = output size, the sharpest framing</td></tr>
+    <tr><td><span class="kbd">Shift+0</span></td><td>Widest box without black bars (full height of the panorama)</td></tr>
+    <tr><td>Scroll out further</td><td>Wider than that: the box gets taller than the panorama and the output is letterboxed (black bars), up to the full panorama width. Scrolling stops once at the widest no-bars box first.</td></tr>
+    <tr><td><span class="kbd">Esc</span></td><td>Abandon the take in progress (the previous take is kept)</td></tr>
+  </table>
+  <p class="muted">The edit saves itself within a second of every change, next to the video as <i>name.director.json</i>
+  (timestamped backups in <i>name.director-backups/</i>). Reopen the video to resume. Re-recording or clearing a take keeps
+  the old one: <b>↺ Previous take</b> brings it back.</p>
+  <div class="row"><button id="helpClose">Close</button></div>
+</div></div>
+
+<div class="modal" id="renderDlg" hidden><div class="box">
+  <h2>Render</h2>
+  <div id="rSummary" class="muted"></div>
+  <div class="row"><label><input type="radio" name="rmode" value="one" checked> One video, points in order</label></div>
+  <div class="row"><label><input type="radio" name="rmode" value="per"> One file per point</label></div>
+  <div class="row"><label>Quality</label>
+    <select id="rQuality">
+      <option value="h264/high">H.264 · high — plays everywhere (~0.55 bits/pixel)</option>
+      <option value="hevc/high">HEVC · high — same quality, ~20% smaller file</option>
+      <option value="h264/standard">H.264 · standard — smaller, slightly softer</option>
+    </select></div>
+  <div class="row"><label>Unframed points</label>
+    <select id="rUnframed"><option value="skip" selected>leave out</option><option value="wide">render as a wide shot</option></select></div>
+  <div class="row"><label>Output</label><input id="rOut" type="text" style="flex:1" placeholder="name_edit.mp4"></div>
+  <div class="row muted">Saved in the takes folder. The render runs as a job: you can leave this page, and its progress shows on the takes list too.</div>
+  <div class="row"><progress id="rProg" max="1" value="0" hidden></progress></div>
+  <div id="rMsg" class="muted"></div>
+  <div class="row"><button id="rStart" class="on">Render</button><button id="rClose">Close</button></div>
+</div></div>
+
+<script>
+'use strict';
+// ------------------------------------------------------------------ state
+const $ = (id) => { return document.getElementById(id); };
+const v = $('v'), ov = $('ov'), ovc = ov.getContext('2d'), tl = $('tl'), tlc = tl.getContext('2d');
+const pv = $('pv'), pvc = pv.getContext('2d'), big = $('big'), bigc = big.getContext('2d');
+
+// Studio: the video comes from the URL (/edit/<name>); everything goes through its API.
+const VIDEO = decodeURIComponent(location.pathname.split('/')[2] || '');
+const DOWN = 'Studio server is not running (start studio/studio.command again)';
+const API = '/api/videos/' + encodeURIComponent(VIDEO);
+let info = null;            // video info from the server
+let proj = null;            // the edit (saved as <video>.director.json)
+let mode = 'cut';           // 'cut' | 'frame'
+let selPt = null;           // selected point object
+let pendingIn = null;       // Cut: In waiting for its Out
+let curFrame = 0;
+let box = { cx:0, by:0, w:0 };   // live box in video pixels (centre x, bottom y, width)
+let mouseIn = false, shiftDown = false;
+let take = null;            // { pt, phase:'preroll'|'rec', raw:[] }
+let preview = null;         // { kind:'point'|'all', pt }
+let outView = false;
+let undoStack = [], redoStack = [];
+let saveTimer = null;
+const PREROLL_S = 3;
+
+const fps = () => { return info ? info.fps : 30; };
+const W = () => { return info ? info.width : 1; };
+const H = () => { return info ? info.height : 1; };
+const OW = () => { return proj ? proj.output.width : 2560; };
+const OH = () => { return proj ? proj.output.height : 1440; };
+const clamp = (x, a, b) => { return Math.max(a, Math.min(b, x)); };
+
+const status = (msg, cls) => {
+  const s = $('status'); s.textContent = msg; s.className = cls || '';
+  return msg;
+};
+
+// ------------------------------------------------------------------ time / frames
+const tcode = (f) => {
+  const t = f / fps(), m = Math.floor(t / 60), s = Math.floor(t % 60), ff = Math.round(f % fps());
+  return String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0') + '.' + String(ff).padStart(2, '0');
+};
+const seekFrame = (f) => {
+  if (!info) return;
+  f = clamp(Math.round(f), 0, info.frames - 1);
+  curFrame = f;
+  v.currentTime = (f + 0.3) / fps();       // inside frame f, so that frame is shown
+  return;
+};
+const playing = () => { return !v.paused && !v.ended; };
+
+// ------------------------------------------------------------------ project
+const newProject = () => {
+  return { version:1, video:info.name, fps:info.fps, frames:info.frames, width:info.width, height:info.height,
+           output:{ width:2560, height:1440 }, smoothing:{ sigma:0.5, dead:10 }, points:[] };
+};
+const sortPoints = () => {
+  proj.points.sort((a, b) => { return a.in - b.in; });
+  proj.points.forEach((p, i) => { p.name = 'Point ' + (i + 1) + (p.label ? ' – ' + p.label : ''); return; });
+  return;
+};
+const pointAt = (f) => { return proj ? proj.points.find((p) => { return f >= p.in && f <= p.out; }) : null; };
+const overlaps = (a, b, except) => {
+  return proj.points.find((p) => { return p !== except && a <= p.out && p.in <= b; });
+};
+const fmtAt = (iso) => {
+  if (!iso) return 'earlier';
+  const d = new Date(iso);
+  return d.toLocaleDateString(undefined, { month:'short', day:'numeric' }) + ' ' +
+         d.toLocaleTimeString(undefined, { hour:'2-digit', minute:'2-digit' });
+};
+const ptStatus = (p) => { return p.take ? 'framed' : (p.retake ? 'retake' : 'unframed'); };
+const ptStatusText = (p) => { return p.take ? 'framed' : (p.retake ? 'needs re-take' : 'not framed'); };
+
+// ---- takes are protected -------------------------------------------------------
+// Recording a take is NOT an undoable action. Every take a point has ever had stays
+// with it: re-recording or clearing moves the old take into p.history (newest first),
+// from where "Previous take" brings it back. Undo/redo only cover the Cut structure
+// (add / delete / move edges), and never silently drop a take (see restore()).
+const HISTORY_MAX = 8;
+const newId = () => { return Date.now().toString(36) + Math.random().toString(36).slice(2, 7); };
+const fits = (tk, p) => { return !!tk && tk.path.length === p.out - p.in + 1; };
+const pushHistory = (p, tk) => {
+  if (!tk) return;
+  p.history = [tk].concat((p.history || []).filter((h) => { return h.tid !== tk.tid; })).slice(0, HISTORY_MAX);
+  return;
+};
+const prevTake = (p) => { return (p.history || []).find((h) => { return fits(h, p); }) || null; };
+const allTakes = (p) => { return (p && p.take ? [p.take] : []).concat((p && p.history) || []); };
+
+const snapshot = () => { return JSON.stringify(proj.points); };
+const pushUndo = () => {
+  undoStack.push(snapshot()); if (undoStack.length > 30) undoStack.shift();
+  redoStack = [];
+  return;
+};
+// Restore a structure snapshot, carrying every take across: a point keeps its
+// current take if it still fits the restored range, else the snapshot's; whatever
+// isn't used goes into the point's history. Returns false if cancelled.
+const restore = (snap, verb) => {
+  const target = JSON.parse(snap);
+  const byId = new Map(proj.points.map((p) => { return [p.id, p]; }));
+  const keptIds = new Set(target.map((t) => { return t.id; }));
+  const lost = proj.points.filter((p) => { return !keptIds.has(p.id) && allTakes(p).length; });
+  if (lost.length && !confirm(verb + ' would remove ' + lost.map((p) => { return p.name; }).join(', ') +
+      ', which ha' + (lost.length > 1 ? 've' : 's') + ' a recorded take.\n\n' + verb + ' anyway? (The other direction brings it back.)')) return false;
+  for (const tp of target) {
+    const cur = byId.get(tp.id);
+    if (!cur) continue;
+    const pool = [];
+    for (const tk of allTakes(cur).concat(allTakes(tp))) if (!pool.find((x) => { return x.tid === tk.tid; })) pool.push(tk);
+    tp.take = fits(cur.take, tp) ? cur.take : (fits(tp.take, tp) ? tp.take : null);
+    tp.history = pool.filter((tk) => { return !tp.take || tk.tid !== tp.take.tid; }).slice(0, HISTORY_MAX);
+    tp.label = cur.label;
+    tp.retake = !tp.take && tp.history.length > 0;
+  }
+  const selId = selPt ? selPt.id : null;
+  proj.points = target;
+  selPt = proj.points.find((p) => { return p.id === selId; }) || null;
+  changed();
+  return true;
+};
+const undo = () => {
+  if (!undoStack.length) { status('nothing to undo'); return; }
+  const cur = snapshot();
+  if (!restore(undoStack[undoStack.length - 1], 'Undo')) return;
+  undoStack.pop(); redoStack.push(cur); status('undone (Cmd/Ctrl+Shift+Z to redo)');
+  return;
+};
+const redo = () => {
+  if (!redoStack.length) { status('nothing to redo'); return; }
+  const cur = snapshot();
+  if (!restore(redoStack[redoStack.length - 1], 'Redo')) return;
+  redoStack.pop(); undoStack.push(cur); status('redone');
+  return;
+};
+
+const changed = (save) => {
+  sortPoints(); renderList(); renderSel(); drawTimeline();
+  if (save !== false) scheduleSave();
+  return;
+};
+const scheduleSave = () => {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveNow, 700);
+  return;
+};
+const saveNow = async () => {
+  if (!proj) return;
+  try {
+    const r = await fetch(API + '/save', { method:'POST', body:JSON.stringify(proj) });
+    if (!r.ok) { const e = await r.json().catch(() => { return {}; }); status('save failed: ' + (e.error || r.status), 'bad'); }
+  } catch (e) {
+    status(DOWN + ' — the edit is kept in this tab and saves as soon as it is back', 'bad');
+    clearTimeout(saveTimer); saveTimer = setTimeout(saveNow, 3000);       // keep trying
+    return false;
+  }
+  return;
+};
+
+// ------------------------------------------------------------------ box geometry
+const boxH = (w) => { return w * OH() / OW(); };
+const maxW = () => { return Math.min(W(), H() * OW() / OH()); };
+const minW = () => { return Math.max(160, OW() * 0.5); };
+// The box can go wider than the widest 16:9 box that fits the panorama's height,
+// up to the panorama's full width: it is then taller than the panorama, stays
+// centred on it vertically, and the output gets black bars top and bottom.
+const letterboxed = (w) => { return boxH(w) > H() + 0.5; };
+const clampBox = (b) => {
+  const w = clamp(b.w, minW(), W()), h = boxH(w);
+  const by = h > H() ? (H() + h) / 2 : clamp(b.by, h, H());
+  return { w, cx:clamp(b.cx, w / 2, W() - w / 2), by };
+};
+const pathBox = (p, f) => {
+  if (!p || !p.take || f < p.in || f > p.out) return null;
+  const s = p.take.path[f - p.in];
+  return s ? { cx:s[0], by:s[1], w:s[2] } : null;
+};
+const wideBox = () => { return { cx:W() / 2, by:H(), w:maxW() }; };
+// What the render will show at frame f (null = frame is cut)
+const renderBoxAt = (f) => {
+  const p = pointAt(f);
+  if (!p) return null;
+  return pathBox(p, f) || wideBox();
+};
+
+// ------------------------------------------------------------------ smoothing
+// Per take, after recording (so it can look both ways - no lag):
+//  1. zero-phase Gaussian (sigma seconds) removes hand jitter and back-and-forth,
+//  2. a dead-band (px) holds the camera still through small wiggles,
+//  3. a light Gaussian rounds off the starts/stops the dead-band leaves.
+const gauss = (a, sigma) => {
+  const n = a.length; if (sigma < 0.5 || n < 3) return a.slice();
+  const r = Math.ceil(sigma * 3), k = [];
+  let ks = 0;
+  for (let i = -r; i <= r; i++) { const g = Math.exp(-(i * i) / (2 * sigma * sigma)); k.push(g); ks += g; }
+  const out = new Array(n);
+  for (let i = 0; i < n; i++) {
+    let s = 0;
+    for (let j = -r; j <= r; j++) {
+      let idx = i + j;
+      if (idx < 0) idx = -idx; if (idx >= n) idx = 2 * n - 2 - idx;   // reflect at the ends
+      s += a[clamp(idx, 0, n - 1)] * k[j + r];
+    }
+    out[i] = s / ks;
+  }
+  return out;
+};
+const deadband = (a, d) => {
+  if (d <= 0) return a.slice();
+  let held = a[0];
+  return a.map((x) => {
+    if (x > held + d) held = x - d; else if (x < held - d) held = x + d;
+    return held;
+  });
+};
+const smoothPath = (raw, sigmaS, dead) => {
+  const sig = sigmaS * fps(), out = [];
+  const chan = (c, d) => { return gauss(deadband(gauss(raw.map((s) => { return s[c]; }), sig), d), 0.15 * fps()); };
+  const cx = chan(0, dead), by = chan(1, dead), w = chan(2, dead);
+  for (let i = 0; i < raw.length; i++) {
+    const b = clampBox({ cx:cx[i], by:by[i], w:w[i] });
+    out.push([+b.cx.toFixed(2), +b.by.toFixed(2), +b.w.toFixed(2)]);
+  }
+  return out;
+};
+const resmooth = (p) => {
+  if (!p.take) return;
+  p.take.path = smoothPath(p.take.raw, p.take.sigma, p.take.dead);
+  return;
+};
+
+// ------------------------------------------------------------------ takes
+const startTake = (p) => {
+  if (!p) { status('select a point first', 'warn'); return; }
+  if (take) return;
+  preview = null;
+  take = { pt:p, phase:'preroll', raw:new Array(p.out - p.in + 1) };
+  v.playbackRate = +$('speed').value;
+  seekFrame(Math.max(0, p.in - PREROLL_S * fps()));
+  v.play();
+  status('pre-roll — position the box; recording starts at the In', 'warn');
+  return;
+};
+const abandonTake = (why) => {
+  if (!take) return;
+  take = null; v.pause();
+  status('take abandoned' + (why ? ' (' + why + ')' : '') + ' — previous take kept', 'warn');
+  updateRecInd();
+  return;
+};
+const finishTake = () => {
+  const t = take; take = null; v.pause();
+  const n = t.raw.length, known = [];
+  t.raw.forEach((s, i) => { if (s) known.push(i); return; });
+  if (known.length < Math.min(5, n)) { status('take too short — not saved', 'bad'); updateRecInd(); return; }
+  // fill frames the browser skipped (dropped/merged) by interpolating between samples
+  const raw = new Array(n);
+  let k = 0;
+  for (let i = 0; i < n; i++) {
+    while (k < known.length - 1 && known[k + 1] <= i) k++;
+    const a = known[k], b = known[Math.min(k + 1, known.length - 1)];
+    if (i <= known[0]) raw[i] = t.raw[known[0]].slice();
+    else if (i >= known[known.length - 1]) raw[i] = t.raw[known[known.length - 1]].slice();
+    else if (a === i || b === a) raw[i] = t.raw[a].slice();
+    else { const u = (i - a) / (b - a); raw[i] = t.raw[a].map((x, c) => { return x + (t.raw[b][c] - x) * u; }); }
+  }
+  const p = t.pt;
+  pushHistory(p, p.take);                             // the previous take is kept, never replaced outright
+  p.take = { tid:newId(), at:new Date().toISOString(), raw:raw.map((s) => { return s.map((x) => { return +x.toFixed(1); }); }),
+             sigma:proj.smoothing.sigma, dead:proj.smoothing.dead, path:[] };
+  p.retake = false;
+  resmooth(p);
+  changed();
+  status(p.name + ' framed (' + known.length + '/' + n + ' frames sampled)', 'ok');
+  updateRecInd();
+  return;
+};
+const updateRecInd = () => {
+  const r = $('recInd');
+  if (!take) { r.textContent = ''; return; }
+  if (take.phase === 'preroll') { r.textContent = '◌ PRE-ROLL ' + take.pt.name; r.style.color = 'var(--warn)'; }
+  else { r.textContent = '● REC ' + take.pt.name; r.style.color = 'var(--rec)'; }
+  return;
+};
+
+// per presented video frame
+const onVideoFrame = (now, meta) => {
+  curFrame = Math.round(meta.mediaTime * fps());
+  if (take) {
+    const p = take.pt;
+    if (take.phase === 'preroll' && curFrame >= p.in) { take.phase = 'rec'; status('recording ' + p.name, 'bad'); updateRecInd(); }
+    if (take.phase === 'rec') {
+      if (curFrame >= p.in && curFrame <= p.out) take.raw[curFrame - p.in] = [box.cx, box.by, box.w];
+      if (curFrame >= p.out) finishTake();
+    }
+  } else if (preview && playing()) {
+    if (preview.kind === 'point' && curFrame >= preview.pt.out) { v.pause(); preview = null; status('preview done'); }
+    else if (preview.kind === 'all') {
+      const here = pointAt(curFrame);
+      if (!here) {
+        const next = proj.points.find((p) => { return p.in > curFrame; });
+        if (next) seekFrame(next.in); else { v.pause(); preview = null; status('preview done'); }
+      }
+    }
+  }
+  updateTC();
+  v.requestVideoFrameCallback(onVideoFrame);
+  return;
+};
+
+// ------------------------------------------------------------------ drawing
+const layout = () => {
+  const r = v.getBoundingClientRect(), s = $('stage').getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  ov.style.left = (r.left - s.left) + 'px'; ov.style.top = (r.top - s.top) + 'px';
+  ov.style.width = r.width + 'px'; ov.style.height = r.height + 'px';
+  ov.width = Math.round(r.width * dpr); ov.height = Math.round(r.height * dpr);
+  const tw = tl.getBoundingClientRect().width;
+  tl.width = Math.round(tw * dpr); tl.height = Math.round(46 * dpr);
+  if (outView) {
+    const sw = $('stage').clientWidth, maxH = Math.max(240, window.innerHeight - 330);
+    let bw = sw, bh = sw * 9 / 16;
+    if (bh > maxH) { bh = maxH; bw = bh * 16 / 9; }
+    big.style.width = bw + 'px'; big.style.height = bh + 'px';
+    big.width = Math.round(bw * dpr); big.height = Math.round(bh * dpr);
+  }
+  drawTimeline();
+  return;
+};
+
+const drawBox = (ctx, b, k, color, dash, label) => {
+  const h = boxH(b.w), x = (b.cx - b.w / 2) * k, y = (b.by - h) * k;
+  ctx.save();
+  ctx.setLineDash(dash ? [8, 6] : []); ctx.lineWidth = 2 * (window.devicePixelRatio || 1);
+  ctx.strokeStyle = color; ctx.strokeRect(x, y, b.w * k, h * k);
+  if (label) {
+    ctx.font = (12 * (window.devicePixelRatio || 1)) + 'px sans-serif'; ctx.fillStyle = color;
+    ctx.fillText(label, x + 6, y + 16 * (window.devicePixelRatio || 1));
+  }
+  ctx.restore();
+  return;
+};
+
+const drawOverlay = () => {
+  ovc.clearRect(0, 0, ov.width, ov.height);
+  if (!info) return;
+  const k = ov.width / W();
+  const rb = renderBoxAt(curFrame), p = pointAt(curFrame);
+  if (mode === 'cut') {
+    if (p) {   // show what this point will render as (wide, until framed)
+      drawBox(ovc, pathBox(p, curFrame) || wideBox(), k, 'rgba(63,185,80,.8)', true, p.name);
+    }
+    return;
+  }
+  // Frame mode: dim what falls outside the live box, recorded path in green
+  const live = box, h = boxH(live.w);
+  ovc.fillStyle = 'rgba(0,0,0,.35)';
+  ovc.fillRect(0, 0, ov.width, ov.height);
+  ovc.clearRect((live.cx - live.w / 2) * k, (live.by - h) * k, live.w * k, h * k);
+  if (p && p.take && !(take && take.phase === 'rec')) drawBox(ovc, pathBox(p, curFrame), k, '#3fb950', false, p.name + ' take');
+  const soft = live.w < OW();
+  const col = take ? (take.phase === 'rec' ? '#ff3b30' : '#d6a33a') : '#ffffff';
+  drawBox(ovc, live, k, col, !take, (take && take.phase === 'rec' ? '● REC  ' : '') +
+          Math.round(live.w) + '×' + Math.round(h) + (soft ? '  (soft: ' + (OW() / live.w).toFixed(2) + '× upscale)' : ''));
+  // the box's bottom line (vertical lock)
+  ovc.save(); ovc.strokeStyle = 'rgba(255,255,255,.25)'; ovc.setLineDash([3, 6]);
+  ovc.beginPath(); ovc.moveTo(0, live.by * k); ovc.lineTo(ov.width, live.by * k); ovc.stroke(); ovc.restore();
+  return;
+};
+
+const drawCrop = (ctx, cw, ch) => {
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, cw, ch);
+  if (!info || v.readyState < 2) return;
+  let b = renderBoxAt(curFrame), cut = false;
+  if (take || (mode === 'frame' && !b)) b = box;       // while recording / steering: the live box
+  if (!b) { b = wideBox(); cut = true; }
+  const h = boxH(b.w), sx = b.cx - b.w / 2, sy = b.by - h;
+  const x0 = Math.max(0, sx), y0 = Math.max(0, sy), x1 = Math.min(W(), sx + b.w), y1 = Math.min(H(), sy + h);
+  if (x1 > x0 && y1 > y0)                             // outside the panorama stays black (letterbox)
+    ctx.drawImage(v, x0, y0, x1 - x0, y1 - y0,
+                  (x0 - sx) / b.w * cw, (y0 - sy) / h * ch, (x1 - x0) / b.w * cw, (y1 - y0) / h * ch);
+  if (cut) {
+    ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.fillRect(0, 0, cw, ch);
+    ctx.fillStyle = '#aaa'; ctx.font = Math.round(ch / 14) + 'px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('not in a point — cut', cw / 2, ch / 2);
+  }
+  return;
+};
+
+const drawTimeline = () => {
+  const w = tl.width, h = tl.height, dpr = window.devicePixelRatio || 1;
+  tlc.fillStyle = '#101216'; tlc.fillRect(0, 0, w, h);
+  if (!info) return;
+  const x = (f) => { return f / Math.max(1, info.frames - 1) * w; };
+  tlc.fillStyle = '#2a2f37';
+  tlc.font = (10 * dpr) + 'px sans-serif';
+  const mins = info.frames / fps() / 60, step = mins > 40 ? 10 : (mins > 10 ? 5 : 1);
+  for (let m = 0; m <= mins; m += step) {
+    const xx = x(m * 60 * fps());
+    tlc.fillRect(xx, 0, 1, h); tlc.fillStyle = '#666'; tlc.fillText(m + 'm', xx + 3, h - 4); tlc.fillStyle = '#2a2f37';
+  }
+  const colors = { framed:'#3fb950', unframed:'#d6a33a', retake:'#e5534b' };
+  for (const p of proj.points) {
+    const x0 = x(p.in), x1 = Math.max(x0 + 2, x(p.out + 1));
+    tlc.fillStyle = colors[ptStatus(p)]; tlc.globalAlpha = 0.75;
+    tlc.fillRect(x0, 8 * dpr, x1 - x0, h - 22 * dpr); tlc.globalAlpha = 1;
+    if (p === selPt) { tlc.strokeStyle = '#fff'; tlc.lineWidth = 2 * dpr; tlc.strokeRect(x0, 7 * dpr, x1 - x0, h - 20 * dpr); }
+  }
+  if (pendingIn !== null) {
+    tlc.fillStyle = '#4aa3ff'; tlc.fillRect(x(pendingIn), 0, 2 * dpr, h);
+    tlc.globalAlpha = 0.25; tlc.fillRect(x(pendingIn), 8 * dpr, Math.max(0, x(curFrame) - x(pendingIn)), h - 22 * dpr); tlc.globalAlpha = 1;
+  }
+  tlc.fillStyle = '#ff5050'; tlc.fillRect(x(curFrame) - dpr, 0, 2 * dpr, h);
+  return;
+};
+
+const loop = () => {
+  // keep the overlay glued to the video (its size settles a frame or two after load)
+  if (info && (Math.abs(parseFloat(ov.style.width || 0) - v.clientWidth) > 0.5 ||
+               Math.abs(parseFloat(ov.style.height || 0) - v.clientHeight) > 0.5)) layout();
+  drawOverlay();
+  updateZoomInd();
+  drawCrop(pvc, pv.width, pv.height);
+  if (outView) drawCrop(bigc, big.width, big.height);
+  if (playing()) drawTimeline();
+  requestAnimationFrame(loop);
+  return;
+};
+
+const updateTC = () => {
+  if (!info) return;
+  const p = pointAt(curFrame);
+  $('tc').textContent = tcode(curFrame) + ' · frame ' + curFrame + (p ? ' · ' + p.name : '');
+  $('playBtn').textContent = playing() ? '❚❚ Pause' : '▶ Play';
+  return;
+};
+
+// ------------------------------------------------------------------ lists / panels
+const renderList = () => {
+  const tb = $('ptbody'); tb.innerHTML = '';
+  $('pcount').textContent = proj ? '(' + proj.points.length + ')' : '';
+  if (!proj) return;
+  for (const p of proj.points) {
+    const tr = document.createElement('tr');
+    if (p === selPt) tr.className = 'sel';
+    const dur = (p.out - p.in + 1) / fps();
+    tr.innerHTML = '<td><b></b></td><td class="muted"></td><td class="muted"></td><td></td>';
+    tr.children[0].firstChild.textContent = p.name;
+    tr.children[1].textContent = tcode(p.in) + ' – ' + tcode(p.out);
+    tr.children[2].textContent = dur.toFixed(1) + ' s';
+    tr.children[3].textContent = ptStatusText(p); tr.children[3].className = 'st-' + ptStatus(p);
+    tr.onclick = () => { select(p, true); return; };
+    tb.appendChild(tr);
+  }
+  return;
+};
+const renderSel = () => {
+  const p = selPt;
+  $('selNone').hidden = !!p; $('selBody').hidden = !p;
+  if (!p) return;
+  $('selName').textContent = p.name;
+  $('selStatus').textContent = ptStatusText(p); $('selStatus').className = 'st-' + ptStatus(p);
+  if (document.activeElement !== $('selLabel')) $('selLabel').value = p.label || '';
+  $('selRange').textContent = 'In ' + tcode(p.in) + ' (f' + p.in + ')  ·  Out ' + tcode(p.out) + ' (f' + p.out + ')  ·  ' +
+                              ((p.out - p.in + 1) / fps()).toFixed(1) + ' s';
+  $('takeRow').style.display = mode === 'frame' ? '' : 'none';
+  $('clearTakeBtn').disabled = !p.take;
+  const pt = prevTake(p), nh = (p.history || []).length;
+  $('prevTakeBtn').disabled = !pt;
+  $('takeInfo').textContent = (p.take ? 'take recorded ' + fmtAt(p.take.at) : 'no take') +
+    (nh ? ' · ' + nh + ' earlier take' + (nh > 1 ? 's' : '') + ' kept' : '');
+  const sg = p.take ? p.take.sigma : proj.smoothing.sigma, dd = p.take ? p.take.dead : proj.smoothing.dead;
+  $('sigma').value = sg; $('sigmaV').textContent = sg.toFixed(2) + ' s';
+  $('dead').value = dd; $('deadV').textContent = dd + ' px';
+  return;
+};
+const select = (p, jump) => {
+  selPt = p; renderList(); renderSel(); drawTimeline();
+  if (p && jump && !take) { v.pause(); preview = null; seekFrame(p.in); }
+  return;
+};
+
+// ------------------------------------------------------------------ cut actions
+const markIn = () => {
+  const inside = pointAt(curFrame);
+  if (inside) { status('frame ' + curFrame + ' is inside ' + inside.name + ' — points can\'t overlap', 'bad'); return; }
+  pendingIn = curFrame; drawTimeline();
+  status('In at ' + tcode(curFrame) + ' — now press O at the end of the point');
+  return;
+};
+const markOut = () => {
+  if (pendingIn === null) { status('press I at the start of the point first', 'warn'); return; }
+  const a = pendingIn, b = curFrame;
+  if (b < a) { status('Out is before the In — move past ' + tcode(a) + ' first', 'bad'); return; }
+  const hit = overlaps(a, b, null);
+  if (hit) { status('that range overlaps ' + hit.name + ' — points can\'t overlap', 'bad'); return; }
+  pushUndo();
+  const p = { id:newId(), in:a, out:b, label:'', take:null, history:[], retake:false };
+  proj.points.push(p); pendingIn = null; selPt = p;
+  changed();
+  status(p.name + ' added (' + ((b - a + 1) / fps()).toFixed(1) + ' s)', 'ok');
+  return;
+};
+const deletePoint = () => {
+  if (!selPt) return;
+  if (allTakes(selPt).length && !confirm('Delete ' + selPt.name + ' and its recorded take' +
+      (allTakes(selPt).length > 1 ? 's' : '') + '?\n\n(Cmd/Ctrl+Z brings it back.)')) return;
+  pushUndo();
+  const name = selPt.name;
+  proj.points = proj.points.filter((p) => { return p !== selPt; });
+  selPt = null; changed();
+  status(name + ' deleted (Cmd/Ctrl+Z to undo)', 'warn');
+  return;
+};
+// Move an edge. Shrinking keeps the take (trimmed); growing past what was recorded
+// marks the point "needs re-take" rather than inventing frames that were never steered.
+const setEdge = (which) => {
+  const p = selPt; if (!p) return;
+  const a = which === 'in' ? curFrame : p.in, b = which === 'out' ? curFrame : p.out;
+  if (b < a) { status('In must come before Out', 'bad'); return; }
+  const hit = overlaps(a, b, p);
+  if (hit) { status('that would overlap ' + hit.name, 'bad'); return; }
+  pushUndo();
+  if (p.take) {
+    const old = p.take;
+    pushHistory(p, old);                              // the full take stays recoverable
+    if (a >= p.in && b <= p.out)
+      p.take = Object.assign({}, old, { tid:newId(), raw:old.raw.slice(a - p.in, b - p.in + 1),
+                                        path:old.path.slice(a - p.in, b - p.in + 1) });
+    else { p.take = null; p.retake = true; }
+  }
+  p.in = a; p.out = b;
+  changed();
+  status(p.name + ' ' + which + ' moved' + (p.retake && !p.take ? ' — needs a new take' : ''), p.retake && !p.take ? 'warn' : 'ok');
+  return;
+};
+
+// ------------------------------------------------------------------ modes / view
+const setMode = (m) => {
+  if (take) return;
+  mode = m;
+  $('tabCut').classList.toggle('on', m === 'cut'); $('tabFrame').classList.toggle('on', m === 'frame');
+  $('cutHint').style.display = m === 'cut' ? '' : 'none';
+  if (m === 'frame' && !selPt && proj && proj.points.length) select(proj.points[0], true);
+  pendingIn = null; renderSel(); drawTimeline();
+  status(m === 'cut' ? 'Cut: I / O to mark points' : 'Frame: select a point, R to record its take');
+  return;
+};
+const setView = (o) => {
+  outView = o;
+  $('stage').classList.toggle('outView', o);
+  $('viewBtn').textContent = 'View: ' + (o ? 'output' : 'overview');
+  requestAnimationFrame(layout);
+  return;
+};
+
+// ------------------------------------------------------------------ loading
+const applyInfo = (j) => {
+  if (j.error) { status(j.error, 'bad'); return; }
+  if (!j.loaded) return;
+  info = j;
+  if (j.project && j.project.frames === j.frames && Array.isArray(j.project.points)) {
+    proj = j.project;
+    proj.points.forEach((p) => {
+      if (!p.id) p.id = newId();
+      if (!p.history) p.history = [];
+      if (p.take && !p.take.tid) p.take.tid = newId();
+      p.history.forEach((h) => { if (!h.tid) h.tid = newId(); return; });
+      return;
+    });
+    proj.output = proj.output || { width:2560, height:1440 };
+    proj.smoothing = proj.smoothing || { sigma:0.5, dead:10 };
+    status('loaded ' + proj.points.length + ' point(s) from ' + j.projectPath.split(/[\\/]/).pop(), 'ok');
+  } else {
+    proj = newProject();
+    status(j.project ? 'existing project is for a different video length — starting fresh (old file kept until you edit)' : 'new edit', j.project ? 'warn' : '');
+  }
+  $('outRes').value = proj.output.width + 'x' + proj.output.height;
+  $('vname').textContent = j.name + ' — ' + j.width + '×' + j.height + ', ' + (j.frames / j.fps / 60).toFixed(1) + ' min';
+  $('empty').style.display = 'none';
+  selPt = null; pendingIn = null; take = null; preview = null; undoStack = []; redoStack = [];
+  box = { cx:W() / 2, by:H(), w:0 }; box = nativeBox();
+  v.src = API + '/stream?t=' + Date.now();
+  document.title = j.name + ' · Edit · Veery Studio';
+  v.addEventListener('loadedmetadata', () => { layout(); seekFrame(0); return; }, { once:true });
+  changed(false);
+  return;
+};
+
+// ------------------------------------------------------------------ render dialog
+let renderPoll = null;
+const openRender = () => {
+  if (!proj || !proj.points.length) { status('mark some points first', 'warn'); return; }
+  const un = proj.points.filter((p) => { return !p.take; }).length;
+  const secs = proj.points.reduce((s, p) => { return s + (p.out - p.in + 1); }, 0) / fps();
+  $('rSummary').textContent = proj.points.length + ' point(s), ' + (secs / 60).toFixed(1) + ' min total, output ' +
+    OW() + '×' + OH() + (un ? ' — ' + un + ' not framed yet' : ' — all framed');
+  $('rMsg').textContent = ''; $('rProg').hidden = true;
+  $('renderDlg').hidden = false;
+  return;
+};
+const startRender = async (overwrite) => {
+  if (await saveNow() === false) { $('rMsg').textContent = DOWN + '.'; return; }
+  const body = { video:VIDEO, project:proj, out:$('rOut').value.trim(), overwrite:!!overwrite,
+                 perPoint:document.querySelector('input[name=rmode]:checked').value === 'per',
+                 unframed:$('rUnframed').value,
+                 codec:$('rQuality').value.split('/')[0], quality:$('rQuality').value.split('/')[1] };
+  const r = await fetch('/api/jobs/render', { method:'POST', body:JSON.stringify(body) });
+  const j = await r.json();
+  if (j.exists) {
+    if (confirm(j.exists + ' already exists in the takes folder. Replace it?')) startRender(true);
+    return;
+  }
+  if (!r.ok || j.error) { $('rMsg').textContent = j.error || ('error ' + r.status); return; }
+  watchRender(j.job);
+  return;
+};
+// Follow a render job (also one started earlier, found on load): it runs on the server,
+// so leaving or reloading this page doesn't stop it.
+const watchRender = (id) => {
+  $('rStart').disabled = true; $('rProg').hidden = false;
+  clearInterval(renderPoll);
+  const tick = async () => {
+    let p;
+    try { p = await (await fetch('/api/jobs/' + id)).json(); } catch (e) { return; }
+    $('rProg').value = p.percent ? p.percent / 100 : 0;
+    $('rMsg').textContent = p.stage || p.status;
+    if (p.status !== 'running' && p.status !== 'queued') {
+      clearInterval(renderPoll); renderPoll = null; $('rStart').disabled = false;
+      const ok = p.status === 'done';
+      $('rMsg').textContent = ok ? 'Done: ' + (p.result ? p.result.outputs.join(', ') : '') : (p.error || p.status);
+      status(ok ? 'render done' : 'render ' + p.status, ok ? 'ok' : 'bad');
+    } else status('rendering… ' + (p.percent != null ? Math.round(p.percent) + '%' : ''), '');
+    return;
+  };
+  tick();
+  renderPoll = setInterval(tick, 1000);
+  return;
+};
+
+// ------------------------------------------------------------------ input
+const videoXY = (e) => {
+  const r = ov.getBoundingClientRect();
+  return { x:(e.clientX - r.left) / r.width * W(), y:(e.clientY - r.top) / r.height * H() };
+};
+ov.addEventListener('mousemove', (e) => {
+  if (!info || mode !== 'frame') return;
+  const p = videoXY(e);
+  const nb = { cx:p.x, by:box.by, w:box.w };
+  if (e.shiftKey) nb.by = p.y + boxH(box.w) / 2;     // Shift: the box also moves vertically
+  box = clampBox(nb);
+  return;
+});
+// Zoom is measured against the output size: 1.00x = the box is exactly the output
+// resolution (1:1, the sharpest framing). Below 1 = wider (downscaled, still sharp),
+// above 1 = tighter than the panorama can feed (upscaled, soft).
+const nativeW = () => { return Math.min(OW(), maxW()); };   // 4K output: the panorama can't reach 1:1
+const nativeBox = () => { return clampBox({ cx:box.cx || W() / 2, by:box.by || H(), w:nativeW() }); };
+const zoomOf = () => { return OW() / box.w; };
+const setZoom = (z) => {
+  box = clampBox({ cx:box.cx, by:box.by, w:OW() / z });
+  return;
+};
+const resetZoom = () => { box = nativeBox(); status('zoom reset to 1:1 (box = output size)'); return; };
+const widestZoom = () => { box = clampBox({ cx:box.cx, by:H(), w:maxW() }); status('widest box (full height)'); return; };
+// ~4% per mouse-wheel notch (trackpads send many small steps); Alt = 4x finer.
+$('stage').addEventListener('wheel', (e) => {
+  if (!info || mode !== 'frame') return;
+  e.preventDefault();
+  const px = e.deltaY * (e.deltaMode === 1 ? 16 : (e.deltaMode === 2 ? 400 : 1));
+  let nw = box.w * Math.exp(px * (e.altKey ? 0.0001 : 0.0004));
+  // stop once at the widest box without bars, so letterboxing is never added by accident
+  if (box.w < maxW() - 0.5 && nw > maxW()) nw = maxW();
+  box = clampBox({ cx:box.cx, by:box.by, w:nw });
+  return;
+}, { passive:false });
+ov.addEventListener('dblclick', () => { if (mode === 'frame') resetZoom(); return; });
+const updateZoomInd = () => {
+  const zi = $('zoomInd'), on = !!info && mode === 'frame';
+  zi.style.display = on ? '' : 'none'; $('zoomReset').style.display = on ? '' : 'none';
+  if (!on) return;
+  const z = zoomOf(), soft = z > 1.005, native = Math.abs(z - 1) <= 0.005;
+  zi.textContent = 'Zoom ' + z.toFixed(2) + '× · box ' + Math.round(box.w) + '×' + Math.round(boxH(box.w)) +
+    (native ? ' · 1:1 (sharpest)' : (soft ? ' · soft (' + z.toFixed(2) + '× upscale)' :
+     (letterboxed(box.w) ? ' · letterboxed (black bars)' : ' · wider, sharp (widest without bars ' + (OW() / maxW()).toFixed(2) + '×)')));
+  zi.style.color = soft ? 'var(--warn)' : '';
+  return;
+};
+
+let tlDrag = false;
+const tlSeek = (e, click) => {
+  if (!info || take) return;
+  const r = tl.getBoundingClientRect();
+  const f = Math.round(clamp((e.clientX - r.left) / r.width, 0, 1) * (info.frames - 1));
+  if (click) { const p = pointAt(f); if (p && p !== selPt) select(p, false); }
+  preview = null; seekFrame(f); drawTimeline();
+  return;
+};
+tl.addEventListener('mousedown', (e) => { tlDrag = true; tlSeek(e, true); return; });
+window.addEventListener('mousemove', (e) => { if (tlDrag) tlSeek(e, false); return; });
+window.addEventListener('mouseup', () => { tlDrag = false; return; });
+
+const togglePlay = () => {
+  if (!info) return;
+  if (take) { abandonTake('stopped'); return; }
+  if (playing()) v.pause(); else { v.playbackRate = +$('speed').value; v.play(); }
+  return;
+};
+const step = (n) => {
+  if (!info || take) return;
+  v.pause(); preview = null; seekFrame(curFrame + n);
+  return;
+};
+const previewPoint = () => {
+  if (!selPt || take) return;
+  preview = { kind:'point', pt:selPt }; seekFrame(selPt.in); v.playbackRate = +$('speed').value; v.play();
+  status('previewing ' + selPt.name);
+  return;
+};
+const previewAll = () => {
+  if (!proj || !proj.points.length || take) return;
+  preview = { kind:'all' }; seekFrame(proj.points[0].in); v.playbackRate = +$('speed').value; v.play();
+  status('previewing all points');
+  return;
+};
+const nav = (d) => {
+  if (!proj || !proj.points.length || take) return;
+  let i = selPt ? proj.points.indexOf(selPt) + d : (d > 0 ? 0 : proj.points.length - 1);
+  i = clamp(i, 0, proj.points.length - 1);
+  select(proj.points[i], true);
+  return;
+};
+
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Shift') shiftDown = true;
+  const tag = (e.target && e.target.tagName) || '';
+  if (tag === 'INPUT' && e.target.type === 'text') { if (e.key === 'Escape' || e.key === 'Enter') e.target.blur(); return; }
+  if (!$('help').hidden) { if (e.key === 'Escape' || e.key === '?') $('help').hidden = true; return; }
+  if (!$('renderDlg').hidden) { if (e.key === 'Escape') $('renderDlg').hidden = true; return; }
+  const k = e.key, mod = e.metaKey || e.ctrlKey;
+  if (mod && (k === 'z' || k === 'Z')) { e.preventDefault(); if (take) return; if (e.shiftKey) redo(); else undo(); return; }
+  if (mod) return;
+  if (k === '?') { $('help').hidden = false; return; }
+  if (!info) return;
+  if (k === ' ') { e.preventDefault(); togglePlay(); return; }
+  if (k === 'Escape') {
+    if (take) abandonTake('Esc');
+    else if (pendingIn !== null) { pendingIn = null; drawTimeline(); status('pending In cleared'); }
+    return;
+  }
+  if (take && mode === 'frame') {                     // steering keys still work while recording
+    if (k === ')' || (k === '0' && e.shiftKey)) { widestZoom(); return; }
+    if (k === '0') { resetZoom(); return; }
+    if (k === '-' || k === '_') { setZoom(zoomOf() / 1.02); return; }
+    if (k === '=' || k === '+') { setZoom(zoomOf() * 1.02); return; }
+  }
+  if (take) return;                                   // nothing else while a take runs
+  if (k === 'ArrowLeft' || k === 'ArrowRight') {
+    e.preventDefault();
+    const n = e.altKey ? 10 * fps() : (e.shiftKey ? fps() : 1);
+    step(k === 'ArrowLeft' ? -n : n); return;
+  }
+  const lk = k.toLowerCase();
+  if (lk === 'j') { step(-5 * fps()); return; }
+  if (lk === 'l') { step(5 * fps()); return; }
+  if (k === '1') { setMode('cut'); return; }
+  if (k === '2') { setMode('frame'); return; }
+  if (lk === 'v') { setView(!outView); return; }
+  if (k === '[') { nav(-1); return; }
+  if (k === ']') { nav(1); return; }
+  if (lk === 'p') { previewPoint(); return; }
+  if (mode === 'cut') {
+    if (lk === 'i') { markIn(); return; }
+    if (lk === 'o') { markOut(); return; }
+    if (k === 'Backspace' || k === 'Delete') { e.preventDefault(); deletePoint(); return; }
+  } else {
+    if (lk === 'r' || k === 'Enter') { startTake(selPt); return; }
+  }
+  if (mode === 'frame') {
+    if (k === ')' || (k === '0' && e.shiftKey)) { widestZoom(); return; }
+    if (k === '0') { resetZoom(); return; }
+    if (k === '-' || k === '_') { setZoom(zoomOf() / 1.02); return; }
+    if (k === '=' || k === '+') { setZoom(zoomOf() * 1.02); return; }
+  }
+  return;
+});
+window.addEventListener('keyup', (e) => { if (e.key === 'Shift') shiftDown = false; return; });
+
+// ------------------------------------------------------------------ buttons
+$('tabCut').onclick = () => { setMode('cut'); return; };
+$('tabFrame').onclick = () => { setMode('frame'); return; };
+$('playBtn').onclick = () => { togglePlay(); return; };
+$('viewBtn').onclick = () => { setView(!outView); return; };
+$('prevPtBtn').onclick = () => { previewPoint(); return; };
+$('prevAllBtn').onclick = () => { previewAll(); return; };
+$('undoBtn').onclick = () => { undo(); return; };
+$('helpBtn').onclick = () => { $('help').hidden = false; return; };
+$('helpClose').onclick = () => { $('help').hidden = true; return; };
+$('setInBtn').onclick = () => { setEdge('in'); return; };
+$('setOutBtn').onclick = () => { setEdge('out'); return; };
+$('delBtn').onclick = () => { deletePoint(); return; };
+$('takeBtn').onclick = () => { startTake(selPt); return; };
+$('clearTakeBtn').onclick = () => {
+  if (!selPt || !selPt.take) return;
+  pushHistory(selPt, selPt.take); selPt.take = null; selPt.retake = false; changed();
+  status(selPt.name + ' take set aside — "Previous take" brings it back', 'warn');
+  return;
+};
+$('prevTakeBtn').onclick = () => {
+  const p = selPt, pt = p && prevTake(p);
+  if (!pt) return;
+  const cur = p.take;
+  p.history = p.history.filter((h) => { return h.tid !== pt.tid; });
+  pushHistory(p, cur);
+  p.take = pt; p.retake = false; changed();
+  status(p.name + ': restored the take from ' + fmtAt(pt.at) + (cur ? ' (the other one is kept)' : ''), 'ok');
+  return;
+};
+$('selLabel').oninput = () => {
+  if (!selPt) return;
+  selPt.label = $('selLabel').value.trim(); changed();
+  return;
+};
+const smoothChanged = () => {
+  const sg = +$('sigma').value, dd = +$('dead').value;
+  $('sigmaV').textContent = sg.toFixed(2) + ' s'; $('deadV').textContent = dd + ' px';
+  proj.smoothing = { sigma:sg, dead:dd };            // default for the next takes
+  if (selPt && selPt.take) { selPt.take.sigma = sg; selPt.take.dead = dd; resmooth(selPt); }
+  scheduleSave();
+  return;
+};
+$('sigma').oninput = smoothChanged; $('dead').oninput = smoothChanged;
+$('outRes').onchange = () => {
+  if (!proj) return;
+  const [w, h] = $('outRes').value.split('x').map(Number);
+  proj.output = { width:w, height:h };
+  box = clampBox(box);
+  proj.points.forEach((p) => { resmooth(p); return; });
+  scheduleSave(); status('output ' + w + '×' + h);
+  return;
+};
+$('speed').onchange = () => { v.playbackRate = +$('speed').value; return; };
+$('renderBtn').onclick = () => { openRender(); return; };
+$('zoomReset').onclick = () => { resetZoom(); return; };
+$('rClose').onclick = () => { $('renderDlg').hidden = true; return; };
+$('rStart').onclick = () => { startRender(false); return; };
+$('backLink').onclick = async (e) => {
+  e.preventDefault();
+  if (take) return;
+  clearTimeout(saveTimer); await saveNow();
+  location.href = '/';
+  return;
+};
+
+v.addEventListener('seeked', () => { if (!playing()) curFrame = Math.round(v.currentTime * fps() - 0.3); updateTC(); drawTimeline(); return; });
+v.addEventListener('pause', () => { updateTC(); drawTimeline(); return; });
+v.addEventListener('play', () => { updateTC(); return; });
+v.addEventListener('ended', () => { if (take && take.phase === 'rec') finishTake(); return; });
+window.addEventListener('resize', () => { layout(); return; });
+new ResizeObserver(() => { layout(); return; }).observe(v);
+window.addEventListener('beforeunload', () => { if (proj) navigator.sendBeacon(API + '/save', JSON.stringify(proj)); return; });
+
+v.requestVideoFrameCallback(onVideoFrame);
+requestAnimationFrame(loop);
+(async () => {
+  const r = await fetch(API + '/info');
+  const j = await r.json();
+  if (!r.ok) { $('empty').textContent = j.error || 'cannot open this video'; return; }
+  applyInfo(j); setMode('cut');
+  $('rOut').value = j.name.replace(/\.[^.]+$/, '') + '_edit.mp4';
+  // a render of this video still running (started before a reload): follow it
+  const jobs = (await (await fetch('/api/jobs')).json()).jobs;
+  const live = jobs.filter((x) => { return x.kind === 'render' && x.target === VIDEO && (x.status === 'running' || x.status === 'queued'); });
+  if (live.length) { openRender(); watchRender(live[live.length - 1].id); }
+  return;
+})();
+</script>
+</body>
+</html>

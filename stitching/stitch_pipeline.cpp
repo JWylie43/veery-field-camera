@@ -60,6 +60,9 @@
 // measured slower - see the note in main). The video ENCODER still uses the GPU
 // (hardware HEVC, chooseVideoEncoder). Uses core/imgproc/imgcodecs/videoio; OpenCV 4.x/5.x.
 //
+// --metadata-file F  stores the global tags of the ffmpeg FFMETADATA file F in the
+//   output video (Studio uses it to record each stitch's settings in the file).
+//
 // Encoding (changed 2026-09-19): HEVC/H.265 at every size, tagged hvc1, with the
 // bitrate defaulting to "auto" - sized from the output pixel rate at ~0.20 bpp rather
 // than a fixed number, so a crop or a --scale gets a sensible rate by itself.
@@ -138,6 +141,9 @@ static int runShell(string cmd);   // forward decl (defined near main); the enco
 static string g_vencExplicit;      // --venc NAME: force a specific encoder
 static bool   g_forceCpu = false;  // --cpu / --no-hwenc: force software libx264
 static string g_vbitrate  = "auto"; // --bitrate: explicit rate (e.g. "90M"), or "auto"
+// --metadata-file: an ffmpeg FFMETADATA file whose global tags (Studio writes the
+// stitch settings as JSON in "comment") are stored in the output video.
+static string g_metaFile;
 // "auto" sizes the bitrate from the OUTPUT pixel rate instead of a fixed number, so a
 // crop, a --scale or a different rig all get a sensible rate without being re-tuned.
 // Target bits-per-pixel: Joe's VMAF runs put good H.264 at ~0.26 bpp (25M on the old
@@ -1533,7 +1539,10 @@ static string buildEncodeCmd(const string &venc, int W, int H, double fps, const
     ostringstream c;
     c << "ffmpeg -y -hide_banner -loglevel error"
       << " -f rawvideo -pixel_format bgr24 -video_size " << W << "x" << H
-      << " -framerate " << fps << " -i - -an"
+      << " -framerate " << fps << " -i -";
+    if (!g_metaFile.empty())
+        c << " -f ffmetadata -i " << q(g_metaFile) << " -map 0:v -map_metadata 1";
+    c << " -an"
       // Panorama W/H aren't guaranteed even, but H.264 4:2:0 needs even dims - pad up
       // to the next even size (adds at most a 1px black edge; a no-op when already even).
       << " -vf \"pad=ceil(iw/2)*2:ceil(ih/2)*2\""
@@ -1849,7 +1858,7 @@ fval.onchange=()=>{ loadFrame(fval.value); };
 // frame slider, show the first frame, and enable stitching.
 function applyLoad(d){
   loaded=true; OW=d.ow; OH=d.oh; SEAM0=d.seam; TOTAL=d.total; VIDEO=d.video; seam=SEAM0;
-  // this take's measured shear (refine_extrinsics.py --align), if it has one
+  // this take's measured shear (studio/refine_extrinsics.py --align), if it has one
   if(d.align){ tv.value=d.align.shiftTop; bv.value=d.align.shiftBottom; }
   rot=0; { const r=document.getElementById('rot'); if(r) r.value=0; }   // reset rotation for a new source
   cropW=0;   // re-initialise the crop box to the new frame size on next draw
@@ -2055,7 +2064,7 @@ static string buildCliCommand(const string &source, const string &calibDir,
     return c;
 }
 
-// Per-take alignment, written by calibration/refine_extrinsics.py --align as
+// Per-take alignment, written by studio/refine_extrinsics.py --align as
 // take_TS.align.json next to the take: that take's camera rotation (measured on its
 // own footage, so a mount that settled between sessions is corrected) and its
 // measured shear. When present it replaces the base rotation for that take only and
@@ -2539,6 +2548,7 @@ int main(int argc, char **argv)
     g_forceCpu   = hasArg(argc, argv, "--cpu") || hasArg(argc, argv, "--no-hwenc");
     g_vencExplicit = argVal(argc, argv, "--venc", "");
     g_vbitrate   = argVal(argc, argv, "--bitrate", "auto");
+    g_metaFile   = argVal(argc, argv, "--metadata-file", "");
 
     // Ensure the output destination exists (batch, or a preset --out-file).
     if (!outFile.empty()) { fs::path p(outFile); if (p.has_parent_path()) fs::create_directories(p.parent_path()); }

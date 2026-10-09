@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Veery Studio</title>
+<link rel="stylesheet" href="/static/studio.css">
+<style>
+  main { padding:12px 16px 40px; max-width:1400px; }
+  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); margin:22px 0 8px;
+       display:flex; align-items:center; gap:12px; }
+  .bar { display:flex; gap:10px; align-items:center; margin-bottom:8px; flex-wrap:wrap; }
+  table { width:100%; border-collapse:collapse; background:var(--panel); border:1px solid var(--line); border-radius:8px; }
+  th { text-align:left; font-weight:500; color:var(--dim); padding:7px 10px; border-bottom:1px solid var(--line); }
+  td { padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:middle; }
+  tr.details > td { background:#171a1f; padding:10px 14px 14px; }
+  tr.sel > td { background:#1f2b3a; }
+  .name { font-weight:600; }
+  .actions { white-space:nowrap; text-align:right; }
+  .actions a.btn { display:inline-block; text-decoration:none; color:#fff; background:var(--accent);
+                   border:1px solid var(--accent); border-radius:5px; padding:4px 10px; margin-left:4px; }
+  .actions a.btn.edit { background:var(--ok); border-color:var(--ok); }
+  .jobcell { min-width:280px; }
+  .jobcell progress { width:150px; vertical-align:middle; margin-right:6px; }
+  .jobline { margin:2px 0; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(300px, 1fr)); gap:12px; }
+  .card { border:1px solid var(--line); border-radius:7px; padding:9px 11px; background:var(--panel); }
+  .card h4 { margin:0 0 6px; font-size:12px; color:var(--dim); font-weight:600; text-transform:uppercase; letter-spacing:.05em; }
+  .kv { display:grid; grid-template-columns:max-content 1fr; gap:2px 12px; }
+  .kv span:nth-child(odd) { color:var(--dim); }
+  details.job { margin:6px 0; } details.job summary { cursor:pointer; }
+  .empty { padding:18px; color:var(--dim); background:var(--panel); border:1px solid var(--line); border-radius:8px; }
+  code { font:12px ui-monospace, Menlo, monospace; word-break:break-all; }
+</style>
+</head>
+<body>
+<div id="top">
+  <b style="font-size:15px">Veery Studio</b>
+  <span id="folder" class="muted"></span>
+  <span class="grow"></span>
+  <span id="activeSummary" class="muted"></span>
+</div>
+<div id="toolBanner" class="banner bad" hidden></div>
+<div id="msgBanner" class="banner" hidden></div>
+<main>
+  <h2>Camera pairs <span id="pairCount" class="muted"></span></h2>
+  <div class="bar">
+    <label><input type="checkbox" id="selAll"> select all</label>
+    <button id="alignSel" class="primary" disabled>Align selected</button>
+    <span class="muted">Align measures the take's own camera alignment and shear (two run at a time; the rest wait their turn).</span>
+  </div>
+  <div id="pairsWrap"></div>
+  <div id="incomplete" class="muted" style="margin-top:6px"></div>
+
+  <h2>Stitched videos <span id="vidCount" class="muted"></span></h2>
+  <div id="videosWrap"></div>
+</main>
+<script>
+'use strict';
+const $ = (id) => { return document.getElementById(id); };
+const esc = (s) => { return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => { return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]; }); };
+const gb = (b) => { return b > 1e9 ? (b / 1e9).toFixed(2) + ' GB' : (b / 1e6).toFixed(0) + ' MB'; };
+const dur = (s) => { s = Math.round(s || 0); return Math.floor(s / 60) + ':' + ('0' + (s % 60)).slice(-2); };
+const num = (v, d) => { return v == null ? '–' : (+v).toFixed(d == null ? 2 : d); };
+const sgn = (v, d) => { return v == null ? '–' : (v >= 0 ? '+' : '') + (+v).toFixed(d == null ? 2 : d); };
+const when = (t) => { return new Date(t * 1000).toLocaleString(undefined, { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' }); };
+const takeTime = (take) => {
+  const m = /take_(\d{4})(\d\d)(\d\d)_(\d\d)(\d\d)(\d\d)/.exec(take);
+  if (!m) return '';
+  return new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]).toLocaleString(undefined,
+    { weekday:'short', month:'short', day:'numeric', year:'numeric', hour:'2-digit', minute:'2-digit', second:'2-digit' });
+};
+
+let lib = null, jobs = [];
+const selected = new Set(), openRows = new Set(), openLogs = new Set(), logText = new Map();
+const cells = new Map();          // row key -> { job, jobsBox, alignBtn }
+const LIVE = (j) => { return j.status === 'running' || j.status === 'queued'; };
+const jobsFor = (key) => {
+  const [kind, name] = [key.slice(0, key.indexOf(':')), key.slice(key.indexOf(':') + 1)];
+  return jobs.filter((j) => { return j.target === name && (kind === 'take' ? j.kind !== 'render' : j.kind === 'render'); });
+};
+
+// ------------------------------------------------------------------ the library tables
+const renderLibrary = () => {
+  $('folder').textContent = lib.folder;
+  const t = lib.tools, warn = [];
+  if (!t.stitcher_ok) warn.push('StitchPipeline is not built (' + t.stitcher + ') — stitching is off. Build it: see studio/README.md.');
+  else if (!t.stitcher_metadata) warn.push('StitchPipeline is an old build: rebuild it, or new stitches will not record their settings and will not open in the editor.');
+  if (!t.director_ok) warn.push('Director is not built (' + t.director + ') — rendering edits is off.');
+  $('toolBanner').hidden = !warn.length; $('toolBanner').innerHTML = warn.map(esc).join('<br>');
+
+  cells.clear();
+  $('pairCount').textContent = lib.takes.length ? '· ' + lib.takes.length : '';
+  if (!lib.takes.length) $('pairsWrap').innerHTML = '<div class="empty">No take_…_cam0 / _cam1 pairs in this folder.</div>';
+  else {
+    $('pairsWrap').innerHTML = '<table><thead><tr><th></th><th>Take</th><th>Length</th><th>Alignment</th><th>Status</th><th></th></tr></thead><tbody>' +
+      lib.takes.map((tk) => {
+        const key = 'take:' + tk.take, i0 = tk.cam0_info || {}, i1 = tk.cam1_info || {};
+        const al = tk.align;
+        const alTxt = al ? '<span class="ok">✓ own alignment</span><div class="muted">' + esc(al.date) + ' · shear ' + num(al.shift_top, 1) + ' / ' + num(al.shift_bottom, 1) + '</div>'
+                         : '<span class="warn">base calibration</span><div class="muted">not aligned yet</div>';
+        return '<tr data-key="' + esc(key) + '"' + (selected.has(tk.take) ? ' class="sel"' : '') + '>' +
+          '<td><input type="checkbox" class="pick" data-take="' + esc(tk.take) + '"' + (selected.has(tk.take) ? ' checked' : '') + '></td>' +
+          '<td><div class="name">' + esc(tk.take) + '</div><div class="muted">' + esc(takeTime(tk.take)) + '</div></td>' +
+          '<td>' + dur((i0.frames || 0) / (i0.fps || 30)) + '<div class="muted">' + (i0.frames || '?') + ' / ' + (i1.frames || '?') + ' frames · ' + gb(tk.size) + '</div></td>' +
+          '<td>' + alTxt + '</td>' +
+          '<td class="jobcell"></td>' +
+          '<td class="actions"><button class="alignBtn" data-take="' + esc(tk.take) + '">Align</button>' +
+          '<a class="btn" href="/stitch/' + encodeURIComponent(tk.take) + '">Stitch →</a> ' +
+          '<button class="toggle">' + (openRows.has(key) ? 'Details ▴' : 'Details ▾') + '</button></td></tr>' +
+          '<tr class="details" data-for="' + esc(key) + '"' + (openRows.has(key) ? '' : ' hidden') + '><td colspan="6">' + takeDetails(tk) + '</td></tr>';
+      }).join('') + '</tbody></table>';
+  }
+  $('incomplete').textContent = lib.incomplete.length ? 'Incomplete pairs (partner missing): ' +
+    lib.incomplete.map((x) => { return x.have.join(', '); }).join(' · ') : '';
+
+  $('vidCount').textContent = lib.videos.length ? '· ' + lib.videos.length : '';
+  if (!lib.videos.length) $('videosWrap').innerHTML = '<div class="empty">No stitched videos yet. Stitch a take — the result appears here with an Edit button. (Only videos stitched from Studio carry the record the editor needs.)</div>';
+  else {
+    $('videosWrap').innerHTML = '<table><thead><tr><th>Video</th><th>From</th><th>Size</th><th>Status</th><th></th></tr></thead><tbody>' +
+      lib.videos.map((v) => {
+        const key = 'video:' + v.name, s = v.stitch || {}, i = v.info || {};
+        return '<tr data-key="' + esc(key) + '">' +
+          '<td><div class="name">' + esc(v.name) + '</div><div class="muted">stitched ' + esc((s.stitched || '').replace('T', ' ')) + (v.project ? ' · has an edit' : '') + '</div></td>' +
+          '<td>' + esc(s.take || '?') + '<div class="muted">' + (s.calibration && s.calibration.take_alignment ? 'own alignment' : 'base calibration') + '</div></td>' +
+          '<td>' + (i.width || '?') + '×' + (i.height || '?') + ' · ' + dur(i.duration) + '<div class="muted">' + gb(v.size) + ' · ' + esc(i.codec || '') + '</div></td>' +
+          '<td class="jobcell"></td>' +
+          '<td class="actions"><a class="btn edit" href="/edit/' + encodeURIComponent(v.name) + '">Edit →</a> ' +
+          '<button class="toggle">' + (openRows.has(key) ? 'Details ▴' : 'Details ▾') + '</button></td></tr>' +
+          '<tr class="details" data-for="' + esc(key) + '"' + (openRows.has(key) ? '' : ' hidden') + '><td colspan="5">' + videoDetails(v) + '</td></tr>';
+      }).join('') + '</tbody></table>';
+  }
+
+  document.querySelectorAll('tr[data-key]').forEach((tr) => {
+    const key = tr.dataset.key;
+    const det = document.querySelector('tr.details[data-for="' + CSS.escape(key) + '"]');
+    cells.set(key, { job:tr.querySelector('.jobcell'), jobsBox:det.querySelector('.jobsBox'), alignBtn:tr.querySelector('.alignBtn') });
+    tr.querySelector('.toggle').onclick = (e) => {
+      if (openRows.has(key)) openRows.delete(key); else openRows.add(key);
+      det.hidden = !openRows.has(key);
+      cells.get(key).sig = null;
+      e.target.textContent = openRows.has(key) ? 'Details ▴' : 'Details ▾';
+      updateJobs();
+      return;
+    };
+    return;
+  });
+  document.querySelectorAll('input.pick').forEach((cb) => {
+    cb.onchange = () => {
+      if (cb.checked) selected.add(cb.dataset.take); else selected.delete(cb.dataset.take);
+      cb.closest('tr').classList.toggle('sel', cb.checked);
+      updateSel();
+      return;
+    };
+    return;
+  });
+  document.querySelectorAll('button.alignBtn').forEach((b) => { b.onclick = () => { align([b.dataset.take]); return; }; return; });
+  updateSel();
+  updateJobs();
+  return;
+};
+
+const takeDetails = (tk) => {
+  const al = tk.align, cards = [];
+  if (al) {
+    const c = al.corrections_from_base_deg || {}, b = al.before || {}, a = al.after || {};
+    cards.push('<div class="card"><h4>Alignment · ' + esc(al.file) + '</h4><div class="kv">' +
+      '<span>measured</span><span>' + esc(al.date) + (al.frames_measured ? ' · frames ' + al.frames_measured.join(', ') : '') + '</span>' +
+      '<span>correction from base</span><span>pitch ' + sgn(c.pitch, 3) + '° · roll ' + sgn(c.roll, 3) + '° · yaw ' + sgn(c.yaw, 3) + '°</span>' +
+      '<span>shear (default)</span><span>top ' + num(al.shift_top, 1) + ' · bottom ' + num(al.shift_bottom, 1) + ' px</span>' +
+      '<span>offset at seam</span><span>' + sgn(b.dy_seam) + ' → ' + sgn(a.dy_seam) + ' px</span>' +
+      '<span>tilt across overlap</span><span>' + sgn(b.tilt_far) + ' → ' + sgn(a.tilt_far) + ' px/1000</span>' +
+      '<span>far-field horizontal</span><span>' + sgn(b.far_dx) + ' → ' + sgn(a.far_dx) + ' px</span>' +
+      (al.pair_offset != null ? '<span>pair offset</span><span>' + al.pair_offset + ' frames</span>' : '<span>pair offset</span><span class="warn">not recorded (aligned by an older version — re-align)</span>') +
+      '</div></div>');
+  } else cards.push('<div class="card"><h4>Alignment</h4><span class="muted">None yet — stitches use the base calibration (calibration/stereo_extrinsics.json). Align measures this take\'s own.</span></div>');
+  const tm = tk.timing;
+  const tline = (n, r) => {
+    if (!r) return '<span>' + n + '</span><span class="muted">checking…</span>';
+    if (r.error) return '<span>' + n + '</span><span class="bad">' + esc(r.error) + '</span>';
+    return '<span>' + n + '</span><span>' + r.frames + ' frames · ' + (r.gaps ? '<span class="bad">' + r.gaps + ' timing gap(s), first at ' + r.first_gaps[0][0] + ' s (' + r.first_gaps[0][1] + ' ms)</span>' : '<span class="ok">no gaps</span>') + '</span>';
+  };
+  cards.push('<div class="card"><h4>Frame timing</h4><div class="kv">' + tline('cam0', tm && tm.cam0) + tline('cam1', tm && tm.cam1) +
+    '</div><div class="muted" style="margin-top:4px">A gap is missing time in one camera: everything after it is out of step with the other.</div></div>');
+  const vids = lib.videos.filter((v) => { return v.stitch && v.stitch.take === tk.take; });
+  cards.push('<div class="card"><h4>Stitched from this take</h4>' + (vids.length ? vids.map((v) => {
+    return '<div><a href="/edit/' + encodeURIComponent(v.name) + '">' + esc(v.name) + '</a> <span class="muted">' + esc((v.stitch.stitched || '').replace('T', ' ')) + '</span></div>';
+  }).join('') : '<span class="muted">nothing yet</span>') + '</div>');
+  return '<div class="grid">' + cards.join('') + '</div><div class="jobsBox"></div>';
+};
+
+const videoDetails = (v) => {
+  const s = v.stitch || {}, st = s.settings || {}, cal = s.calibration || {}, c = cal.corrections_from_base_deg;
+  return '<div class="grid"><div class="card"><h4>Stitch settings</h4><div class="kv">' +
+    '<span>take</span><span>' + esc(s.take) + '</span>' +
+    '<span>rotation</span><span>' + num(st.degrees, 1) + '°</span>' +
+    '<span>crop box</span><span>' + (st.crop ? st.crop[2] + '×' + st.crop[3] + ' at (' + st.crop[0] + ', ' + st.crop[1] + ')' : 'whole panorama') + (s.panorama ? ' <span class="muted">of ' + s.panorama.join('×') + '</span>' : '') + '</span>' +
+    '<span>shear</span><span>top ' + num(st.shift_top, 1) + ' · bottom ' + num(st.shift_bottom, 1) + ' px</span>' +
+    '<span>frames</span><span>' + (st.start || 0) + ' – ' + (st.end == null ? 'end' : st.end) + '</span>' +
+    '<span>pair offset</span><span>' + (s.pairing ? s.pairing.offset + ' (' + esc(s.pairing.method) + ')' : '–') + '</span>' +
+    '<span>alignment</span><span>' + (cal.take_alignment ? esc(cal.take_alignment) + (c ? ' · pitch ' + sgn(c.pitch, 3) + '° roll ' + sgn(c.roll, 3) + '° yaw ' + sgn(c.yaw, 3) + '°' : '') : 'base: ' + esc(cal.base)) + '</span>' +
+    '</div></div><div class="card"><h4>Command</h4><code>' + esc(s.command) + '</code></div></div><div class="jobsBox"></div>';
+};
+
+// ------------------------------------------------------------------ jobs (polled)
+const jobLine = (j) => {
+  const icon = { running:'⏳', queued:'…', done:'✓', failed:'✗', cancelled:'–' }[j.status] || '';
+  const cls = { done:'ok', failed:'bad', cancelled:'warn' }[j.status] || '';
+  let h = '<div class="jobline"><span class="' + cls + '">' + icon + ' ' + esc(j.kind) + '</span> ';
+  if (j.status === 'running') h += '<progress max="100" value="' + (j.percent || 0) + '"' + (j.percent == null ? ' class="indet"' : '') + '></progress>' + (j.percent != null ? Math.round(j.percent) + '% ' : '');
+  h += '<span class="muted">' + esc(j.status === 'queued' ? 'waiting for a free slot' : (j.stage || j.status)) + '</span>';
+  if (LIVE(j)) h += ' <button class="cancel" data-id="' + esc(j.id) + '">Cancel</button>';
+  return h + '</div>';
+};
+const updateJobs = () => {
+  cells.forEach((c, key) => {
+    const js = jobsFor(key);
+    const live = js.filter(LIVE);
+    const show = live.length ? live : js.slice(-1);
+    c.job.innerHTML = show.map(jobLine).join('');
+    if (c.alignBtn) c.alignBtn.disabled = live.length > 0;
+    const sig = js.map((j) => { return j.id + j.status + (j.error || ''); }).join('|');
+    if (openRows.has(key) && c.jobsBox && c.sig !== sig) {      // rebuilt only when the jobs change
+      c.sig = sig;
+      c.jobsBox.innerHTML = js.length ? '<h4 class="muted" style="margin:12px 0 4px;font-size:12px">JOBS THIS SESSION</h4>' + js.slice().reverse().map((j) => {
+        return '<details class="job" data-id="' + esc(j.id) + '"' + (openLogs.has(j.id) ? ' open' : '') + '><summary>' + esc(j.title) +
+          ' · <span class="muted">' + when(j.created) + '</span> · ' + esc(j.status) + (j.error ? ' · <span class="bad">' + esc(j.error) + '</span>' : '') +
+          '</summary><pre class="log">' + esc(logText.get(j.id) || 'loading…') + '</pre></details>';
+      }).join('') : '';
+      c.jobsBox.querySelectorAll('details.job').forEach((d) => {
+        d.ontoggle = () => {
+          if (d.open) { openLogs.add(d.dataset.id); fetchLog(d.dataset.id); } else openLogs.delete(d.dataset.id);
+          return;
+        };
+        return;
+      });
+    }
+    return;
+  });
+  document.querySelectorAll('button.cancel').forEach((b) => {
+    b.onclick = async () => {
+      if (!confirm('Cancel this job?')) return;
+      await fetch('/api/jobs/' + b.dataset.id + '/cancel', { method:'POST' });
+      poll();
+      return;
+    };
+    return;
+  });
+  const live = jobs.filter(LIVE);
+  $('activeSummary').textContent = live.length ? live.filter((j) => { return j.status === 'running'; }).length + ' running, ' +
+    live.filter((j) => { return j.status === 'queued'; }).length + ' waiting' : 'no jobs running';
+  return;
+};
+const fetchLog = async (id) => {
+  try {
+    const d = await (await fetch('/api/jobs/' + encodeURIComponent(id))).json();
+    logText.set(id, (d.log || []).join('\n'));
+    const pre = document.querySelector('details.job[data-id="' + CSS.escape(id) + '"] pre');
+    if (pre) {
+      const atEnd = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4;
+      pre.textContent = logText.get(id);
+      if (atEnd) pre.scrollTop = pre.scrollHeight;
+    }
+  } catch (e) { /* next poll */ }
+  return;
+};
+
+let lastStatus = new Map();
+const poll = async () => {
+  let d;
+  try { d = await (await fetch('/api/jobs')).json(); } catch (e) { $('activeSummary').textContent = 'Studio server not reachable'; return; }
+  jobs = d.jobs;
+  // a job that just finished can change the folder (new .align.json, new video): rescan
+  let finished = false;
+  jobs.forEach((j) => { if (lastStatus.get(j.id) && LIVE({ status:lastStatus.get(j.id) }) && !LIVE(j)) finished = true; lastStatus.set(j.id, j.status); return; });
+  if (finished) await loadLibrary(); else updateJobs();
+  // open logs of running jobs follow along
+  jobs.filter((j) => { return openLogs.has(j.id) && (j.status === 'running' || !logText.has(j.id) || finished); }).forEach((j) => { fetchLog(j.id); return; });
+  return;
+};
+let libText = '';
+const loadLibrary = async () => {
+  let txt;
+  try { txt = await (await fetch('/api/library')).text(); } catch (e) { return; }
+  if (txt === libText) { updateJobs(); return; }               // nothing changed: keep the page as it is
+  libText = txt; lib = JSON.parse(txt);
+  [...selected].forEach((t) => { if (!lib.takes.some((x) => { return x.take === t; })) selected.delete(t); return; });
+  renderLibrary();
+  return;
+};
+
+// ------------------------------------------------------------------ actions
+const updateSel = () => {
+  $('alignSel').disabled = selected.size === 0;
+  $('alignSel').textContent = selected.size ? 'Align selected (' + selected.size + ')' : 'Align selected';
+  $('selAll').checked = lib && lib.takes.length > 0 && selected.size === lib.takes.length;
+  return;
+};
+$('selAll').onchange = () => {
+  if ($('selAll').checked) lib.takes.forEach((t) => { selected.add(t.take); return; }); else selected.clear();
+  renderLibrary();
+  return;
+};
+const align = async (takes) => {
+  const r = await fetch('/api/jobs/align', { method:'POST', body:JSON.stringify({ takes }) });
+  const d = await r.json();
+  const msgs = (d.errors || []).slice();
+  if (d.error) msgs.push(d.error);
+  $('msgBanner').hidden = !msgs.length; $('msgBanner').textContent = msgs.join(' · ');
+  if (msgs.length) setTimeout(() => { $('msgBanner').hidden = true; return; }, 8000);
+  takes.forEach((t) => { selected.delete(t); return; });
+  await poll();
+  renderLibrary();
+  return;
+};
+$('alignSel').onclick = () => { align([...selected]); return; };
+
+(async () => {
+  await loadLibrary();
+  await poll();
+  setInterval(poll, 1000);
+  setInterval(() => { if (!document.hidden) loadLibrary(); return; }, 15000);   // frame-timing checks, new files
+  return;
+})();
+</script>
+</body>
+</html>

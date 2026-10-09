@@ -41,5 +41,6 @@ rock5t-camera/kernel-build/out/
 .claude/
 .DS_Store
 
-# refine_extrinsics.py --apply backups
+# studio/refine_extrinsics.py --apply backups (of calibration/stereo_extrinsics.json)
 calibration/*.bak-*
+studio/studio.log*

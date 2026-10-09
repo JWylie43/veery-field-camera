@@ -28,6 +28,7 @@ run it.
 - [Status](#status)
 - [Prerequisites](#prerequisites)
 - [Quick reference](#quick-reference)
+- [Studio: align, stitch and edit in the browser](#studio-align-stitch-and-edit-in-the-browser)
 - [1. Record](#1-record-on-the-rock)
 - [2. Offload](#2-offload-on-the-rock)
 - [3. Calibrate](#3-calibrate)
@@ -60,6 +61,11 @@ veery-field-camera/
 │   ├── director.cpp/.html    edit: cut the game into points, steer a 16:9 virtual camera, render
 │   ├── pair_check.py         verify a take's two files before stitching
 │   └── CMakeLists.txt, include/json.hpp
+├── studio/               Runs ON YOUR MAC — Veery Studio, the takes folder in a browser
+│   ├── server.py             local web app: takes list, batch align, stitch page, editor, jobs
+│   ├── refine_extrinsics.py  per-take camera alignment (--align / --check / --apply)
+│   ├── rig.py                take files, calibration and the stitcher's geometry in Python
+│   └── studio.command        double-click to start (own venv: setup.sh, requirements.txt)
 ├── 3d-housing-model/     Printable enclosure (Rock Housing top/bottom, .3mf + .stl)
 ├── setup.sh              Rock dependency + pipeline health check
 └── ROCK5T_CAMERA.md      Hardware bring-up log
@@ -183,6 +189,30 @@ cd stitching && ./stitch.command
 | **No audio** | by design - neither the recorder nor the stitcher handles audio |
 
 **Golden rule:** *copy → verify → only then delete.*
+
+---
+
+## Studio: align, stitch and edit in the browser
+
+Once the takes are on the Mac, **Veery Studio** does steps 3–7 for a folder of
+takes in one local web app (`studio/README.md` has the details):
+
+```bash
+studio/studio.command                 # or double-click it; first run sets up studio/.venv
+```
+
+- **Takes list** (`http://127.0.0.1:8100/`): every `take_…_cam0/_cam1` pair in
+  `~/Desktop/veery-takes` (`--takes DIR` for another folder). Tick several and
+  **Align selected** - each runs `refine_extrinsics.py --align` as a job with live
+  status; the row's details show the result and the log.
+- **Stitch →** opens `/stitch/<take>`: the tuner's controls on any frame of the
+  pair, with its alignment file (or the base calibration) and shear filled in.
+  **Stitch** runs `StitchPipeline` as a job (one at a time) and writes the
+  settings into the video's metadata.
+- **Stitched videos** (those with that metadata) get **Edit →**: the Director at
+  `/edit/<video>`; Render runs `Director --render` as a job.
+
+The C++ tools still run on their own exactly as below; Studio just calls them.
 
 ---
 
@@ -364,13 +394,15 @@ corrections and the original matrix are under `scene_refinement` in the JSON.
 **Per-take alignment (run on every new take).** The mount can settle by a
 fraction of a degree between sessions (2026-10-08: −11 px vertical at the seam
 after a week in the same housing), which shear can't fix. So each take gets its
-own alignment, measured on its own footage - on the Mac, from the repo root:
+own alignment, measured on its own footage. Easiest: tick the takes in
+[Studio](#studio-align-stitch-and-edit-in-the-browser) and **Align selected**. By hand, on the Mac, from the repo root:
 
 ```bash
-.venv/bin/python calibration/refine_extrinsics.py --align ~/Desktop/veery-takes/take_TS_cam0.mkv
+studio/.venv/bin/python studio/refine_extrinsics.py --align ~/Desktop/veery-takes/take_TS_cam0.mkv
 ```
 
-(~10 s; either file of the pair works.) It solves that take's tilt / roll / yaw
+(~10 s; either file of the pair works; the files are paired by their capture
+timestamps, the same way the stitcher pairs them.) It solves that take's tilt / roll / yaw
 correction from parallax-free measurements only and measures its shear, and
 writes both to `take_TS.align.json` next to the take. From then on the stitcher
 and tuner use that file automatically for that take: its rotation replaces the

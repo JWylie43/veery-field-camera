@@ -16,10 +16,11 @@ stands goes into the calibration (that stays with --shift-top/--shift-bottom):
   * yaw: the horizontal offset on the far field (top of the ground) - parallax
     shrinks to ~0 there. --keep-yaw leaves yaw alone.
 
-Usage (on the Mac, from the repo root, with the calibration venv):
-    .venv/bin/python calibration/refine_extrinsics.py --align  ~/Desktop/veery-takes/take_TS_cam0.mkv
-    .venv/bin/python calibration/refine_extrinsics.py --check  ~/Desktop/veery-takes/take_TS_cam0.mkv
-    .venv/bin/python calibration/refine_extrinsics.py --apply  ~/Desktop/veery-takes/take_TS_cam0.mkv
+Usage (on the Mac, from the repo root, with the Studio venv - or from Studio's
+takes list, which runs --align for you):
+    studio/.venv/bin/python studio/refine_extrinsics.py --align  ~/Desktop/veery-takes/take_TS_cam0.mkv
+    studio/.venv/bin/python studio/refine_extrinsics.py --check  ~/Desktop/veery-takes/take_TS_cam0.mkv
+    studio/.venv/bin/python studio/refine_extrinsics.py --apply  ~/Desktop/veery-takes/take_TS_cam0.mkv
 
 --align   (the normal one) solve this take's correction and write it, with the
           measured shear, to take_TS.align.json next to the take. The stitcher and
@@ -30,6 +31,8 @@ Usage (on the Mac, from the repo root, with the calibration venv):
 --apply   solve and write the correction into the BASE calibration instead (with
           a backup) - for when the rig has settled for good
 Either file of the pair works (the partner _cam0/_cam1 is found next to it).
+The two files are paired the way the stitcher pairs them (--pair-offset auto: exact
+from the capture timestamps on shared-clock takes), so both measure the same frames.
 Needs ffmpeg/ffprobe on PATH and a daytime take with textured ground in the overlap.
 
 How it measures: a few frame pairs spread through the take are decoded (with the
@@ -37,133 +40,15 @@ files' own colour tags), warped onto the stitcher's cylinder with the current
 calibration (the same maths as the stitcher), and small textured patches of the
 overlap are matched between the two cameras (phase correlation on high-passed
 images). The solve is a few Newton steps on three small rotations of the right
-camera about axes at the seam.
+camera about axes at the seam. The geometry lives in rig.py (shared with Studio's
+stitch preview).
 """
-import argparse, json, math, os, shutil, subprocess, sys, time
+import argparse, json, math, os, shutil, sys, time
 import numpy as np
 import cv2
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-
-
-# ---------------------------------------------------------------- inputs
-def pair_paths(path):
-    for tag in ('_cam0.', '_cam1.'):
-        i = path.rfind(tag)
-        if i >= 0:
-            pre, post = path[:i], path[i + 6:]
-            return pre + '_cam0.' + post, pre + '_cam1.' + post
-    sys.exit('ERROR: %s is not a _cam0/_cam1 take file' % path)
-
-
-def align_path(f0):
-    """take_TS_cam0.mkv -> take_TS.align.json (next to it)."""
-    i = f0.rfind('_cam0.')
-    return f0[:i] + '.align.json'
-
-
-def probe(path):
-    out = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries',
-                          'stream=width,height,r_frame_rate,nb_frames,color_range,color_space',
-                          '-of', 'json', path], capture_output=True, text=True).stdout
-    s = json.loads(out)['streams'][0]
-    num, den = s.get('r_frame_rate', '30/1').split('/')
-    frames = int(s['nb_frames']) if 'nb_frames' in s else 0
-    if frames <= 0:
-        c = subprocess.run(['ffprobe', '-v', 'error', '-count_packets', '-select_streams', 'v:0',
-                            '-show_entries', 'stream=nb_read_packets', '-of', 'csv=p=0', path],
-                           capture_output=True, text=True).stdout
-        frames = int(c.strip() or 0)
-    return dict(w=s['width'], h=s['height'], fps=float(num) / float(den), frames=frames,
-                range='pc' if s.get('color_range') == 'pc' else 'tv',
-                matrix='bt601' if s.get('color_space') in ('smpte170m', 'bt470bg') else 'bt709')
-
-
-def decode(path, info, n):
-    """Frame n (exact) as BGR, converted with the file's own range + matrix."""
-    t = max(0.0, (n - 0.5) / info['fps'])
-    vf = ('scale=in_range=%s:in_color_matrix=%s:flags=accurate_rnd+full_chroma_int+full_chroma_inp,'
-          'format=bgr24' % (info['range'], info['matrix']))
-    raw = subprocess.run(['ffmpeg', '-v', 'error', '-ss', '%.6f' % t, '-i', path, '-frames:v', '1',
-                          '-vf', vf, '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-'], capture_output=True).stdout
-    if len(raw) != info['w'] * info['h'] * 3:
-        sys.exit('ERROR: could not decode frame %d of %s' % (n, path))
-    return np.frombuffer(raw, np.uint8).reshape(info['h'], info['w'], 3)
-
-
-def load_calib(d):
-    def intr(name):
-        j = json.load(open(os.path.join(d, name + '_intrinsics.json')))
-        if j.get('model') != 'fisheye':
-            sys.exit('ERROR: %s is not a fisheye calibration' % name)
-        return np.array(j['camera_matrix'], float), np.array(j['distortion_coefficients'], float).ravel()
-    K0, D0 = intr('cam0')
-    K1, D1 = intr('cam1')
-    ext = json.load(open(os.path.join(d, 'stereo_extrinsics.json')))
-    return K0, D0, K1, D1, np.array(ext['rotation_matrix'], float), ext
-
-
-# ---------------------------------------------------------------- the stitcher's geometry
-class Rig:
-    """Cylinder canvas exactly as stitch_pipeline.cpp builds it (left camera = canvas
-    frame; with a negative yaw the stitcher swaps to cam1-left and uses R^T)."""
-
-    def __init__(self, K0, D0, K1, D1, R, w, h):
-        self.swap = math.atan2(R[2, 0], R[2, 2]) < 0
-        if self.swap:
-            K0, D0, K1, D1, R = K1, D1, K0, D0, R.T
-        self.KL, self.DL, self.KR, self.DR, self.R0 = K0, D0, K1, D1, R      # R0: left->right
-        self.w, self.h = w, h
-        self.fcyl = K0[0, 0]
-        yaw = math.atan2(R[2, 0], R[2, 2])
-        pad = math.radians(3)
-        self.tmin = min(-w / (2 * K0[0, 0]), yaw - w / (2 * K1[0, 0])) - pad
-        tmax = max(w / (2 * K0[0, 0]), yaw + w / (2 * K1[0, 0])) + pad
-        self.OW = min(int((tmax - self.tmin) * self.fcyl), 12000)
-        self.OH = min(int(2 * math.tan(h / (2 * K0[1, 1])) * self.fcyl), 4000)
-        # overlap band + seam (median overlap column), found on a coarse grid
-        xs = np.arange(0, self.OW, 4)
-        ys = np.arange(0, self.OH, 8)
-        okL = self._map(self.KL, self.DL, np.eye(3), xs, ys)[2]
-        okR = self._map(self.KR, self.DR, self.R0, xs, ys)[2]
-        cols = xs[(okL & okR).any(0)]
-        if len(cols) == 0:
-            sys.exit('ERROR: the cameras do not overlap with this calibration')
-        self.seam = int(cols[len(cols) // 2])
-        self.X0 = max(0, int(cols[0]) - 8)
-        self.X1 = min(self.OW, int(cols[-1]) + 8)
-        ts = self.tmin + self.seam / self.fcyl
-        self.ax_pitch = np.array([math.cos(ts), 0.0, -math.sin(ts)])   # horizontal, across the seam view
-        self.ax_roll = np.array([math.sin(ts), 0.0, math.cos(ts)])     # the seam view direction
-        self.ax_yaw = np.array([0.0, 1.0, 0.0])                        # canvas vertical
-        xb, yb = np.arange(self.X0, self.X1), np.arange(self.OH)
-        self.lx, self.ly, self.okL = self._map(self.KL, self.DL, np.eye(3), xb, yb)
-
-    def _map(self, K, D, Rm, xs, ys):
-        TH, HV = np.meshgrid(self.tmin + xs / self.fcyl, (ys - self.OH / 2) / self.fcyl)
-        d = np.stack([np.sin(TH), HV, np.cos(TH)], -1) @ Rm.T
-        z = d[..., 2]
-        ok = z > 1e-6
-        z = np.where(ok, z, 1)
-        xn, yn = d[..., 0] / z, d[..., 1] / z
-        r = np.sqrt(xn ** 2 + yn ** 2)
-        t = np.arctan(r)
-        t2 = t * t
-        s = np.where(r > 1e-12, t * (1 + D[0] * t2 + D[1] * t2 ** 2 + D[2] * t2 ** 3 + D[3] * t2 ** 4)
-                     / np.maximum(r, 1e-12), 1)
-        u = K[0, 0] * xn * s + K[0, 2]
-        v = K[1, 1] * yn * s + K[1, 2]
-        ok &= (u >= 0) & (u < self.w) & (v >= 0) & (v < self.h)
-        return np.where(ok, u, -1).astype(np.float32), np.where(ok, v, -1).astype(np.float32), ok
-
-    def corrected(self, p, r, y):
-        """Left->right rotation after the small corrections (radians)."""
-        rot = lambda ax, a: cv2.Rodrigues((ax * a).reshape(3, 1))[0]
-        return self.R0 @ rot(self.ax_pitch, p) @ rot(self.ax_roll, r) @ rot(self.ax_yaw, y)
-
-    def file_rotation(self, R_lr):
-        """Back to stereo_extrinsics.json terms (cam0 -> cam1)."""
-        return R_lr.T if self.swap else R_lr
+from rig import (CALIB_DIR, Rig, align_path, decode, load_calib, pair_offset, pair_paths, probe,
+                 skips, take_name)
 
 
 class MeasureError(Exception):
@@ -252,36 +137,57 @@ def main():
                    help="solve this take's correction + shear and write take_TS.align.json (base untouched)")
     g.add_argument('--apply', action='store_true', help='solve, back up and update the base stereo_extrinsics.json')
     ap.add_argument('take', help='either file of the pair (take_..._cam0.mkv or _cam1.mkv)')
-    ap.add_argument('--calib-dir', default=HERE, help='folder with the calibration JSONs (default: this folder)')
+    ap.add_argument('--calib-dir', default=CALIB_DIR,
+                    help='folder with the calibration JSONs (default: the repo\'s calibration/)')
     ap.add_argument('--frames', type=int, default=4, help='frame pairs to measure, spread through the take')
-    ap.add_argument('--pair-offset', type=int, default=0,
-                    help='cam1 frame = cam0 frame + N (static ground makes this forgiving; default 0)')
+    ap.add_argument('--pair-offset', default='auto',
+                    help='frame offset between the files, as the stitcher\'s --pair-offset: >0 skips '
+                         'cam1 frames, <0 cam0 frames. auto (default): from the capture timestamps')
     ap.add_argument('--keep-yaw', action='store_true', help='only correct tilt and roll')
     ap.add_argument('--base', action='store_true', help="--check: ignore the take's .align.json")
     a = ap.parse_args()
 
-    f0, f1 = pair_paths(os.path.expanduser(a.take))
+    pp = pair_paths(os.path.expanduser(a.take))
+    if not pp:
+        sys.exit('ERROR: %s is not a _cam0/_cam1 take file' % a.take)
+    f0, f1 = pp
     for f in (f0, f1):
         if not os.path.exists(f):
             sys.exit('ERROR: missing %s' % f)
     i0, i1 = probe(f0), probe(f1)
     if (i0['w'], i0['h']) != (i1['w'], i1['h']):
         sys.exit('ERROR: the two files differ in size')
-    K0, D0, K1, D1, R, ext = load_calib(a.calib_dir)
+    try:
+        K0, D0, K1, D1, R, ext = load_calib(a.calib_dir)
+    except (OSError, ValueError) as e:
+        sys.exit('ERROR: calibration: %s' % e)
+    if a.pair_offset == 'auto':
+        po = pair_offset(f0, f1, i0, i1)
+        offset = po['offset']
+        print('Pair offset: %d frames (%s)' % (offset, po['detail']))
+    else:
+        offset = int(a.pair_offset)
+        print('Pair offset: %d frames (given)' % offset)
+    skip0, skip1 = skips(offset)
     ap_path = align_path(f0)
     calib_label = os.path.join(a.calib_dir, 'stereo_extrinsics.json')
     if a.check and not a.base and os.path.exists(ap_path):       # check what the stitcher will use
         R = np.array(json.load(open(ap_path))['rotation_matrix'], float)
         calib_label = ap_path + ' (this take)'
-    rig = Rig(K0, D0, K1, D1, R, i0['w'], i0['h'])
-    nfr = min(i0['frames'], i1['frames'] - a.pair_offset)
+    try:
+        rig = Rig(K0, D0, K1, D1, R, i0['w'], i0['h'])
+    except ValueError as e:
+        sys.exit('ERROR: ' + str(e))
+    nfr = min(i0['frames'] - skip0, i1['frames'] - skip1)
     picks = [int(nfr * (k + 1) / (a.frames + 1)) for k in range(a.frames)]
     print('Take: %s (+ partner), %d frames; measuring frames %s' % (os.path.basename(f0), nfr, picks))
     print('Calibration: %s' % calib_label)
     t0 = time.time()
     pairs = []
     for n in picks:
-        a0, a1 = decode(f0, i0, n), decode(f1, i1, n + a.pair_offset)
+        a0, a1 = decode(f0, i0, n + skip0), decode(f1, i1, n + skip1)
+        if a0 is None or a1 is None:
+            sys.exit('ERROR: could not decode frame %d of the pair' % n)
         L, Rs = (a1, a0) if rig.swap else (a0, a1)
         Lh = highpass(cv2.remap(L, rig.lx, rig.ly, cv2.INTER_LINEAR))
         pairs.append((Lh, Rs))
@@ -351,11 +257,12 @@ def main():
             'version': 1,
             'what': 'Per-take camera alignment. The stitcher and tuner use rotation_matrix in place of the '
                     'base calibration for this take, and shift_top/shift_bottom as the default shear. '
-                    'Made by calibration/refine_extrinsics.py --align from parallax-free measurements; '
+                    'Made by studio/refine_extrinsics.py --align from parallax-free measurements; '
                     'the shear is the measured parallax at the seam for this rig position.',
-            'take': os.path.basename(f0)[:-len('_cam0.mkv')],
+            'take': take_name(f0),
             'date': time.strftime('%Y-%m-%d %H:%M'),
             'frames_measured': picks,
+            'pair_offset': offset,
             'rotation_matrix': R_new.tolist(),
             'shift_top': round(after['shift_top'], 1),
             'shift_bottom': round(after['shift_bottom'], 1),
