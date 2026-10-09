@@ -40,3 +40,6 @@ rock5t-camera/kernel-build/out/
 .idea/
 .claude/
 .DS_Store
+
+# refine_extrinsics.py --apply backups
+calibration/*.bak-*

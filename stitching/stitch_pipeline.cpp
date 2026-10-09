@@ -1849,6 +1849,8 @@ fval.onchange=()=>{ loadFrame(fval.value); };
 // frame slider, show the first frame, and enable stitching.
 function applyLoad(d){
   loaded=true; OW=d.ow; OH=d.oh; SEAM0=d.seam; TOTAL=d.total; VIDEO=d.video; seam=SEAM0;
+  // this take's measured shear (refine_extrinsics.py --align), if it has one
+  if(d.align){ tv.value=d.align.shiftTop; bv.value=d.align.shiftBottom; }
   rot=0; { const r=document.getElementById('rot'); if(r) r.value=0; }   // reset rotation for a new source
   cropW=0;   // re-initialise the crop box to the new frame size on next draw
   cv.width=OW; cv.height=OH;
@@ -2053,6 +2055,46 @@ static string buildCliCommand(const string &source, const string &calibDir,
     return c;
 }
 
+// Per-take alignment, written by calibration/refine_extrinsics.py --align as
+// take_TS.align.json next to the take: that take's camera rotation (measured on its
+// own footage, so a mount that settled between sessions is corrected) and its
+// measured shear. When present it replaces the base rotation for that take only and
+// supplies the default --shift-top/--shift-bottom; takes without one use the base
+// calibration. --no-align ignores it.
+static bool g_noAlign = false;
+struct TakeAlign
+{
+    bool ok = false;
+    string path;
+    Mat R;                       // cam0 -> cam1, same convention as stereo_extrinsics.json
+    double shiftTop = 0, shiftBottom = 0;
+};
+static TakeAlign loadTakeAlign(const string &source)
+{
+    TakeAlign t;
+    string c0, c1;
+    if (g_noAlign || !pairNames(source, c0, c1)) return t;
+    size_t i = c0.rfind("_cam0.");
+    if (i == string::npos) return t;             // stills (cam0_NNN.png) have none
+    string p = c0.substr(0, i) + ".align.json";
+    ifstream f(p);
+    if (!f) return t;
+    try
+    {
+        json j; f >> j;
+        Mat R(3, 3, CV_64F);
+        for (int r = 0; r < 3; r++)
+            for (int c = 0; c < 3; c++) R.at<double>(r, c) = j.at("rotation_matrix")[r][c].get<double>();
+        t.R = R;
+        t.shiftTop = j.value("shift_top", 0.0);
+        t.shiftBottom = j.value("shift_bottom", 0.0);
+        t.path = p;
+        t.ok = true;
+    }
+    catch (...) { cerr << "warning: could not read " << p << " - using the base calibration\n"; }
+    return t;
+}
+
 static void runTuneServer(const Mat &KL, const vector<double> &DL,
                           const Mat &KR, const vector<double> &DR, const Mat &R,
                           double degrees, int startFrame, int endFrame,
@@ -2072,6 +2114,7 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
     int totalFrames = 1;
     StitchMaps m;
     string curLeft, curRight;            // first-frame preview (data: URIs)
+    TakeAlign align;                     // the loaded take's .align.json, if any
     PairCapture frameCap;                // persistent for /frame scrubbing
     int frameCapPos = -1;
 
@@ -2090,11 +2133,18 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
             cap.read(fL, fR); cap.release();
         }
         if (fL.empty() || fR.empty()) return "cannot read source";
-        StitchMaps mm = buildStitchMaps(KL, DL, KR, DR, R, fL.cols, fL.rows, -1);
+        TakeAlign ta = loadTakeAlign(path);
+        Mat Ruse = R;                                   // R here is already in left->right terms
+        if (ta.ok)
+        {
+            Ruse = g_swapLR ? Mat(ta.R.t()) : ta.R;
+            cout << "alignment: " << ta.path << " (shear " << ta.shiftTop << " / " << ta.shiftBottom << ")\n";
+        }
+        StitchMaps mm = buildStitchMaps(KL, DL, KR, DR, Ruse, fL.cols, fL.rows, -1);
         Mat mL, mR; warpPreview(fL, fR, mm, mL, mR);
         vector<uchar> bL, bR; vector<int> q = {IMWRITE_JPEG_QUALITY, 85};
         imencode(".jpg", mL, bL, q); imencode(".jpg", mR, bR, q);
-        m = mm; video = isVid; totalFrames = tf; source = path; loaded = true;
+        m = mm; video = isVid; totalFrames = tf; source = path; loaded = true; align = ta;
         curLeft = "data:image/jpeg;base64," + base64(bL);
         curRight = "data:image/jpeg;base64," + base64(bR);
         frameCap.release(); frameCapPos = -1;
@@ -2104,10 +2154,15 @@ static void runTuneServer(const Mat &KL, const vector<double> &DL,
     auto stateJson = [&]() -> string {
         if (!loaded) return "{\"loaded\":false}";
         ostringstream j;
+        string alignJson = align.ok
+            ? ("{\"file\":\"" + jsonEscape(align.path) + "\",\"shiftTop\":" + to_string(align.shiftTop) +
+               ",\"shiftBottom\":" + to_string(align.shiftBottom) + "}")
+            : string("null");
         j << "{\"loaded\":true,\"ow\":" << m.OW << ",\"oh\":" << m.OH << ",\"seam\":" << m.seam
           << ",\"ox0\":" << m.ox0 << ",\"ox1\":" << m.ox1
           << ",\"total\":" << totalFrames << ",\"video\":" << (video ? "true" : "false")
           << ",\"source\":\"" << jsonEscape(source) << "\",\"output\":\"" << jsonEscape(outFile) << "\""
+          << ",\"align\":" << alignJson
           << ",\"left\":\"" << curLeft << "\",\"right\":\"" << curRight << "\"}";
         return j.str();
     };
@@ -2503,6 +2558,22 @@ int main(int argc, char **argv)
     loadIntrinsics(calibDir + "/cam1_intrinsics.json", KR, DR);
     cout << "calibration model: fisheye (equidistant)\n";
     R = loadRotation(calibDir + "/stereo_extrinsics.json");
+    g_noAlign = hasArg(argc, argv, "--no-align");
+    if (!source.empty() && !tune)
+    {
+        TakeAlign ta = loadTakeAlign(source);
+        if (ta.ok)
+        {
+            R = ta.R;
+            cout << "alignment: " << ta.path << " (this take's rotation)\n";
+            if (!hasArg(argc, argv, "--shift-top") && !hasArg(argc, argv, "--shift-bottom")
+                && !hasArg(argc, argv, "--shift-x"))
+            {
+                a.shiftTop = ta.shiftTop; a.shiftBottom = ta.shiftBottom;
+                cout << "shear from the take's alignment: " << a.shiftTop << " / " << a.shiftBottom << "\n";
+            }
+        }
+    }
     // cam1 left of cam0 (negative yaw) -> run with cam1 as the left image. R maps
     // cam0-frame directions into cam1's frame; the reverse mapping is its transpose.
     if (atan2(R.at<double>(2, 0), R.at<double>(2, 2)) < 0)

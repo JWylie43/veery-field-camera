@@ -361,22 +361,33 @@ Re-tune the shear whenever the rig moves; the calibration stays. The
 corrections and the original matrix are under `scene_refinement` in the JSON.
 `translation_mm` is still the board value; the stitcher ignores it.
 
-**Re-checking alignment on new footage.** The mount can settle by a fraction
-of a degree between sessions (2026-10-08: −11 px vertical at the seam after a
-week in the same housing), which shear can't fix. Check each new session's first
-take - ~5 s, nothing is written:
+**Per-take alignment (run on every new take).** The mount can settle by a
+fraction of a degree between sessions (2026-10-08: −11 px vertical at the seam
+after a week in the same housing), which shear can't fix. So each take gets its
+own alignment, measured on its own footage - on the Mac, from the repo root:
 
 ```bash
-.venv/bin/python calibration/refine_extrinsics.py --check ~/Desktop/veery-takes/take_TS_cam0.mkv
+.venv/bin/python calibration/refine_extrinsics.py --align ~/Desktop/veery-takes/take_TS_cam0.mkv
 ```
 
-It prints the vertical offset at the seam, the vertical tilt across the overlap,
-the far-field horizontal offset, the shear for that rig position, and a verdict.
-If it says `needs --apply`, run the same with `--apply`: it solves the tilt /
-roll / yaw correction from parallax-free measurements only (as above), backs up
-`stereo_extrinsics.json` (`.bak-<time>`), writes the new rotation with an entry
-in `refinement_history`, and re-measures (~10 s). `--keep-yaw` corrects tilt and
-roll only. Needs a daytime take with textured ground in the overlap.
+(~10 s; either file of the pair works.) It solves that take's tilt / roll / yaw
+correction from parallax-free measurements only and measures its shear, and
+writes both to `take_TS.align.json` next to the take. From then on the stitcher
+and tuner use that file automatically for that take: its rotation replaces the
+base rotation, and its shear fills in Shift far / Shift near (CLI: used unless
+you pass `--shift-top`/`--shift-bottom`/`--shift-x`; `--no-align` ignores the
+file). Takes without a file use the base calibration (`stereo_extrinsics.json`,
+the calibration-day refinement above), which `--align` never changes.
+
+- `--check` measures and reports only (using the take's file if it has one;
+  `--base` to measure against the base) - shows the offsets and the shear.
+- `--apply` writes a correction into the BASE calibration instead (with a
+  `.bak-<time>` backup) - only for when the rig has settled for good.
+
+Needs a daytime take with textured ground in the overlap. The rotation is
+parallax-free; the shear is the measured parallax for that rig position (the
+straight-line best fit for the ground - nearer people/objects are left to the
+smart seam).
 
 > **`calibrate.py` refuses to write `stereo_extrinsics.json` above 3 px RMS.**
 > That guard exists because the failure is silent: a bad extrinsic still

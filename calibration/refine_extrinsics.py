@@ -16,12 +16,19 @@ stands goes into the calibration (that stays with --shift-top/--shift-bottom):
   * yaw: the horizontal offset on the far field (top of the ground) - parallax
     shrinks to ~0 there. --keep-yaw leaves yaw alone.
 
-Usage (from the repo root, with the calibration venv):
+Usage (on the Mac, from the repo root, with the calibration venv):
+    .venv/bin/python calibration/refine_extrinsics.py --align  ~/Desktop/veery-takes/take_TS_cam0.mkv
     .venv/bin/python calibration/refine_extrinsics.py --check  ~/Desktop/veery-takes/take_TS_cam0.mkv
     .venv/bin/python calibration/refine_extrinsics.py --apply  ~/Desktop/veery-takes/take_TS_cam0.mkv
 
---check   measure and report only (nothing is written)
---apply   solve the correction, back up and update stereo_extrinsics.json, re-measure
+--align   (the normal one) solve this take's correction and write it, with the
+          measured shear, to take_TS.align.json next to the take. The stitcher and
+          tuner use that file automatically for this take; other takes keep using
+          the base calibration (stereo_extrinsics.json), which is not touched.
+--check   measure and report only (nothing is written); uses the take's
+          .align.json if there is one (--base: measure against the base instead)
+--apply   solve and write the correction into the BASE calibration instead (with
+          a backup) - for when the rig has settled for good
 Either file of the pair works (the partner _cam0/_cam1 is found next to it).
 Needs ffmpeg/ffprobe on PATH and a daytime take with textured ground in the overlap.
 
@@ -47,6 +54,12 @@ def pair_paths(path):
             pre, post = path[:i], path[i + 6:]
             return pre + '_cam0.' + post, pre + '_cam1.' + post
     sys.exit('ERROR: %s is not a _cam0/_cam1 take file' % path)
+
+
+def align_path(f0):
+    """take_TS_cam0.mkv -> take_TS.align.json (next to it)."""
+    i = f0.rfind('_cam0.')
+    return f0[:i] + '.align.json'
 
 
 def probe(path):
@@ -235,13 +248,16 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument('--check', action='store_true', help='measure and report only')
-    g.add_argument('--apply', action='store_true', help='solve, back up and update stereo_extrinsics.json')
+    g.add_argument('--align', action='store_true',
+                   help="solve this take's correction + shear and write take_TS.align.json (base untouched)")
+    g.add_argument('--apply', action='store_true', help='solve, back up and update the base stereo_extrinsics.json')
     ap.add_argument('take', help='either file of the pair (take_..._cam0.mkv or _cam1.mkv)')
     ap.add_argument('--calib-dir', default=HERE, help='folder with the calibration JSONs (default: this folder)')
     ap.add_argument('--frames', type=int, default=4, help='frame pairs to measure, spread through the take')
     ap.add_argument('--pair-offset', type=int, default=0,
                     help='cam1 frame = cam0 frame + N (static ground makes this forgiving; default 0)')
     ap.add_argument('--keep-yaw', action='store_true', help='only correct tilt and roll')
+    ap.add_argument('--base', action='store_true', help="--check: ignore the take's .align.json")
     a = ap.parse_args()
 
     f0, f1 = pair_paths(os.path.expanduser(a.take))
@@ -252,11 +268,16 @@ def main():
     if (i0['w'], i0['h']) != (i1['w'], i1['h']):
         sys.exit('ERROR: the two files differ in size')
     K0, D0, K1, D1, R, ext = load_calib(a.calib_dir)
+    ap_path = align_path(f0)
+    calib_label = os.path.join(a.calib_dir, 'stereo_extrinsics.json')
+    if a.check and not a.base and os.path.exists(ap_path):       # check what the stitcher will use
+        R = np.array(json.load(open(ap_path))['rotation_matrix'], float)
+        calib_label = ap_path + ' (this take)'
     rig = Rig(K0, D0, K1, D1, R, i0['w'], i0['h'])
     nfr = min(i0['frames'], i1['frames'] - a.pair_offset)
     picks = [int(nfr * (k + 1) / (a.frames + 1)) for k in range(a.frames)]
     print('Take: %s (+ partner), %d frames; measuring frames %s' % (os.path.basename(f0), nfr, picks))
-    print('Calibration: %s' % os.path.join(a.calib_dir, 'stereo_extrinsics.json'))
+    print('Calibration: %s' % calib_label)
     t0 = time.time()
     pairs = []
     for n in picks:
@@ -269,7 +290,7 @@ def main():
     except MeasureError as e:
         sys.exit('ERROR: ' + str(e))
     report(before, 'Current calibration:')
-    verdict = 'needs --apply' if needs_fix(before) else 'aligned (nothing to do)'
+    verdict = 'needs --align' if needs_fix(before) else 'aligned'
     print('  -> %s' % verdict)
     if a.check:
         return
@@ -298,7 +319,7 @@ def main():
     x = np.zeros(3)
     m = before
     best = (cost(targets(m)), x.copy(), m)
-    J = jacobian(x, m)
+    J = jacobian(x, m) if not done(targets(m)) else None
     for it in range(10):
         tv = targets(m)
         print('  iter %d: pitch %+.3f roll %+.3f yaw %+.3f deg -> seam %+.2f px, tilt %+.2f, far-dx %+.2f'
@@ -323,6 +344,37 @@ def main():
         print('  note: stopped short of full convergence; the best result is used')
     after = m
     R_new = rig.file_rotation(rig.corrected(*x))
+    corr = {'pitch': round(math.degrees(x[0]), 4), 'roll': round(math.degrees(x[1]), 4),
+            'yaw': round(math.degrees(x[2]), 4)}
+    if a.align:
+        out = {
+            'version': 1,
+            'what': 'Per-take camera alignment. The stitcher and tuner use rotation_matrix in place of the '
+                    'base calibration for this take, and shift_top/shift_bottom as the default shear. '
+                    'Made by calibration/refine_extrinsics.py --align from parallax-free measurements; '
+                    'the shear is the measured parallax at the seam for this rig position.',
+            'take': os.path.basename(f0)[:-len('_cam0.mkv')],
+            'date': time.strftime('%Y-%m-%d %H:%M'),
+            'frames_measured': picks,
+            'rotation_matrix': R_new.tolist(),
+            'shift_top': round(after['shift_top'], 1),
+            'shift_bottom': round(after['shift_bottom'], 1),
+            'corrections_from_base_deg': corr,
+            'base_calibration': calib_label,
+            'base_rotation_matrix': ext['rotation_matrix'],
+            'before': {k: round(before[k], 3) for k in ('dy_seam', 'tilt_far', 'far_dx')},
+            'after': {k: round(after[k], 3) for k in ('dy_seam', 'tilt_far', 'far_dx')},
+        }
+        with open(ap_path + '.tmp', 'w') as f:
+            json.dump(out, f, indent=2)
+        os.replace(ap_path + '.tmp', ap_path)
+        print('Corrections from the base: pitch %+.3f, roll %+.3f, yaw %+.3f deg (%.0f s)'
+              % (*np.degrees(x), time.time() - t0))
+        report(after, 'With this take\'s alignment:')
+        print('Wrote %s' % ap_path)
+        print('The stitcher and tuner now use it for this take: shear %.1f / %.1f is filled in automatically.'
+              % (out['shift_top'], out['shift_bottom']))
+        return
 
     # ---- write (with a backup and a history entry)
     path = os.path.join(a.calib_dir, 'stereo_extrinsics.json')
@@ -334,8 +386,7 @@ def main():
         'date': time.strftime('%Y-%m-%d %H:%M'),
         'take': os.path.basename(f0),
         'frames': picks,
-        'corrections_deg': {'pitch': round(math.degrees(x[0]), 4), 'roll': round(math.degrees(x[1]), 4),
-                            'yaw': round(math.degrees(x[2]), 4)},
+        'corrections_deg': corr,
         'before': {k: round(before[k], 3) for k in ('dy_seam', 'tilt_far', 'far_dx')},
         'after': {k: round(after[k], 3) for k in ('dy_seam', 'tilt_far', 'far_dx')},
         'previous_rotation_matrix': ext['rotation_matrix'],
