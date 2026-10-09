@@ -125,7 +125,9 @@ in_image systemctl enable recorder.service rig-firstboot.service >/dev/null 2>&1
 log "Network settings (camera-network.txt on the config partition)"
 install -m 755 "$HERE/system/camera-network" "$R/usr/local/sbin/camera-network"
 install -m 644 "$HERE/system/camera-network.service" "$R/etc/systemd/system/camera-network.service"
-in_image systemctl enable camera-network.service >/dev/null 2>&1
+install -m 755 "$HERE/system/wifi-fallback" "$R/usr/local/sbin/wifi-fallback"
+install -m 644 "$HERE/system/wifi-fallback.service" "$R/etc/systemd/system/wifi-fallback.service"
+in_image systemctl enable camera-network.service wifi-fallback.service >/dev/null 2>&1
 cp "$HERE/system/camera-network.txt" "$R/config/camera-network.txt"   # the blank template
 
 if [ -n "${RIG_HOSTNAME:-}" ]; then

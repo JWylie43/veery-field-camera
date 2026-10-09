@@ -172,22 +172,25 @@ HOTSPOT_PASSWORD="..."         # default changeme123 - change it; blank = an OPE
 
 The first boot reads it **once** and sets up NetworkManager:
 
-- **Wi-Fi** — only when both `WIFI_NAME` and `WIFI_PASSWORD` are filled in. Priority
-  100: the Rock joins it whenever it is in range. If it can't connect (out of range,
-  wrong password), it moves on to the hotspot.
+- **Wi-Fi** — only when both `WIFI_NAME` and `WIFI_PASSWORD` are filled in (priority
+  100).
 - **Hotspot** — whenever `HOTSPOT_NAME` is set (default `VeeryCam`, password
-  `changeme123` — the same on every image, so change it): a 2.4 GHz
-  network the Rock creates itself, priority −10, so it starts only when no
-  higher-priority network connects. Join it from a phone or laptop and open
-  `http://10.43.0.1:8080`. With `HOTSPOT_PASSWORD` blank it is **open**: anyone nearby
-  can join and use the recorder panel. Blank `HOTSPOT_NAME` = no hotspot.
-- With no Wi-Fi set there is no home network to prefer: the hotspot runs at every boot
-  (or use Ethernet). Networks added later with `sudo nmtui` get priority 0 — above the
-  hotspot, below the Wi-Fi — unless you set otherwise
-  (`sudo nmcli connection modify "<name>" connection.autoconnect-priority <n>`).
+  `changeme123` — the same on every image, so change it): a 2.4 GHz network the Rock
+  creates itself. Join it from a phone or laptop and open `http://10.43.0.1:8080`. With
+  `HOTSPOT_PASSWORD` blank it is **open**: anyone nearby can join and use the recorder
+  panel. Blank `HOTSPOT_NAME` = no hotspot.
 
-The Rock never joins other networks on its own, open or not. While the hotspot is
-running it rejoins the Wi-Fi at the next boot (or `sudo nmcli connection up "<name>"`).
+At **every boot** the Rock scans once: if a known Wi-Fi network is in range it connects
+to it, and if that fails (wrong password) it starts the hotspot; if none is in range it
+starts the hotspot **right away** — no fixed waits, each step ends when it has its answer.
+With no Wi-Fi set up it starts the hotspot straight away (or use Ethernet). Networks added later
+with `sudo nmtui` count as known Wi-Fi too (priority 0 unless you set otherwise:
+`sudo nmcli connection modify "<name>" connection.autoconnect-priority <n>`). The Rock
+never joins other networks on its own, open or not. Once the hotspot is up the radio is
+busy being an access point, so the Rock looks for the Wi-Fi again at the next boot (or:
+`sudo nmcli connection up "<name>"`). What happened at boot:
+`journalctl -b -u camera-network -u wifi-fallback`.
+
 After applying, the file becomes `camera-network.applied.txt` with the passwords
 blanked (they're kept on the Rock, not on the card); to apply new settings later, put a
 filled-in `camera-network.txt` back on the `config` partition (on the Rock:

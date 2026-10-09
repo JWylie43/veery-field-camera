@@ -1,0 +1,13 @@
+[Unit]
+# At every boot: join a known Wi-Fi if one is in range, otherwise start the rig's hotspot
+# (see /usr/local/sbin/wifi-fallback). After camera-network, which may create both.
+Description=Camera rig: known Wi-Fi first, otherwise the hotspot
+After=NetworkManager.service camera-network.service
+Wants=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wifi-fallback
+
+[Install]
+WantedBy=multi-user.target

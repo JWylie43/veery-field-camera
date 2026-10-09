@@ -1,0 +1,51 @@
+#!/bin/bash
+# wifi-fallback - at boot (wifi-fallback.service): known Wi-Fi if it's here, otherwise the
+# rig's hotspot. No fixed waits - each step ends when NetworkManager reports its result:
+#   1. scan (returns when the scan is done)
+#   2. a known network is in the results -> connect to it (returns on success, or on
+#      failure, e.g. a wrong password) -> on failure, the hotspot
+#   3. no known network in the results   -> the hotspot
+# Known networks are the autoconnect Wi-Fi connections, tried highest priority first.
+# The hotspot is the access-point connection that isn't set to autoconnect (camera-network
+# makes it so): left to autoconnect it would come up before the first scan has seen the home
+# network, and an access point can't scan - so it would stay up even at home.
+set -u
+for _ in $(seq 1 60); do nmcli -t general status >/dev/null 2>&1 && break; sleep 1; done
+DEV="$(nmcli -t -f DEVICE,TYPE device | awk -F: '$2=="wifi"{print $1; exit}')"
+[ -n "$DEV" ] || exit 0
+
+HOT=""; KNOWN=()                                        # KNOWN: "priority<TAB>name<TAB>ssid"
+while IFS=: read -r name type; do
+  [ "$type" = "802-11-wireless" ] || continue
+  get() { nmcli -g "$1" connection show "$name" 2>/dev/null; }
+  mode="$(get 802-11-wireless.mode)"; auto="$(get connection.autoconnect)"
+  prio="$(get connection.autoconnect-priority)"; ssid="$(get 802-11-wireless.ssid)"
+  if [ "$mode" = "ap" ]; then
+    [ "$auto" = "no" ] && [ -z "$HOT" ] && HOT="$name"
+  elif [ "$auto" = "yes" ]; then
+    KNOWN+=("$prio"$'\t'"$name"$'\t'"$ssid")
+  fi
+done < <(nmcli -t -f NAME,TYPE connection show)
+[ -n "$HOT" ] || exit 0                                 # no rig hotspot set up
+
+hotspot() { echo "wifi-fallback: $1 - starting hotspot \"$HOT\""; nmcli connection up "$HOT" ifname "$DEV" >/dev/null; exit; }
+current() { nmcli -g GENERAL.CONNECTION device show "$DEV" 2>/dev/null; }
+connected() { [ "$(nmcli -g GENERAL.STATE device show "$DEV" 2>/dev/null | cut -d' ' -f1)" = "100" ]; }
+
+[ "${#KNOWN[@]}" -gt 0 ] || hotspot "no Wi-Fi to join is set up"
+connected && { echo "wifi-fallback: already on \"$(current)\""; exit 0; }
+
+# 1. scan - returns when the radio has finished scanning
+visible="$(nmcli -t -f SSID device wifi list ifname "$DEV" --rescan yes 2>/dev/null)"
+
+# 2. the known networks that are here, best first: connect (returns on success or failure)
+while IFS=$'\t' read -r _ name ssid; do
+  grep -Fxq -- "$ssid" <<<"$visible" || continue
+  if nmcli --wait 45 connection up "$name" ifname "$DEV" >/dev/null 2>&1; then
+    echo "wifi-fallback: joined \"$name\""; exit 0
+  fi
+  echo "wifi-fallback: \"$name\" is in range but did not connect (wrong password?)"
+done < <(printf '%s\n' "${KNOWN[@]}" | sort -t$'\t' -k1,1nr)
+
+# 3. nothing joined
+hotspot "no known Wi-Fi joined"

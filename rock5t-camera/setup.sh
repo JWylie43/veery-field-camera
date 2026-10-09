@@ -174,16 +174,20 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
   # ---------------------------------------------------------------- 5b. network settings
   # /config/camera-network.txt (Wi-Fi + hotspot), applied at boot by camera-network.service
   step "5b. Network settings (camera-network.txt)"
-  if same "$HERE/system/camera-network" /usr/local/sbin/camera-network \
-     && same "$HERE/system/camera-network.service" /etc/systemd/system/camera-network.service; then
-    ok "installed"
-  else
-    sudo install -m 755 "$HERE/system/camera-network" /usr/local/sbin/camera-network
-    sudo install -m 644 "$HERE/system/camera-network.service" /etc/systemd/system/camera-network.service
+  changed=0
+  for f in camera-network wifi-fallback; do
+    if ! same "$HERE/system/$f" "/usr/local/sbin/$f"; then
+      sudo install -m 755 "$HERE/system/$f" "/usr/local/sbin/$f"; changed=1; fi
+    if ! same "$HERE/system/$f.service" "/etc/systemd/system/$f.service"; then
+      sudo install -m 644 "$HERE/system/$f.service" "/etc/systemd/system/$f.service"; changed=1; fi
+  done
+  if [ "$changed" -eq 1 ]; then
     sudo systemctl daemon-reload
-    did "installed camera-network (applies /config/camera-network.txt at boot)"
+    did "installed camera-network + wifi-fallback (known Wi-Fi first, else the hotspot)"
+  else
+    ok "installed"
   fi
-  sudo systemctl enable camera-network >/dev/null 2>&1
+  sudo systemctl enable camera-network wifi-fallback >/dev/null 2>&1
   # The template is NOT dropped in here: its default hotspot (open unless a password is
   # set) would appear next to a Rock's existing networks. To use it on this Rock: copy
   # rock5t-camera/system/camera-network.txt to /config/, fill it in, reboot.

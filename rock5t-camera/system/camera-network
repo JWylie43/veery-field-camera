@@ -5,12 +5,12 @@
 #   WIFI_NAME + WIFI_PASSWORD  -> a Wi-Fi connection, autoconnect priority 100: joined
 #                                 whenever it is in range (only when both are filled in)
 #   HOTSPOT_NAME               -> an access point (2.4 GHz, the Rock at 10.43.0.1),
-#                                 priority -10: started when no higher-priority network
-#                                 connects; HOTSPOT_PASSWORD blank = open hotspot
+#                                 priority -10, NOT autoconnect: wifi-fallback starts it
+#                                 at boot only if no known Wi-Fi joins (a self-starting
+#                                 hotspot wins the race against the first Wi-Fi scan);
+#                                 HOTSPOT_PASSWORD blank = open hotspot
 # The connection is named after the network (SSID). Re-applying replaces those two
-# connections; other connections are left alone. Once the hotspot is up the radio is busy
-# being an access point, so the Rock rejoins the Wi-Fi at the next boot (or:
-# sudo nmcli connection up "<name>").
+# connections; other connections are left alone.
 set -u
 CONF=/config/camera-network.txt
 DONE=/config/camera-network.applied.txt
@@ -40,12 +40,11 @@ if [ -n "$HOTSPOT_NAME" ]; then
   sec=(); [ -n "$HOTSPOT_PASSWORD" ] && sec=(wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$HOTSPOT_PASSWORD")
   nmcli connection add type wifi con-name "$HOTSPOT_NAME" ifname "$DEV" ssid "$HOTSPOT_NAME" \
     802-11-wireless.mode ap 802-11-wireless.band bg ipv4.method shared ipv4.addresses 10.43.0.1/24 \
-    "${sec[@]}" connection.autoconnect yes connection.autoconnect-priority -10 >/dev/null \
+    "${sec[@]}" connection.autoconnect no connection.autoconnect-priority -10 >/dev/null \
     && echo "camera-network: hotspot \"$HOTSPOT_NAME\" ($([ -n "$HOTSPOT_PASSWORD" ] && echo password || echo OPEN), priority -10)" \
     || { echo "camera-network: could not add hotspot \"$HOTSPOT_NAME\""; ok=0; }
 fi
 # read once: keep the settings (minus passwords - those now live in NetworkManager,
 # root-only) as camera-network.applied.txt
 sed -E 's/^([[:space:]]*(WIFI|HOTSPOT)_PASSWORD[[:space:]]*=).*/\1""/' "$CONF" > "$DONE" && rm -f "$CONF"
-nmcli device connect "$DEV" >/dev/null 2>&1 || true             # pick by priority now
 [ "$ok" -eq 1 ]
