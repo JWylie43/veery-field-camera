@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Veery Studio - one local web app for the takes folder: align, stitch, edit.
+Studio - one local web app for the takes folder: align, stitch, edit.
 
-    studio/.venv/bin/python studio/server.py [--takes ~/Desktop/veery-takes] [--port 8100]
+    .venv/bin/python studio/server.py [--takes ~/Desktop/takes] [--port 8100]
     (or double-click studio/studio.command)
 
 Pages:
@@ -12,8 +12,8 @@ Pages:
   /edit/<video>     the virtual-camera editor (Director) for a stitched video
 Heavy work runs as jobs - each one process, the same command you would type:
   align  -> studio/refine_extrinsics.py --align   (two at a time, the rest queue)
-  stitch -> stitching/build/StitchPipeline        (one at a time)
-  render -> stitching/build/Director --render     (one at a time)
+  stitch -> studio/native/build/StitchPipeline        (one at a time)
+  render -> studio/native/build/Director --render     (one at a time)
 The pages poll /api/jobs for progress; jobs keep running when a page is closed.
 """
 import argparse, atexit, faulthandler, json, os, re, shlex, shutil, signal, sys, tempfile, threading, time
@@ -29,14 +29,15 @@ from preview import Previews
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, 'static')
-BIN_DIR = os.path.join(rig.REPO, 'stitching', 'build')
+BIN_DIR = os.path.join(HERE, 'native', 'build')
 VERSION = 1
-LOG_PATH = os.path.join(HERE, 'studio.log')
+LOG_DIR = os.path.join(HERE, 'logs')
+LOG_PATH = os.path.join(LOG_DIR, 'studio.log')
 _logf = None
 
 
 def log(msg):
-    """One line in studio/studio.log (and the terminal): starts, stops and why, jobs, errors."""
+    """One line in studio/logs/studio.log (and the terminal): starts, stops and why, jobs, errors."""
     line = '%s  %s' % (time.strftime('%Y-%m-%d %H:%M:%S'), msg)
     try:
         print(line, flush=True)
@@ -52,6 +53,8 @@ def log(msg):
 
 def open_log():
     global _logf
+    os.makedirs(LOG_DIR, exist_ok=True)
+    # at most two files: past 2 MB the log becomes studio.log.1 (replacing the older one)
     if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > (2 << 20):
         os.replace(LOG_PATH, LOG_PATH + '.1')
     _logf = open(LOG_PATH, 'a', buffering=1)
@@ -69,7 +72,7 @@ class Studio:
         self.jobs = JobManager({'align': 2, 'stitch': 1, 'render': 1}, reject_when_busy=('stitch', 'render'))
         self.jobs.on_finish = lambda j: log('job %s %s%s' % (j.id, j.status, ': ' + j.error if j.error else ''))
         self.previews = Previews()
-        self.runtime = tempfile.mkdtemp(prefix='veery-studio-')
+        self.runtime = tempfile.mkdtemp(prefix='studio-')
         self.save_lock = threading.Lock()
         self.last_backup = {}
 
@@ -159,7 +162,7 @@ class Studio:
             cmd += ['--end', str(end)]
         cmd += ['--out-file', out]
         record = {
-            'veery': 'stitch', 'version': VERSION, 'take': take,
+            'kind': 'stitch', 'version': VERSION, 'take': take,
             'sources': [os.path.basename(pair[0]), os.path.basename(pair[1])],
             'stitched': datetime.now().isoformat(timespec='seconds'),
             'calibration': {
@@ -463,12 +466,12 @@ def _notfound(msg):
 
 
 def main():
-    ap = argparse.ArgumentParser(description='Veery Studio - align, stitch and edit takes in the browser')
-    ap.add_argument('--takes', default=os.environ.get('VEERY_TAKES', '~/Desktop/veery-takes'),
-                    help='the takes folder (default ~/Desktop/veery-takes, or $VEERY_TAKES)')
+    ap = argparse.ArgumentParser(description='Studio - align, stitch and edit takes in the browser')
+    ap.add_argument('--takes', default=os.environ.get('STUDIO_TAKES', '~/Desktop/takes'),
+                    help='the takes folder (default ~/Desktop/takes, or $STUDIO_TAKES)')
     ap.add_argument('--port', type=int, default=8100)
-    ap.add_argument('--stitcher', default=os.environ.get('VEERY_STITCHER', os.path.join(BIN_DIR, 'StitchPipeline')))
-    ap.add_argument('--director', default=os.environ.get('VEERY_DIRECTOR', os.path.join(BIN_DIR, 'Director')))
+    ap.add_argument('--stitcher', default=os.environ.get('STUDIO_STITCHER', os.path.join(BIN_DIR, 'StitchPipeline')))
+    ap.add_argument('--director', default=os.environ.get('STUDIO_DIRECTOR', os.path.join(BIN_DIR, 'Director')))
     ap.add_argument('--no-browser', action='store_true', help='do not open the browser')
     a = ap.parse_args()
     sys.stdout.reconfigure(line_buffering=True)
@@ -493,8 +496,8 @@ def main():
     srv.daemon_threads = True
     url = 'http://127.0.0.1:%d/' % srv.server_address[1]
     t = studio.tools()
-    log('Veery Studio started at %s (pid %d)' % (url, os.getpid()))
-    print('Veery Studio at %s  (Ctrl+C to stop; log: %s)' % (url, LOG_PATH))
+    log('Studio started at %s (pid %d)' % (url, os.getpid()))
+    print('Studio at %s  (Ctrl+C to stop; log: %s)' % (url, LOG_PATH))
     print('  takes:    %s' % takes)
     print('  stitcher: %s%s' % (a.stitcher, '' if t['stitcher_ok'] else '  [missing - build it]'))
     if t['stitcher_ok'] and not t['stitcher_metadata']:

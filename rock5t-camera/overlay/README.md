@@ -5,6 +5,8 @@ roles: CAM0 connector = source (master), CAM1 connector = sink (slave). Chains
 are copied verbatim from Radxa's shipped `rock-5t-cam{0,1}-radxa-camera-8m-219`
 overlays (same 2-lane Sony-sensor path), sensor nodes swapped to `imx477@1a`.
 
+`rock5t-camera/setup.sh` builds and installs this for you. By hand:
+
 ## Build (on the Rock, needs kernel headers for the dt-bindings includes)
 
 ```bash

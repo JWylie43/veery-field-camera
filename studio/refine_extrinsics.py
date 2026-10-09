@@ -16,15 +16,15 @@ stands goes into the calibration (that stays with --shift-top/--shift-bottom):
   * yaw: the horizontal offset on the far field (top of the ground) - parallax
     shrinks to ~0 there. --keep-yaw leaves yaw alone.
 
-Usage (on the Mac, from the repo root, with the Studio venv - or from Studio's
+Usage (on the Mac, from the repo root, with the repo venv - or from Studio's
 takes list, which runs --align for you):
-    studio/.venv/bin/python studio/refine_extrinsics.py --align  ~/Desktop/veery-takes/take_TS_cam0.mkv
-    studio/.venv/bin/python studio/refine_extrinsics.py --check  ~/Desktop/veery-takes/take_TS_cam0.mkv
-    studio/.venv/bin/python studio/refine_extrinsics.py --apply  ~/Desktop/veery-takes/take_TS_cam0.mkv
+    .venv/bin/python studio/refine_extrinsics.py --align  ~/Desktop/takes/take_TS_cam0.mkv
+    .venv/bin/python studio/refine_extrinsics.py --check  ~/Desktop/takes/take_TS_cam0.mkv
+    .venv/bin/python studio/refine_extrinsics.py --apply  ~/Desktop/takes/take_TS_cam0.mkv
 
 --align   (the normal one) solve this take's correction and write it, with the
           measured shear, to take_TS.align.json next to the take. The stitcher and
-          tuner use that file automatically for this take; other takes keep using
+          Studio use that file automatically for this take; other takes keep using
           the base calibration (stereo_extrinsics.json), which is not touched.
 --check   measure and report only (nothing is written); uses the take's
           .align.json if there is one (--base: measure against the base instead)
@@ -255,7 +255,7 @@ def main():
     if a.align:
         out = {
             'version': 1,
-            'what': 'Per-take camera alignment. The stitcher and tuner use rotation_matrix in place of the '
+            'what': 'Per-take camera alignment. The stitcher and Studio use rotation_matrix in place of the '
                     'base calibration for this take, and shift_top/shift_bottom as the default shear. '
                     'Made by studio/refine_extrinsics.py --align from parallax-free measurements; '
                     'the shear is the measured parallax at the seam for this rig position.',
@@ -279,7 +279,7 @@ def main():
               % (*np.degrees(x), time.time() - t0))
         report(after, 'With this take\'s alignment:')
         print('Wrote %s' % ap_path)
-        print('The stitcher and tuner now use it for this take: shear %.1f / %.1f is filled in automatically.'
+        print('The stitcher and Studio now use it for this take: shear %.1f / %.1f is filled in automatically.'
               % (out['shift_top'], out['shift_bottom']))
         return
 

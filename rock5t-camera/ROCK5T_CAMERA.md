@@ -8,11 +8,7 @@ are still placeholder design values — see the README.
 
 This file is the **bring-up log**: a dated record of what was tried, what broke
 and why, kept because none of it is recoverable from the code. Newest entries
-are at the bottom. For how to *run* the rig, see [README.md](README.md).
-
-> **Resuming this work (e.g. cables arrived)? Start with
-> [`NEXT_STEPS.md`](NEXT_STEPS.md)** — a self-contained handoff: current state,
-> how to operate the board, and the exact next-step sequence.
+are at the bottom. For how to *run* the rig, see [README.md](../README.md).
 
 
 Goal: run the two genlocked Pi HQ cameras on the **Radxa ROCK 5T** (RK3588).
@@ -72,7 +68,7 @@ that can be proven without cameras is proven:
   reached the chip-ID read and reported `Unexpected sensor id(0000), ret(-5)`
   on both buses — the correct "no sensor connected" signal.
 
-**Install steps that worked** (from ~/veery-field-camera/rock5t-camera):
+**Install steps that worked** (from <repo>/rock5t-camera):
 ```
 cd driver && make && sudo cp imx477.ko /lib/modules/$(uname -r)/kernel/drivers/media/i2c/ && sudo depmod -a
 sudo cp iqfiles/imx477_RPI-HQ_default.json /etc/iqfiles/
@@ -151,7 +147,7 @@ Both Pi HQ cameras connected (CAM0 J5002, CAM1 J10) with the new 30-pin cables.
 - **Topology note for STEP 3:** this stack runs CIF→ISP **online** — the rkcif
   video nodes are not for raw capture here; the smoke test goes through
   `rkisp_mainpath` (video22 = CAM0, video31 = CAM1, NV12) with rkaiq_3A_server
-  running. The raw-bypass grab in NEXT_STEPS STEP 3 doesn't apply as written.
+  running. The raw-bypass grab planned for this step doesn't apply as written.
 
 ## Bring-up log (2026-09-11, later): PIPELINE COMPLETE on custom builtin-driver kernel
 
@@ -295,8 +291,8 @@ as preview.sh; add selfpath selection reset to record_dual.sh.
   Board: charuco_board.png on a TV, 78mm squares (measured on glass).
   **Never touch the focus rings or reseat a lens** without recalibrating
   that camera.
-- **calib_server.py / veery_server.py**: browser panels (8081 calibration,
-  8080 recorder). Rules baked in: previews run CONTINUOUSLY on the selfpath
+- **recorder/server.py**: the browser panel (8080: recorder, and /calib for
+  calibration snapshots). Rules baked in: previews run CONTINUOUSLY on the selfpath
   and are never stopped/restarted (a camera switcher that restarted
   pipelines caused a lockup), snapshots/records come off the mainpath so
   both coexist, preview children run in their own process group and are

@@ -1,8 +1,8 @@
 """
-rig.py - the Veery rig's take files, calibration and stitch geometry, in Python.
+rig.py - the camera rig's take files, calibration and stitch geometry, in Python.
 
 Shared by refine_extrinsics.py (alignment) and the Studio server (the stitch
-page's preview). The geometry is the stitcher's (stitching/stitch_pipeline.cpp)
+page's preview). The geometry is the stitcher's (native/stitch_pipeline.cpp)
 line for line, so what the preview shows is what StitchPipeline renders:
   * a cylinder canvas in the LEFT camera's frame, radius = its focal length;
   * equidistant (Kannala-Brandt) fisheye projection into each camera;
@@ -18,7 +18,9 @@ import cv2
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 CALIB_DIR = os.path.join(REPO, 'calibration')
-SHARED_CLOCK_TAG = 'veery-shared-clock'      # written by the recorder (veery_server.py)
+# Written into every take by the recorder (rock5t-camera/recorder/server.py). Matched
+# anywhere in the tag, so takes recorded under the tag's older, longer name count too.
+SHARED_CLOCK_TAG = 'shared-clock'
 
 TAKE_RE = re.compile(r'^(take_[A-Za-z0-9_-]+?)_cam([01])\.(mkv|mp4|mov)$')
 

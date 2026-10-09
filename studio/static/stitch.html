@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Stitch · Veery Studio</title>
+<title>Stitch · Studio</title>
 <link rel="stylesheet" href="/static/studio.css">
 <style>
   #controls { display:flex; gap:10px; align-items:center; flex-wrap:wrap; padding:8px 12px; background:var(--panel);
@@ -72,7 +72,7 @@ const clmp = (v, lo, hi) => { return Math.max(lo, Math.min(hi, v)); };
 const st = (t, cls) => { $('status').textContent = t; $('status').className = cls || 'muted'; return; };
 const clock = (f) => { const s = f / FPS; return Math.floor(s / 60) + ':' + ('0' + Math.floor(s % 60)).slice(-2); };
 
-// ------------------------------------------------------------------ drawing (as the stitcher's tuner)
+// ------------------------------------------------------------------ drawing
 const both = () => { if (--pending <= 0) { pending = 0; render(); } return; };
 imgL.onload = both; imgR.onload = both;
 imgL.onerror = imgR.onerror = () => { st('could not load that frame', 'bad'); pending = 0; return; };
@@ -284,7 +284,7 @@ const updateButtons = () => {
 // ------------------------------------------------------------------ load
 (async () => {
   $('takeName').textContent = TAKE;
-  document.title = TAKE + ' · Stitch · Veery Studio';
+  document.title = TAKE + ' · Stitch · Studio';
   const r = await fetch(API + '/info');
   info = await r.json();
   if (!r.ok) { st(info.error || 'cannot open this take', 'bad'); return; }

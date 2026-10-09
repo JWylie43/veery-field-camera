@@ -9,11 +9,16 @@ fisheye lenses in a 3D-printed housing, recording **4K30 per camera** to the
 RK3588's hardware HEVC encoder — so the CPU stays near-idle and the rig has the
 thermal headroom to run outdoors for hours.
 
+> **Platforms:** the Rock side runs on the ROCK 5T's Linux. Everything else —
+> Veery Studio (align, stitch, edit) and calibration — is **macOS / Linux only**
+> (developed and tested on macOS; Linux should work but is untested). Windows is
+> not supported.
+
 > This is the `radxa-rock-5t` branch. The earlier Jetson Orin Nano rig lives on
 > [`nvidia-orin-jetson-nano`](../../tree/nvidia-orin-jetson-nano); none of its
 > code is on this branch.
 
-**[ROCK5T_CAMERA.md](ROCK5T_CAMERA.md)** is the hardware bring-up log — what was
+**[rock5t-camera/ROCK5T_CAMERA.md](rock5t-camera/ROCK5T_CAMERA.md)** is the hardware bring-up log — what was
 tried, what failed and why. Read it before touching the driver, the overlay or
 the ISP tuning. This file is everything else: what the project is, and how to
 run it.
@@ -33,7 +38,7 @@ run it.
 - [2. Offload](#2-offload-on-the-rock)
 - [3. Calibrate](#3-calibrate)
 - [4. Check a take](#4-check-a-take-before-stitching-on-the-mac)
-- [5. Stitch](#5-stitch-on-the-mac--pc)
+- [5. Stitch](#5-stitch-on-the-mac)
 - [6. Verify the output](#6-verify-the-output)
 - [7. Edit: points and virtual camera](#7-edit-points-and-virtual-camera)
 
@@ -49,26 +54,27 @@ veery-field-camera/
 │   ├── kernel-build/       kernel build script + notes
 │   ├── iqfiles/            rkaiq ISP tuning (generated; → /etc/iqfiles/)
 │   ├── reference/          vendor DTS / drivers / schematic used as source material
-│   └── recorder/           veery_server.py (web panel), veery.service, ae_follower.py
+│   ├── recorder/           server.py (the recorder's web panel) + recorder.service (starts it at boot)
+│   ├── system/             rkaiq_3A service fix (installed by setup.sh)
+│   ├── image-build/        builds the ready-to-flash Rock image (Radxa's + everything above)
+│   ├── setup.sh            sets up a fresh Rock (packages, kernel, overlay, tuning, services) + checks it
+│   └── ROCK5T_CAMERA.md    hardware bring-up log
 ├── calibration/          Runs ON YOUR MAC — ChArUco stereo calibration
-│   ├── calib_server.py     Rock-side capture panel (preview + full-res snapshot)
-│   ├── snap_pair.sh        Rock-side: capture ONE simultaneous cam0+cam1 pair
-│   ├── show_board.py       generate/display the ChArUco board
+│   ├── charuco_board.png   the ChArUco board (shown full-screen on a TV)
 │   ├── calibrate.py        cam0+cam1 fisheye intrinsics + stereo extrinsics
 │   └── cam0_intrinsics.json, cam1_intrinsics.json, stereo_extrinsics.json
-├── stitching/            Runs ON YOUR MAC/PC — panorama stitcher (C++)
-│   ├── stitch_pipeline.cpp   calibration-driven cylindrical stitch + browser tuner
-│   ├── director.cpp/.html    edit: cut the game into points, steer a 16:9 virtual camera, render
-│   ├── pair_check.py         verify a take's two files before stitching
-│   └── CMakeLists.txt, include/json.hpp
 ├── studio/               Runs ON YOUR MAC — Veery Studio, the takes folder in a browser
 │   ├── server.py             local web app: takes list, batch align, stitch page, editor, jobs
 │   ├── refine_extrinsics.py  per-take camera alignment (--align / --check / --apply)
 │   ├── rig.py                take files, calibration and the stitcher's geometry in Python
-│   └── studio.command        double-click to start (own venv: setup.sh, requirements.txt)
+│   ├── static/               the pages (takes list, stitch, edit)
+│   ├── native/               the C++ tools Studio runs (CMake; build output in native/build/)
+│   │   ├── stitch_pipeline.cpp   StitchPipeline: calibration-driven cylindrical stitch of a pair
+│   │   └── director.cpp          Director: renders a virtual-camera edit
+│   └── studio.command        double-click to start Studio
 ├── 3d-housing-model/     Printable enclosure (Rock Housing top/bottom, .3mf + .stl)
-├── setup.sh              Rock dependency + pipeline health check
-└── ROCK5T_CAMERA.md      Hardware bring-up log
+├── setup.sh              Mac setup: Python packages into .venv/ + build Studio's C++ tools
+├── requirements.txt      the Python packages (Studio, alignment, calibration)
 ```
 
 The three calibration JSONs live directly in `calibration/` because that is
@@ -87,15 +93,15 @@ rkisp mainpath (NV12, tuned IQ) → videorate → mpph265enc (CBR, rotation=180)
 
 One pipeline means one clock: genlocked frames carry the same timestamps in
 both files, each file keeps its first frame's real start time, and both are
-tagged `veery-shared-clock`. The stitcher (and `pair_check.py`) read the two
+tagged `shared-clock`. The stitcher (and Studio) read the two
 start times and get the frame offset **exactly** - no brightness guessing.
 The trade-off, chosen deliberately: a fault in one camera ends the whole take.
 
-**2 — Calibrate (capture on the Rock, solve on the Mac).** `calib_server.py` or
-`snap_pair.sh` captures full-res ChArUco frames; `calibrate.py` solves per-camera
+**2 — Calibrate (capture on the Rock, solve on the Mac).** The recorder panel's
+`/calib` page captures full-res ChArUco pairs; `calibrate.py` solves per-camera
 **fisheye** intrinsics and the stereo extrinsics into `calibration/`.
 
-**3 — Stitch (on the Mac/PC).** `StitchPipeline` reads that calibration and warps
+**3 — Stitch (on the Mac).** `StitchPipeline` reads that calibration and warps
 both cameras onto one cylinder. No feature detection — the alignment comes
 entirely from the calibrated geometry.
 
@@ -122,7 +128,7 @@ panorama built from the wrong geometry.
 |---|---|
 | IMX477 driver + dual-camera overlay | working on kernel 6.1.84-8-rk2410-imx477 |
 | ISP tuning (`imx477_RPI-HQ_default.json`) | tuned; see `iqfiles/TRANSLATION_NOTES.md` |
-| Dual 4K30 HEVC recording | working (`veery_server.py`) |
+| Dual 4K30 HEVC recording | working (`recorder/server.py`) |
 | cam0/cam1 fisheye intrinsics | **solved** — ~0.23 px RMS, 104.5° H |
 | Stereo extrinsics | **PLACEHOLDER** (design values, not a measurement) |
 | Stitcher | working, fisheye + paired input |
@@ -133,8 +139,8 @@ take). The stitcher's own `auto` target for its HEVC *output* is **0.20 bpp**,
 derived from VMAF runs that put good H.264 at ~0.26 bpp with HEVC buying ~40%.
 So the capture master — which then gets de-warped, stitched and re-encoded — is
 running at roughly **half** the bits/pixel this project already established as
-"good", on high-entropy content (grass, motion). `rock5t-camera/NEXT_STEPS.md`
-lists "confirm against footage" as an open item; that was never done. Matching
+"good", on high-entropy content (grass, motion). Confirming it against footage
+is still an open item. Matching
 0.20 bpp would mean ~50 Mbit/cam (~45 GB/hr for the pair, vs ~25 today). Worth
 an A/B on real footage before a real game.
 
@@ -147,29 +153,94 @@ mount is ever disturbed.
 
 ## Prerequisites
 
-**On the Rock** — run `./setup.sh` (or `./setup.sh --check` to install nothing).
-It checks the tools, the GStreamer elements the pipelines actually use
-(including `h265parse` and the Rockchip `mpph265enc`), the driver binding, the
-two ISP mainpath nodes, the rkaiq daemon, the IQ file and the `veery.service`
-install. It does *not* build the kernel driver or overlay — see
-[ROCK5T_CAMERA.md](ROCK5T_CAMERA.md) and `rock5t-camera/driver/NOTES.md`.
-
-The recorder needs **no pip packages** — `veery_server.py` and
-`calib_server.py` are Python 3 standard library only, on purpose.
-
-**On the Mac/PC** — calibration needs Python 3 with OpenCV:
+**On the Rock — a fresh one: flash the rig image.** Download
+`rock5t-camera-image-N.img.xz` from this repo's [Releases](../../releases)
+(the newest `image-N`), flash it to the Rock's SD card or NVMe with any image
+flasher (balenaEtcher, Raspberry Pi Imager — the same way as Radxa's image),
+connect the cameras and power on. That's all: the first boot creates the
+`radxa` user (password `radxa` — change it), and the recorder comes up at
+`http://<rock-ip>:8080` (or `http://veery.local:8080`). To confirm everything,
+on the Rock:
 
 ```bash
-python3 -m venv .venv && ./.venv/bin/pip install -U opencv-contrib-python numpy
+~/veery-field-camera/rock5t-camera/setup.sh --check
 ```
 
-Stitching needs CMake, OpenCV (4.x or 5.x) and `ffmpeg` on PATH. Build it once:
+The image is Radxa's stock image with the camera kernel, overlay, tuning, 3A fix,
+recorder and a checkout of this repo already installed — how it's built and
+published is in [rock5t-camera/image-build/](rock5t-camera/image-build/README.md).
+
+**Or set up a Rock from Radxa's own image** (and how a running Rock is updated
+after `git pull`): flash Radxa's ROCK 5T Debian 12 image, connect the cameras,
+then on the Rock:
 
 ```bash
-cd stitching && ./stitch.command
+git clone https://github.com/JWylie43/veery-field-camera.git && cd veery-field-camera
+rock5t-camera/setup.sh            # installs everything, then asks to reboot
 ```
 
-(`stitch.bat` on Windows. Both build on first run, then launch the tuner.)
+After the reboot the recorder is already running. Confirm with
+`rock5t-camera/setup.sh --check`.
+
+`setup.sh` installs, skipping whatever is already done:
+
+1. **packages** — GStreamer, ffmpeg and tools (apt);
+2. **the camera kernel** — Radxa's kernel with our IMX477 driver built in (stock
+   kernels have none), downloaded from this repo's
+   [Releases](../../releases) and installed beside the stock kernel, which stays
+   in the boot menu as a fallback; kernel updates are put on hold so a Radxa
+   update can't replace it;
+3. **the camera overlay** — tells the board both cameras are attached and which
+   one leads the genlock;
+4. **the IQ tuning file** the camera's 3A daemon (auto exposure / colour) loads;
+5. **a fix for Radxa's `rkaiq_3A.service`**, which as shipped kills the 3A daemon
+   right after starting it;
+6. **the recorder service** — the web panel, started at every boot.
+
+Then it asks to reboot if the kernel, overlay or tuning changed, and otherwise
+runs its checks: kernel and boot default, tools and GStreamer elements
+(including the Rockchip hardware encoder, which comes with Radxa's image), the
+driver and both sensors bound, the two ISP nodes, the 3A daemon, and the
+recorder. Re-running it is always safe; on a finished Rock it changes nothing.
+`--check` only checks; `--yes` reboots without asking. Re-run it after pulling
+changes to the tuning or the overlay.
+
+It doesn't flash the OS, set the hostname (this rig's is `veery`, hence
+`veery.local`) or configure the field hotspot.
+
+**Tested Rock setup** — the rig image is built on exactly this; when setting up
+from Radxa's image, flash the same one (`rsdk-r7`). The camera kernel is built
+from the same Radxa kernel source as this image, and Radxa's camera software
+(the 3A daemon, the hardware encoder) has to match it; the IQ tuning file is
+written for this rkaiq version's format. `setup.sh` warns if a Rock's camera
+software differs.
+
+| | Version |
+|---|---|
+| Radxa OS image | ROCK 5T Debian 12 (bookworm) KDE, release [`rsdk-r7`](https://github.com/radxa-build/rock-5t/releases/tag/rsdk-r7) (2026-07-06) |
+| Kernel | `6.1.84-8-rk2410-imx477` (release `kernel-6`), from Radxa's `6.1.84-8-rk2410` |
+| 3A daemon / ISP tuning | `camera-engine-rkaiq` 6.8.0-rk3588 |
+| Hardware encoder | `librockchip-mpp1` 1.5.0-1, `gstreamer1.0-rockchip1` 1.14-4, `libv4l-rkmpp` 1.7.0-1 |
+| Boot | `u-boot-menu` 4.2.2, `u-boot-rock-5t` 2017.09-64-455bd2a, `rsetup` 0.4.27 |
+
+The recorder needs **no pip packages** — `recorder/server.py` is Python 3
+standard library only, on purpose.
+
+**On the Mac** (macOS / Linux only — no Windows) — install the tools with
+Homebrew (plus Xcode's command-line tools for the compiler:
+`xcode-select --install`), then run the repo's setup. On Linux, install the same
+four with the system package manager (and a C++ compiler) instead of Homebrew:
+
+```bash
+brew install python cmake opencv ffmpeg
+./setup.sh
+```
+
+`setup.sh` creates the repo's one Python environment, `.venv/`, installs
+`requirements.txt` into it (every Python script here runs with
+`.venv/bin/python`), and builds Studio's two C++ tools into
+`studio/native/build/`. Re-run it after pulling changes to the C++ or the
+requirements.
 
 ---
 
@@ -198,14 +269,14 @@ Once the takes are on the Mac, **Veery Studio** does steps 3–7 for a folder of
 takes in one local web app (`studio/README.md` has the details):
 
 ```bash
-studio/studio.command                 # or double-click it; first run sets up studio/.venv
+studio/studio.command                 # or double-click it (runs ./setup.sh first if needed)
 ```
 
 - **Takes list** (`http://127.0.0.1:8100/`): every `take_…_cam0/_cam1` pair in
-  `~/Desktop/veery-takes` (`--takes DIR` for another folder). Tick several and
+  `~/Desktop/takes` (`--takes DIR` for another folder). Tick several and
   **Align selected** - each runs `refine_extrinsics.py --align` as a job with live
   status; the row's details show the result and the log.
-- **Stitch →** opens `/stitch/<take>`: the tuner's controls on any frame of the
+- **Stitch →** opens `/stitch/<take>`: shear, rotation and crop box on any frame of the
   pair, with its alignment file (or the base calibration) and shear filled in.
   **Stitch** runs `StitchPipeline` as a job (one at a time) and writes the
   settings into the video's metadata.
@@ -218,12 +289,8 @@ The C++ tools still run on their own exactly as below; Studio just calls them.
 
 ## 1. Record (on the Rock)
 
-```bash
-sudo python3 rock5t-camera/recorder/veery_server.py
-```
-
-Or let systemd run it at boot (`veery.service`). Then open
-`http://veery.local:8080`:
+The recorder runs by itself: `recorder.service` starts it at every boot (installed by
+`rock5t-camera/setup.sh`). Open `http://veery.local:8080`:
 
 - two live previews (continuous, ISP selfpath, 1080p/5 fps)
 - one **Record** button — starts both cameras, writes two MKVs
@@ -238,7 +305,9 @@ per camera — deliberately: one less thing to get wrong at a game. Change the
 tuning, not the panel. (See the bitrate note in [Status](#status).)
 
 > Only one process can hold a camera node. If you run anything else against the
-> cameras, stop the panel first: `sudo systemctl stop veery`.
+> cameras, stop the panel first: `sudo systemctl stop recorder` (start it again
+> with `sudo systemctl start recorder`; logs: `journalctl -u recorder -f`). To run
+> it by hand instead: `sudo python3 rock5t-camera/recorder/server.py`.
 
 ---
 
@@ -290,7 +359,7 @@ df -h /home/radxa
 Plain `rsync` over the LAN, from the **Mac**:
 
 ```bash
-rsync -avP radxa@veery.local:'/home/radxa/recordings/take_YYYYmmdd_HHMMSS_cam*.mkv' ~/Desktop/veery-takes/
+rsync -avP radxa@veery.local:'/home/radxa/recordings/take_YYYYmmdd_HHMMSS_cam*.mkv' ~/Desktop/takes/
 ```
 
 ---
@@ -302,33 +371,22 @@ Intrinsics are mount-independent; **extrinsics are not**.
 
 > **Orientation.** The cameras are mounted upside down. The sensors read out
 > as they are, and everything that saves or shows an image (recording
-> encoder, panel previews, `/calib` snapshots, `calib_server.py`,
-> `snap_pair.sh`) rotates it 180°, so files on disk are upright. Calibration
-> must be solved in that same orientation. Files solved from older
-> upside-down captures are converted once with
-> `python3 calibration/rotate180.py` (exact: it moves the principal point and
-> conjugates the extrinsic rotation, and marks each file so it is never
-> converted twice). The stitcher then sees cam1 to the left of cam0 and swaps
+> encoder, panel previews, `/calib` snapshots) rotates it 180°, so files on
+> disk are upright. Calibration must be solved in that same orientation (the
+> current JSONs are). The stitcher then sees cam1 to the left of cam0 and swaps
 > the two automatically.
 
 ### 3a. Capture (on the Rock)
 
-For **intrinsics**, one camera at a time is fine — walk the board around each
-camera's whole frame, edges and corners included:
+Show `calibration/charuco_board.png` full-screen (a TV works) and open the
+recorder panel's **Calibration Snapshots** page, `http://veery.local:8080/calib`.
+Each **Take Snapshot** saves a full-res 3840×2160 pair, `cam0_NNN.png` +
+`cam1_NNN.png`, into `~/calib-pairs` on the Rock.
 
-```bash
-python3 calibration/calib_server.py     # http://<rock-ip>:8081
-```
-
-Preview comes from the selfpath, full-res 3840×2160 snapshots from the
-mainpath. Shots land in `~/calib0` / `~/calib1`.
-
-For **extrinsics** you need genuinely **simultaneous pairs** of the same board
-pose — hold the board still where *both* cameras see it and run, once per pose:
-
-```bash
-./calibration/snap_pair.sh              # → ~/calib/cam0_NNN.png + cam1_NNN.png
-```
+- For **intrinsics**, walk the board around each camera's whole frame, edges
+  and corners included (a shot only one camera sees still counts for that one).
+- For **extrinsics**, hold the board still where *both* cameras see it - the
+  pairs are simultaneous, which is what the stereo solve needs.
 
 Aim for ~30–40 poses at varied depth and tilt.
 
@@ -338,9 +396,9 @@ Pull the shots into the `calibration/` folder, then:
 
 ```bash
 cd calibration
-scp -r radxa@veery.local:~/calib0 images-cam0
-scp -r radxa@veery.local:~/calib1 images-cam1
-python3 calibrate.py
+scp -r radxa@veery.local:~/calib-pairs images-pairs
+../.venv/bin/python calibrate.py --cam0-glob 'images-pairs/cam0_*.png' --cam1-glob 'images-pairs/cam1_*.png' \
+        --square-mm <measured> --marker-mm <measured>
 ```
 
 Results are written alongside the scripts, which is where the stitcher looks.
@@ -357,7 +415,7 @@ To re-solve only the extrinsics against already-good intrinsics, from pairs
 taken on the panel's `/calib` page (`scp -r veery:~/calib-pairs images-pairs`):
 
 ```bash
-python3 calibrate.py --use-intrinsics . --square-mm 71 --marker-mm 53 \
+../.venv/bin/python calibrate.py --use-intrinsics . --square-mm 71 --marker-mm 53 \
         --cam0-glob 'images-pairs/cam0_*.png' --cam1-glob 'images-pairs/cam1_*.png'
 ```
 
@@ -398,14 +456,14 @@ own alignment, measured on its own footage. Easiest: tick the takes in
 [Studio](#studio-align-stitch-and-edit-in-the-browser) and **Align selected**. By hand, on the Mac, from the repo root:
 
 ```bash
-studio/.venv/bin/python studio/refine_extrinsics.py --align ~/Desktop/veery-takes/take_TS_cam0.mkv
+.venv/bin/python studio/refine_extrinsics.py --align ~/Desktop/takes/take_TS_cam0.mkv
 ```
 
 (~10 s; either file of the pair works; the files are paired by their capture
 timestamps, the same way the stitcher pairs them.) It solves that take's tilt / roll / yaw
 correction from parallax-free measurements only and measures its shear, and
 writes both to `take_TS.align.json` next to the take. From then on the stitcher
-and tuner use that file automatically for that take: its rotation replaces the
+and Studio use that file automatically for that take: its rotation replaces the
 base rotation, and its shear fills in Shift far / Shift near (CLI: used unless
 you pass `--shift-top`/`--shift-bottom`/`--shift-x`; `--no-align` ignores the
 file). Takes without a file use the base calibration (`stereo_extrinsics.json`,
@@ -425,8 +483,8 @@ smart seam).
 > That guard exists because the failure is silent: a bad extrinsic still
 > produces a plausible-looking panorama. The usual cause is feeding it the two
 > *intrinsics* folders — those are independent per-camera shoots, both numbered
-> `img_NNN`, so sort-order pairing matches unrelated frames. Use `/calib` (or
-> `snap_pair.sh`) pairs. `--force-extrinsics` overrides, but you almost never
+> `img_NNN`, so sort-order pairing matches unrelated frames. Use `/calib`
+> pairs. `--force-extrinsics` overrides, but you almost never
 > want that.
 >
 > The stereo solve is fisheye-aware: corners are mapped through each camera's
@@ -439,23 +497,20 @@ Eyeball the sanity images it writes: straight lines straight in
 crosses (where the solved geometry puts each corner) inside the green circles
 (where it was detected) in BOTH halves. Then stitch one pair and look at the
 seam - that is the real test:
-`./build/StitchPipeline --source "../calibration/images-pairs/cam0_013.png::../calibration/images-pairs/cam1_013.png" --out-file pano.jpg`
+`studio/native/build/StitchPipeline --source calibration/images-pairs/cam0_013.png --out-file pano.jpg`
+(from the repo root; either file of a pair finds its partner)
 
 ---
 
 ## 4. Check a take before stitching (on the Mac)
 
-Optional — the stitcher estimates the frame offset itself. Run this when a take
-looks wrong:
-
-```bash
-python3 stitching/pair_check.py take_YYYYmmdd_HHMMSS_cam0.mkv
-```
-
-It reports frame counts, PTS gaps, duplicated frames and the estimated
-cam0↔cam1 offset with its correlation margin. The two files should have
-**identical** frame counts — the pipeline stamps a rigid 30 fps grid, so a
-capture drop shows up as a duplicated frame, not a shorter file.
+Studio does this for every take: a pair's **Details** on the takes list shows
+each file's frame count and any **timing gaps** (missing time in one camera -
+everything after a gap is out of step with the other), and the stitch page shows
+the frame offset between the two files, read exactly from their capture
+timestamps. The two files should have **identical** frame counts, or differ only
+by that start offset - the pipeline stamps a rigid 30 fps grid, so a capture
+drop shows up as a duplicated frame, not a shorter file.
 
 ### Make a take seekable
 
@@ -471,42 +526,29 @@ Remux **both** halves and keep the `_cam0`/`_cam1` suffixes so pairing still wor
 
 ---
 
-## 5. Stitch (on the Mac / PC)
+## 5. Stitch (on the Mac)
 
-Build once — `./stitch.command` (Mac) or `stitch.bat` (Windows). Run from
-`stitching/`.
+### 5a. In Studio (the normal way)
 
-**Every input is a pair.** Pass either file of a pair and its partner is found
-next to it, or give both explicitly:
+On the takes list, a pair's **Stitch →** opens its stitch page (`/stitch/<take>`).
+It loads the take's own alignment (`.align.json`, filling in the shear) or the
+base calibration, and shows any frame of the pair warped exactly as the stitcher
+will warp it:
 
-```bash
---source take_TS_cam0.mkv                    # partner found automatically
---source take_TS_cam1.mkv                    # either half works
---source images-pairs/cam1_013.png           # /calib page pairs too
---source "left.mkv::right.mkv"               # explicit, any names
-```
+- **Shift far (top)** / **Shift near (bottom)** - the parallax shear, below.
+  ←/→ shift both.
+- **Rotate** - levels the finished panorama: it rotates the whole panorama and
+  THEN applies the crop box, exactly as the preview shows (positive =
+  clockwise; it does not change how the cameras are aligned).
+- **Crop box** - drag it, or its yellow corners; it is the output frame.
+- **In ← here** / **Out ← here** - stitch only part of the take (default: all).
+- **seam line** / **overlap blend** - preview aids. The seam is the middle of
+  the overlap (the smart seam routes it around moving players); blending and
+  exposure match are fixed defaults.
+- **Output** - a file name; it is saved in the takes folder.
 
-There is no single-file mode; a source that resolves to neither is an error.
-
-### 5a. Interactive tuner (recommended first)
-
-```bash
-./stitch.command
-```
-
-Opens a browser tuner: **Import source…** (either file of a pair) → align the
-far/near edges → **Stitch all frames**. **Output → Choose…** picks the file up
-front; once one is chosen the equivalent CLI command is shown and kept in step
-with every change, so you can copy it without stitching (Stitch also asks for an
-output if none is chosen yet).
-
-Controls: the two edge shifts (near/far parallax, below), **Rotate** (levels the
-finished panorama: it rotates the whole panorama and THEN applies the crop box,
-exactly as the preview shows - positive = clockwise; it does not change how the
-cameras are aligned),
-**show seam line** / **crop to box**, **overlap blend** (preview aid), and the
-frame seeker. The seam is always the middle of the overlap (smart seam routes it
-around moving players); shift-y, blending and exposure match are fixed defaults.
+**Stitch** starts the job (one at a time; progress on the page and the takes
+list) and records every setting in the video's metadata - see `studio/README.md`.
 
 Why the edge shifts still matter with a real calibration: the calibration
 aligns the cameras' *directions*, which is exact only for distant things. The
@@ -514,23 +556,31 @@ lenses are ~68 mm apart, so a nearer object lands at a different spot in each
 view - roughly 2104 px × 0.068 m / distance: ~3 px at 50 m, ~15 px at 10 m,
 ~30 px at 5 m. The far edge of the field usually needs nothing; the near edge
 (bottom of frame) can need a few to a few tens of px depending on how close the
-rig is to the touchline.
+rig is to the touchline. **Align** measures it for each take.
 
-### 5b. Headless
+### 5b. By hand
+
+`StitchPipeline` is a plain command-line tool (Studio runs exactly this; each
+stitched video's metadata holds the command that made it). From the repo root:
 
 ```bash
-./build/StitchPipeline --source take_TS_cam0_seekable.mkv \
-    --shift-top 4 --shift-bottom 20 --out-file stitched.mp4
+studio/native/build/StitchPipeline --source ~/Desktop/takes/take_TS_cam0.mkv \
+    --shift-top 4 --shift-bottom 20 --crop 341,119,6141,2134 --out-file stitched.mp4
 ```
+
+**Every input is a pair.** Pass either file of a pair and its partner is found
+next to it (`take_TS_cam0.mkv` / `_cam1`, or `/calib` `cam0_NNN.png` / `cam1_`),
+or give both explicitly as `"left.mkv::right.mkv"`. A take's `.align.json` is
+used automatically (`--no-align` ignores it).
 
 | Flag | Meaning |
 |---|---|
-| `--source <file>` | input — either file of a pair (`_cam0`/`_cam1`, or `/calib` `cam0_`/`cam1_`), or `"a::b"` |
-| `--shift-top N` / `--shift-bottom N` | far/near edge alignment (your tuned values) |
+| `--source <file>` | input — either file of a pair, or `"a::b"` |
+| `--shift-top N` / `--shift-bottom N` | far/near edge alignment (default: the take's `.align.json`) |
 | `--shift-x N` / `--shift-y N` | uniform horizontal / vertical shift of cam1 |
 | `--pair-offset N\|auto` | frame offset between the two files (default `auto`: exact from the capture timestamps on shared-clock takes, brightness estimate on older ones) |
 | `--crop x,y,w,h` | output box (full-canvas coords); applied AFTER `--degrees` |
-| `--degrees N` | rotate the finished panorama, positive = clockwise (as in the tuner) |
+| `--degrees N` | rotate the finished panorama, positive = clockwise |
 | `--start N` / `--end N` | frame range |
 | `--scale F` | render the cylinder at F× radius — same FOV, fewer pixels |
 | `--seam N` / `--bands N` / `--no-smart-seam` | seam placement and blending |
@@ -539,14 +589,15 @@ rig is to the touchline.
 | `--venc <name>` / `--no-hwenc` | pick or disable the hardware encoder |
 | `--calib-dir <dir>` | calibration folder (default: found by walking up) |
 | `--out-file <path>` / `--out <dir>` | output |
-| `--tune` | open the browser tuner |
+| `--metadata-file <f>` | store an ffmpeg FFMETADATA file's tags in the output (Studio's settings record) |
+| `--no-align` | ignore the take's `.align.json` |
 
 ### 5c. A time range only
 
 `--start`/`--end` are **frames**. At 30 fps, `frame = seconds × 30`:
 
 ```bash
-./build/StitchPipeline --source take_TS_cam0_seekable.mkv \
+studio/native/build/StitchPipeline --source take_TS_cam0_seekable.mkv \
     --start 2700 --end 5400 --out-file clip_1m30-3m.mp4     # 1:30 → 3:00
 ```
 
@@ -598,14 +649,10 @@ The **Director** turns the full-width panorama into a normal 16:9 video: you
 cut the game into points, then steer a "camera" box over each point while it
 plays.
 
-```bash
-cd stitching && ./director.command          # Windows: director.bat
-```
-
-It opens in the browser. **Open video…** loads a stitched panorama; the edit
-saves itself within a second of every change, next to it as
-`name.director.json` (reopen the video to resume), with timestamped backups
-(at most one per 5 min, last 20) in `name.director-backups/`.
+On Studio's takes list, a stitched video's **Edit →** opens it in the editor
+(`/edit/<video>`). The edit saves itself within a second of every change, next
+to the video as `name.director.json` (reopen it to resume), with timestamped
+backups (at most one per 5 min, last 20) in `name.director-backups/`.
 
 **1 · Cut** — play or scrub, press **I** where a point starts and **O** where it
 ends. Points show as bars on the timeline and are numbered in game order;
@@ -648,11 +695,12 @@ Quality: **H.264 high** (default, plays everywhere), **HEVC high** (same quality
 the panorama's own YUV from decode to encode (no colour conversion), and are
 scaled bicubically with anti-aliasing, so a 1:1 box is a bit-exact crop before
 encoding. Unframed points are left out by default (or rendered as a full-height
-wide shot). Headless:
+wide shot). The render runs as a Studio job (saved in the takes folder); it is
+the `Director` command-line tool, which also runs by hand:
 
 ```bash
-./build/Director --render take.director.json --out game_edit.mp4 [--per-point] [--unframed skip|wide] \
-    [--codec h264|hevc] [--quality high|standard]
+studio/native/build/Director --render take.director.json --out game_edit.mp4 [--per-point] \
+    [--unframed skip|wide] [--codec h264|hevc] [--quality high|standard]
 ```
 
 Output size and sharpness: with a 1697 px tall panorama a full-height box is

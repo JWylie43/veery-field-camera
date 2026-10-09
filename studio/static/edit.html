@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Edit · Veery Studio</title>
+<title>Edit · Studio</title>
 <style>
   :root { --bg:#14161a; --panel:#1d2026; --line:#2c313a; --fg:#e6e8eb; --dim:#8b929c;
           --accent:#4aa3ff; --ok:#3fb950; --warn:#d6a33a; --bad:#e5534b; --rec:#ff3b30; }
@@ -777,7 +777,7 @@ const applyInfo = (j) => {
   selPt = null; pendingIn = null; take = null; preview = null; undoStack = []; redoStack = [];
   box = { cx:W() / 2, by:H(), w:0 }; box = nativeBox();
   v.src = API + '/stream?t=' + Date.now();
-  document.title = j.name + ' · Edit · Veery Studio';
+  document.title = j.name + ' · Edit · Studio';
   v.addEventListener('loadedmetadata', () => { layout(); seekFrame(0); return; }, { once:true });
   changed(false);
   return;

@@ -1,0 +1,7 @@
+# Python packages for everything on the Mac side of this repo - Studio
+# (studio/), the alignment script and calibration/calibrate.py. ./setup.sh installs
+# them into the repo's one environment, .venv/.
+# OpenCV stays on 4.x: the alignment measurements were validated against it.
+# (It includes the ChArUco/aruco detector calibrate.py uses.)
+numpy>=2.0
+opencv-python-headless>=4.10,<5

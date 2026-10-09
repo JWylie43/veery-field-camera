@@ -1,16 +1,13 @@
 [Unit]
-# Web control panel for Veery, the ROCK 5T stereo camera (previews + record button).
-# Install:
-#   sudo cp ~/veery-field-camera/rock5t-camera/recorder/veery.service \
-#           /etc/systemd/system/
-#   sudo systemctl daemon-reload
-#   sudo systemctl enable --now veery
-# Then it is up at http://<rock-ip>:8080 on every boot.
-# Logs:    journalctl -u veery -f
-# Manual:  sudo systemctl stop veery   (before running the script by hand,
+# The rig's recorder: web control panel (previews, record button, files, /calib).
+# Installed by rock5t-camera/setup.sh, which puts this checkout's real path in place
+# of @REPO_DIR@ below. Then it is up at http://<rock-ip>:8080 on
+# every boot. Takes go to ~/recordings of the user who owns the checkout.
+# Logs:    journalctl -u recorder -f
+# Manual:  sudo systemctl stop recorder   (before running server.py by hand,
 #          or by-hand runs fail: only one process can hold a camera node)
-Description=Veery stereo camera - web control panel
-Documentation=file:///home/radxa/veery-field-camera/ROCK5T_CAMERA.md
+Description=Stereo camera recorder - web control panel
+Documentation=file://@REPO_DIR@/rock5t-camera/ROCK5T_CAMERA.md
 # rkaiq_3A drives the ISP's exposure/colour; without it frames are unusable
 After=network-online.target rkaiq_3A.service
 Wants=network-online.target rkaiq_3A.service
@@ -21,8 +18,8 @@ Type=simple
 # no privileged helper script or sudoers rule to maintain. The panel has no
 # login and is reachable by anyone on the network it is attached to, so put a
 # password on the field hotspot (see ROCK5T_CAMERA.md).
-WorkingDirectory=/home/radxa/veery-field-camera
-ExecStart=/usr/bin/python3 /home/radxa/veery-field-camera/rock5t-camera/recorder/veery_server.py
+WorkingDirectory=@REPO_DIR@
+ExecStart=/usr/bin/python3 @REPO_DIR@/rock5t-camera/recorder/server.py
 # the camera pipeline settles a few seconds after the sensors probe (~12s);
 # starting into a half-ready pipeline just makes the first previews fail
 ExecStartPre=/bin/sleep 8

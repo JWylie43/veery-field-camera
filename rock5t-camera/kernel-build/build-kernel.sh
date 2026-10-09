@@ -4,7 +4,7 @@
 #
 # Why builtin: the vendor camera pipeline purges not-yet-registered sensors
 # in a late_initcall (before /init), so a loadable sensor module can never
-# join the media graph on a stock kernel (see ../../ROCK5T_CAMERA.md,
+# join the media graph on a stock kernel (see ../ROCK5T_CAMERA.md,
 # bring-up log 2026-09-11). Building the sensor in — exactly like every
 # in-tree Rockchip sensor — makes the whole runtime-workaround stack
 # (split overlay, rk_cam_defer_enable, modules-load ordering) unnecessary.

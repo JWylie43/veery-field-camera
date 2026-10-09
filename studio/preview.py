@@ -2,7 +2,7 @@
 preview.py - the stitch page's preview: one take's two cameras warped onto the
 stitcher's cylinder canvas, at any frame.
 
-As in the stitcher's own tuner, each camera is warped onto the full canvas
+Each camera is warped onto the full canvas
 (un-rotated, un-sheared) and the page applies shear, rotation and the crop box on
 top, live. The canvas, the warp and the frame pairing are the stitcher's (see
 rig.py), so the box drawn here is the box StitchPipeline renders.

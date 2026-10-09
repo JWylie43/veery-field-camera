@@ -3,7 +3,7 @@ library.py - what is in the takes folder: camera pairs and stitched videos.
 
   * a camera PAIR is take_<name>_cam0.<ext> + take_<name>_cam1.<ext> (both present);
   * a STITCHED video is an .mp4/.mov whose metadata carries Studio's stitch record
-    (JSON in the "comment" tag, {"veery": "stitch", ...}) - only those open in the editor.
+    (JSON in the "comment" tag, {"kind": "stitch", ...}) - only those open in the editor.
 Probing is cached per file (path, size, mtime), so a rescan costs a directory listing.
 The frame-timing check (every frame's timestamp, for gaps) reads the whole file's
 packets, so it runs in the background and appears in the list when ready.
@@ -182,7 +182,9 @@ def read_stitch_record(path):
         rec = json.loads(out)
     except ValueError:
         return None
-    return rec if isinstance(rec, dict) and rec.get('veery') == STITCH_TAG else None
+    # 'kind' names the record; the first stitches keyed it by the project's name instead,
+    # so any key whose value is the stitch tag counts
+    return rec if isinstance(rec, dict) and STITCH_TAG in rec.values() else None
 
 
 def project_path(video):

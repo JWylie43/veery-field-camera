@@ -1,4 +1,4 @@
-/* Veery Studio - shared look (the Director's palette) */
+/* Studio - shared look (the Director's palette) */
 :root { --bg:#14161a; --panel:#1d2026; --line:#2c313a; --fg:#e6e8eb; --dim:#8b929c;
         --accent:#4aa3ff; --ok:#3fb950; --warn:#d6a33a; --bad:#e5534b; }
 * { box-sizing:border-box; }

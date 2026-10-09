@@ -1,5 +1,5 @@
 #!/bin/bash
-# build-kernel-docker.sh - build the Veery kernel packages on ANY machine with
+# build-kernel-docker.sh - build the IMX477 kernel packages on ANY machine with
 # Docker: Apple Silicon Mac, arm64 Linux, x86-64 Linux, Windows (Docker Desktop
 # + WSL2). No toolchain on the host; everything runs in a Debian container.
 #
@@ -16,9 +16,9 @@
 #   - the exact kernel settings in kernel.config (the Rock's own config plus
 #     CONFIG_VIDEO_IMX477=y and the -imx477 release suffix)
 #
-# The kernel source and build objects live in a Docker volume (veery-kernel-src),
+# The kernel source and build objects live in a Docker volume (imx477-kernel-src),
 # so only the first build is slow (~30-60 min, all modules); after a driver
-# change, rebuilds take minutes. `docker volume rm veery-kernel-src` starts over.
+# change, rebuilds take minutes. `docker volume rm imx477-kernel-src` starts over.
 #
 # On an arm64 host (Apple Silicon, arm64 Linux) the container builds natively;
 # on x86-64 it cross-compiles with Debian's aarch64 toolchain.
@@ -29,7 +29,7 @@ KERNEL_REPO=https://github.com/radxa/kernel.git
 KERNEL_BRANCH=linux-6.1-stan-rkr4.1                     # for reference
 KERNEL_COMMIT=34337a9c76fd2fa10d8201ce32d3b782afd38098  # 6.1.84, the Rock's kernel
 IMAGE=debian:bookworm
-VOLUME=veery-kernel-src
+VOLUME=imx477-kernel-src
 
 # ---------------------------------------------------------------- in container
 if [ "${1:-}" = "--inside" ]; then

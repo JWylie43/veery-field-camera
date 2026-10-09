@@ -1,0 +1,12 @@
+[Unit]
+# The image's first-boot step - see /usr/local/sbin/rig-firstboot. Runs once.
+Description=Camera rig first boot: move the repo checkout into the user's home
+ConditionPathExists=/opt/@REPO_NAME@
+After=rsetup.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/rig-firstboot
+
+[Install]
+WantedBy=multi-user.target

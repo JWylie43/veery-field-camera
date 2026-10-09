@@ -159,11 +159,16 @@ uncertain spots are listed here instead:
   (0x20c0 = 8384 "Mbps" vs the expected 4192 total) was copied verbatim
   since it streamed fine on Jetson.
 
-## Build / install on the ROCK 5T
+## Build / install on the ROCK 5T (OBSOLETE)
+
+> **Don't use this.** It loads the driver as a module, which can never work on
+> this board's kernel (the camera pipeline drops any sensor that isn't built in -
+> see `../kernel-build/README.md`). The driver is built INTO the camera kernel,
+> which `rock5t-camera/setup.sh` installs. Kept for history.
 
 ```sh
 sudo apt install linux-headers-$(uname -r)   # if not present
-cd ~/veery-field-camera/rock5t-camera/driver      # after pulling the repo
+cd <repo>/rock5t-camera/driver      # after pulling the repo
 make
 sudo make install                            # copies to /lib/modules/.../extra + depmod
 sudo modprobe imx477                         # or: sudo insmod ./imx477.ko

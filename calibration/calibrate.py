@@ -10,20 +10,19 @@ snapshot pairs it computes, for the rig now fixed in its housing:
                               baseline in mm and toe-in angle)
 
 Workflow:
-  1. On the Rock, run calibration/calib_server.py (or snap_pair.sh) and capture
+  1. On the Rock, open the recorder panel's /calib page and capture
      ~30-40 pairs with the ChArUco board at varied angles/distances. Cover each
      camera's whole frame (edges/corners) AND get a good batch with the board
      centered where BOTH cameras see it (that overlap set is what the extrinsics
      are solved from).
-  2. Pull the shots to your Mac (from the calibration/ folder):
-         scp -r radxa@rock.local:~/calib0 images-cam0
-         scp -r radxa@rock.local:~/calib1 images-cam1
+  2. Pull the pairs to your Mac (from the calibration/ folder):
+         scp -r radxa@<rock-ip>:~/calib-pairs images-pairs
   3. Run this (from the calibration/ folder):
-         python3 calibrate.py
+         ../.venv/bin/python calibrate.py --cam0-glob 'images-pairs/cam0_*.png' \
+                              --cam1-glob 'images-pairs/cam1_*.png'
 
-The rig records TWO INDEPENDENT full-frame files per pose, one per camera - the
-cameras are paired by sort order, so shoot them back-to-back (a static board
-needs no sync). Intrinsics are solved per camera from that camera's own views;
+Each /calib snapshot saves one full-frame file per camera (cam0_NNN.png +
+cam1_NNN.png, same NNN); the two folders are paired by sort order. Intrinsics are solved per camera from that camera's own views;
 extrinsics only from poses where BOTH cameras see the board, with the intrinsics
 held FIXED (the stable way).
 
@@ -37,7 +36,7 @@ a model mismatch, not noise. cv2.fisheye lands at ~0.23px. Every JSON this
 writes carries "model": "fisheye", and the stitcher requires it.
 
 Requires OpenCV with the aruco module (>= 4.7):
-    pip install -U opencv-contrib-python numpy
+    the repo's ./setup.sh installs it into .venv/ (requirements.txt)
 
 Board defaults match the printed board MEASURED with calipers (7x10,
 DICT_5X5_1000, square=78mm, marker=58mm). If you reprint at a different scale,
@@ -64,11 +63,11 @@ try:
     import cv2
     import cv2.aruco as aruco
 except ImportError:
-    sys.exit("OpenCV not found. Install with:  pip install -U opencv-contrib-python numpy")
+    sys.exit("OpenCV not found. Run the repo's ./setup.sh, then use .venv/bin/python")
 
 if not hasattr(aruco, "CharucoDetector"):
     sys.exit("Your OpenCV is too old for this script (needs the >=4.7 aruco API).\n"
-             "Upgrade:  pip install -U opencv-contrib-python")
+             "Run the repo's ./setup.sh (requirements.txt pins a version that has it)")
 
 
 def build_board(cfg):
@@ -374,10 +373,10 @@ def calibrate_extrinsics(records, board, size, KL, dL, KR, dR, cfg, out_dir):
     # Sanity gate. A real solve on this rig lands well under 1px; anything
     # above a few px means the "pairs" are not simultaneous views of the same
     # board pose. That happens when cam0/cam1 folders hold INDEPENDENT
-    # per-camera intrinsics shoots (calib_server.py writes ~/calib0 and
-    # ~/calib1 separately, both numbered img_NNN) - sort-order pairing then
-    # matches unrelated frames and the solve is meaningless. Use snap_pair.sh,
-    # which captures one genuine cam0+cam1 pair per board pose.
+    # per-camera intrinsics shoots (separate folders, both numbered img_NNN) -
+    # sort-order pairing then matches unrelated frames and the solve is
+    # meaningless. Use the panel's /calib pairs: one genuine cam0+cam1 pair
+    # per board pose.
     # Refusing to write is deliberate: silently replacing a good
     # stereo_extrinsics.json with a bad one produces a plausible-looking
     # panorama built from the wrong geometry.

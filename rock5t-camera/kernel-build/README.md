@@ -6,7 +6,7 @@ rkisp) purges any sensor that hasn't async-registered by the end of kernel
 init (`late_initcall`, i.e. before `/init` runs) — permanently. A loadable
 `imx477.ko` therefore can never join the media graph on a stock kernel, no
 matter how it's ordered (softdep, modules-load.d, initramfs: all tried,
-all lose by design; full autopsy in `../../ROCK5T_CAMERA.md`, bring-up log
+all lose by design; full autopsy in `../ROCK5T_CAMERA.md`, bring-up log
 2026-09-11 — a partial runtime-overlay workaround lives in git history at
 df6b0ec). Building the driver in — exactly like every in-tree Rockchip
 sensor — makes the problem not exist.
@@ -24,12 +24,13 @@ Built kernels are published as **GitHub Releases** (`kernel-N`, with the two
 
 ## Install a released kernel (no build)
 
-On the Mac, download the two `.deb` files from the repo's Releases page
+`rock5t-camera/setup.sh` does this for you (and the rest of the Rock's setup) - it
+installs the release named by `KREL`/`KREV` at its top. To do it by hand: on the Mac, download the two `.deb` files from the repo's Releases page
 (e.g. `kernel-6`), or with the GitHub CLI:
 
 ```
-gh release download kernel-6 --repo JWylie43/veery-field-camera --dir ~/Desktop/veery-kernel-6
-scp ~/Desktop/veery-kernel-6/*.deb veery:~/
+gh release download kernel-6 --repo JWylie43/veery-field-camera --dir ~/Desktop/kernel-6
+scp ~/Desktop/kernel-6/*.deb radxa@<rock-ip>:~/
 ```
 
 Then on the Rock:
@@ -53,14 +54,14 @@ REV=7 ./build-kernel-docker.sh        # bump REV every build
 
 The packages land in `kernel-build/out/` (ignored by git). The first build
 takes ~30-60 min (the whole kernel and its modules); the source and objects
-are kept in the Docker volume `veery-kernel-src`, so a rebuild after a
+are kept in the Docker volume `imx477-kernel-src`, so a rebuild after a
 driver change takes minutes. On arm64 hosts it builds natively; on x86-64 it
-cross-compiles. `docker volume rm veery-kernel-src` frees the space (~15 GB).
+cross-compiles. `docker volume rm imx477-kernel-src` frees the space (~15 GB).
 
 ## Build + install on the Rock (~1–2 h)
 
 ```
-cd ~/veery-field-camera/rock5t-camera/kernel-build
+cd <repo>/rock5t-camera/kernel-build
 ./build-kernel.sh              # clone radxa/kernel, inject driver, build debs
 ./build-kernel.sh install      # dpkg -i + u-boot-update
 sudo reboot
@@ -77,7 +78,8 @@ dtbo installs unchanged.
 
 ## Publishing a new kernel release
 
-After building and testing a new revision N on the Rock:
+After building and testing a new revision N on the Rock (then bump `KREV` - and
+`KREL` if the version string changed - at the top of `rock5t-camera/setup.sh`):
 
 ```
 gh release create kernel-N rock5t-camera/kernel-build/out/linux-image-*-imx477-N_arm64.deb \
@@ -125,4 +127,5 @@ if Radxa moved on, run both steps again).
   ```
 
   (plus `chmod 644` on the world-writable unit). Any fresh install needs
-  this drop-in too.
+  this drop-in too - it is `../system/rkaiq_3A-override.conf`, installed by
+  `rock5t-camera/setup.sh`.

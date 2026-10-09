@@ -1,190 +1,41 @@
 #!/usr/bin/env bash
 #
-# setup.sh - check (and optionally install) what the ROCK 5T rig needs to record.
-# Run ON THE ROCK:
-#     ./setup.sh            # check, and apt-install anything missing
-#     ./setup.sh --check    # check only, install nothing
+# setup.sh - set up the Mac side of this repo (Studio, alignment, calibration).
+# macOS / Linux only (tested on macOS); Windows is not supported.
+#     ./setup.sh
+# 1. creates the repo's Python environment, .venv/, and installs requirements.txt
+#    into it - every Python script here runs with .venv/bin/python;
+# 2. builds Studio's C++ tools (studio/native -> studio/native/build/).
+# Safe to re-run: it updates the packages and rebuilds what changed.
 #
-# On a stock Radxa OS image most of this is ALREADY present - the vendor image
-# ships the GStreamer + Rockchip MPP stack. The half of this script that earns
-# its keep is the verification below: driver bound, sensors on I2C, two ISP
-# mainpath nodes, the rkaiq daemon up and the IQ file installed. Those are what
-# actually go wrong.
-#
-# This does NOT build the kernel driver or the device-tree overlay. Do that
-# first - see rock5t-camera/driver/NOTES.md and ROCK5T_CAMERA.md - then run this
-# to confirm the result.
-#
-# The Mac-side tools are not covered here:
-#   calibration/  -> python3 + opencv-contrib-python   (see README)
-#   stitching/    -> cmake + OpenCV + ffmpeg           (see README)
-#
-# The recorder panel itself needs NO pip packages: veery_server.py and
-# calib_server.py are Python 3 standard library only, on purpose.
+# Needs (Homebrew): python3, cmake, opencv, ffmpeg; and Xcode's command-line tools
+# for the compiler (xcode-select --install).
+# The Rock has its own check script: rock5t-camera/setup.sh (run on the Rock).
+set -e
+cd "$(dirname "$0")"
 
-CHECK_ONLY=0
-[ "${1:-}" = "--check" ] && CHECK_ONLY=1
-
-fail=0
-ok()   { printf '    \033[32mOK\033[0m    %s\n' "$1"; }
-warn() { printf '    \033[33mWARN\033[0m  %s\n' "$1"; }
-bad()  { printf '    \033[31mMISS\033[0m  %s\n' "$1"; fail=1; }
-
-# ---------------------------------------------------------------- packages
-# Only stock Debian package names here. The Rockchip MPP GStreamer plugin is
-# deliberately NOT apt-installed: it comes from the vendor image / Radxa's repo
-# and the package name varies by image, so guessing it would just fail the run.
-# It is checked for below instead.
-PKGS="v4l-utils ffmpeg exfatprogs
-      gstreamer1.0-tools gstreamer1.0-plugins-base
-      gstreamer1.0-plugins-good gstreamer1.0-plugins-bad"
-
-if [ "$CHECK_ONLY" -eq 0 ]; then
-  missing_pkgs=""
-  for p in $PKGS; do
-    dpkg -s "$p" >/dev/null 2>&1 || missing_pkgs="$missing_pkgs $p"
-  done
-  if [ -n "$missing_pkgs" ]; then
-    echo "==> Installing:$missing_pkgs"
-    sudo apt-get update
-    # shellcheck disable=SC2086
-    sudo apt-get install -y $missing_pkgs
-  else
-    echo "==> All apt dependencies already installed."
-  fi
-  echo
-fi
-
-# ---------------------------------------------------------------- tools
-echo "==> Command-line tools"
-for c in gst-launch-1.0 v4l2-ctl media-ctl ffmpeg ffprobe python3; do
-  command -v "$c" >/dev/null 2>&1 && ok "$c" || bad "$c not on PATH"
+missing=""
+for tool in python3 cmake ffmpeg ffprobe; do
+  command -v "$tool" >/dev/null || missing="$missing $tool"
 done
-
-# ---------------------------------------------------------------- gst elements
-echo
-echo "==> GStreamer elements used by the record + preview pipelines"
-for e in v4l2src videorate jpegenc multifilesink matroskamux filesink queue; do
-  gst-inspect-1.0 "$e" >/dev/null 2>&1 && ok "$e" || bad "$e"
-done
-# h26xparse live in plugins-bad; the record pipeline will not link without them
-for e in h265parse h264parse; do
-  gst-inspect-1.0 "$e" >/dev/null 2>&1 && ok "$e" || bad "$e (gstreamer1.0-plugins-bad)"
-done
-# The hardware encoder - vendor-supplied, not a stock Debian package
-for e in mpph265enc mpph264enc; do
-  if gst-inspect-1.0 "$e" >/dev/null 2>&1; then
-    ok "$e"
-  else
-    bad "$e - the Rockchip MPP plugin is missing. It ships with the Radxa OS
-          image; on a plain Debian install add Radxa's apt repo and install
-          their gstreamer-rockchip package. Without it there is no hardware
-          encoder and recording will not run."
-  fi
-done
-
-# ---------------------------------------------------------------- camera stack
-echo
-echo "==> Camera pipeline"
-
-# Ask sysfs, not lsmod: on this rig the driver is COMPILED IN
-# (CONFIG_VIDEO_IMX477=y - see rock5t-camera/kernel-build/README.md), so lsmod
-# shows nothing even when it is working. The driver directory exists either way.
-# Bound sensors appear inside it as <bus>-<addr> symlinks. Also avoids i2cdetect,
-# which needs root and would report a false miss under a plain ./setup.sh.
-DRV=/sys/bus/i2c/drivers/imx477
-if [ -d "$DRV" ]; then
-  ok "imx477 driver registered"
-else
-  bad "imx477 driver not registered - see rock5t-camera/driver/NOTES.md"
+if [ -n "$missing" ]; then
+  echo "Missing:$missing"
+  echo "Install with Homebrew:  brew install python cmake opencv ffmpeg"
+  exit 1
 fi
 
-bound=$(ls -1 "$DRV" 2>/dev/null | grep -E '^[0-9]+-00[0-9a-f]+$' | tr '\n' ' ')
-nb=$(echo $bound | wc -w | tr -d " ")
-if [ "$nb" -eq 2 ]; then
-  ok "both sensors bound: $bound"
-elif [ "$nb" -gt 0 ]; then
-  bad "only $nb sensor bound ($bound), want 2 (3-001a + 4-001a) - check the other ribbon"
-else
-  bad "no sensor bound to the imx477 driver - check the ribbons + overlay
-          manual look: sudo i2cdetect -y 3   (UU at 0x1a = bound)"
+echo "==> Python environment (.venv)"
+[ -x .venv/bin/python ] || python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip -q
+.venv/bin/python -m pip install -r requirements.txt -q
+.venv/bin/python -c "import cv2, numpy; print('    OpenCV', cv2.__version__, '· numpy', numpy.__version__)"
+
+echo "==> Studio's C++ tools (studio/native/build)"
+if ! cmake -S studio/native -B studio/native/build >/dev/null; then
+  echo "    CMake could not configure the build - is OpenCV installed?  brew install opencv"
+  exit 1
 fi
+cmake --build studio/native/build -j >/dev/null
+ls studio/native/build/StitchPipeline studio/native/build/Director | sed 's/^/    /'
 
-mainpaths=$(for v in /sys/class/video4linux/video*; do
-              grep -q rkisp_mainpath "$v/name" 2>/dev/null && echo "/dev/$(basename "$v")"
-            done | sort | tr '\n' ' ')
-n=$(echo $mainpaths | wc -w | tr -d " ")
-[ "$n" -eq 2 ] && ok "2 rkisp mainpath nodes: $mainpaths" \
-               || bad "found $n rkisp mainpath nodes, want 2: ${mainpaths:-none}
-          check: v4l2-ctl --list-devices"
-
-# rkaiq_3A.service is a oneshot wrapper that kills its own daemon at start, so
-# the UNIT can read "active" with nothing actually running. Check the process.
-if pgrep -x rkaiq_3A_server >/dev/null 2>&1; then
-  ok "rkaiq_3A_server running"
-else
-  bad "rkaiq_3A_server not running - the ISP needs it (sudo rkaiq_3A_server &)
-          note: the systemd unit is unreliable here, see rock5t-camera/NEXT_STEPS.md"
-fi
-
-[ -f /etc/iqfiles/imx477_RPI-HQ_default.json ] \
-  && ok "IQ file installed" \
-  || bad "/etc/iqfiles/imx477_RPI-HQ_default.json missing
-          cp rock5t-camera/iqfiles/imx477_RPI-HQ_default.json /etc/iqfiles/"
-
-# ---------------------------------------------------------------- service
-# The installed unit is a COPY in /etc - re-cloning the repo to a new path does
-# not update it, and systemd caches it besides. A unit whose ExecStart points at
-# a deleted checkout fails silently at boot, so check the path it actually holds,
-# not just that the file exists.
-echo
-echo "==> Web panel service"
-UNIT=/etc/systemd/system/veery.service
-REPO_UNIT="$(cd "$(dirname "$0")" && pwd)/rock5t-camera/recorder/veery.service"
-FIXCMD="sudo cp $REPO_UNIT /etc/systemd/system/ &&
-          sudo systemctl daemon-reload && sudo systemctl enable --now veery"
-
-if [ ! -f "$UNIT" ]; then
-  bad "veery.service not installed
-          $FIXCMD"
-else
-  exec_path=$(sed -n 's/^ExecStart=[^ ]* \(.*\)$/\1/p' "$UNIT" | head -1)
-  if [ -n "$exec_path" ] && [ ! -f "$exec_path" ]; then
-    bad "veery.service points at a path that does not exist:
-            $exec_path
-          (stale after moving or re-cloning the repo) - reinstall it:
-          $FIXCMD"
-  else
-    ok "veery.service installed ($exec_path)"
-    systemctl is-enabled --quiet veery 2>/dev/null \
-      && ok "veery enabled at boot" \
-      || warn "veery not enabled at boot (sudo systemctl enable veery)"
-    if systemctl is-active --quiet veery 2>/dev/null; then
-      ok "veery running"
-    else
-      warn "veery not running (sudo systemctl start veery)
-          normal if you stopped it to run something else against the cameras"
-    fi
-  fi
-fi
-
-# ---------------------------------------------------------------- storage
-echo
-echo "==> Storage"
-REC_DIR="$HOME/recordings"
-if [ -d "$REC_DIR" ]; then
-  ok "$REC_DIR present ($(df -h "$REC_DIR" | awk 'NR==2{print $4}') free)"
-else
-  warn "$REC_DIR does not exist yet - the panel creates it on first record"
-fi
-
-echo
-if [ "$fail" -eq 0 ]; then
-  echo "All checks passed."
-else
-  echo "Some checks FAILED (see MISS above) - recording will not work until they pass."
-fi
-echo
-echo "Web panel:           sudo python3 rock5t-camera/recorder/veery_server.py"
-echo "                     (then http://<rock-ip>:8080)"
-exit "$fail"
+echo "Ready. Start Studio with:  studio/studio.command"

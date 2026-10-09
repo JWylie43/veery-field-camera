@@ -1,4 +1,0 @@
-# Veery Studio's Python dependencies (installed into studio/.venv by setup.sh).
-# OpenCV stays on 4.x: the alignment measurements were validated against it.
-numpy>=2.0
-opencv-python-headless>=4.10,<5

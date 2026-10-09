@@ -260,7 +260,8 @@ print('AE DySetpoint:', _old, '->', _new, '(~+0.7EV daylight)')
 # at 42/255 while the sky idles at 117 with 0.4% clip. Game film cares about
 # the FIELD; sky detail is worthless. Weight: field rows x4, horizon x2,
 # sky rows x1 (sky still counts a little, so it doesn't blow out wildly).
-# Exposure stays single-brain across cameras (cam0 AE, ae_follower mirrors).
+# Both cameras load this same file, so each runs its own AE with identical settings;
+# the stitcher matches their brightness per frame.
 #
 # ORIENTATION: grid rows are sensor rows. Cameras are currently mounted
 # UPSIDE DOWN (scene sky lands on sensor-bottom rows). After the re-mount,

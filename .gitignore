@@ -17,17 +17,12 @@ venv/
 # snapshot images and the generated board/sample images
 calibration/images-cam*/
 calibration/images-pairs/
-charuco_board.png
 *_undistort_sample.jpg
 *_rectified_sample.jpg
 *_reprojection_sample.jpg
 
-# Stitching: keep source (stitch_pipeline.cpp/CMakeLists/include/pair_check.py);
-# ignore build output and generated renders
-stitching/build/
-stitching/*_out/
-stitching/output/
-stitching/pipeline_out/
+# Studio's C++ tools: ignore the build output
+studio/native/build/
 *.bin
 
 # Kernel build tree (rock5t-camera/kernel-build/build-kernel.sh clones into it)
@@ -43,4 +38,8 @@ rock5t-camera/kernel-build/out/
 
 # studio/refine_extrinsics.py --apply backups (of calibration/stereo_extrinsics.json)
 calibration/*.bak-*
-studio/studio.log*
+studio/logs/
+
+# Rock image builds: Radxa base image, kernel downloads, scratch and output
+rock5t-camera/image-build/work/
+rock5t-camera/image-build/out/

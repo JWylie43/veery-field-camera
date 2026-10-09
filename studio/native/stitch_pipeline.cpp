@@ -1,6 +1,6 @@
 // stitch_pipeline.cpp - calibration-driven cylindrical stitch (C++), NO feature detection.
 //
-// Reads the Veery rig's calibration (cam0/cam1 fisheye intrinsics + stereo
+// Reads the camera rig's calibration (cam0/cam1 fisheye intrinsics + stereo
 // extrinsics from calibration/) and stitches the two camera feeds into a
 // cylindrical panorama, aligning them from the extrinsic rotation R. No BRISK /
 // matcher / findHomography anywhere.
@@ -13,10 +13,11 @@
 // barrel; a pinhole+polynomial fit leaves a uniform ~2.6px residual, so
 // calibrate.py writes "model":"fisheye" and loadIntrinsics rejects anything else.
 //
-// Modes:
+// A command-line tool: Studio (studio/) runs it for every stitch - its stitch
+// page is where the shear, rotation and crop box are chosen - and passes the
+// settings as flags. It can also be run by hand:
 //   image source (.jpg/.png/...) -> stitch the one pose      -> pano.jpg
 //   video source (.mp4/.mkv/...) -> loop frames [start..end] -> stitched_video.mp4
-//   --tune  -> launch an interactive browser tuner (see below)
 //
 // cam1 alignment (folded into cam1's remap table, with the rotation and crop):
 //   --shift-top N     horizontal shift of the TOP rows   (aligns the FAR edge)
@@ -25,10 +26,6 @@
 // If top != bottom this is a vertical SHEAR: the per-row horizontal shift is
 // interpolated between the two, so a receding field (near at the bottom, far at the
 // top) lines up along a straight vertical seam. (--shift-x N sets top=bottom=N.)
-//
-// --tune warps the first frame once, starts a localhost web server, opens a browser
-// to a live tuner where you adjust those values and click "Stitch all frames" to run
-// the full stitch (progress bar + done). One command; UI opens itself.
 //
 // Video renders as a pipeline in ONE process (see FramePipeline): decode -> remap +
 // exposure -> seam -> blend -> encode, several frames in flight, worker threads taking
@@ -68,7 +65,7 @@
 // than a fixed number, so a crop or a --scale gets a sensible rate by itself.
 // --bitrate 90M still pins an explicit rate. H.264 remains only as a fallback.
 //
-// Build:  cmake -S . -B build && cmake --build build
+// Build (from studio/native):  cmake -S . -B build && cmake --build build
 
 #include <opencv2/core.hpp>
 #include <opencv2/core/ocl.hpp>
@@ -96,35 +93,11 @@
 #include <csignal>
 #include "json.hpp"
 
-#ifdef _WIN32
-  #include <winsock2.h>
-  #include <ws2tcpip.h>
-  #include <windows.h>          // GetModuleFileNameA (locate our own exe)
-  using socket_t = SOCKET;
-  #define CLOSESOCK closesocket
-#else
-  #include <sys/socket.h>
-  #include <netinet/in.h>
-  #include <arpa/inet.h>
-  #include <unistd.h>
-  #include <fcntl.h>               // FD_CLOEXEC on child-process pipes
-  using socket_t = int;
-  #define CLOSESOCK close
-  #define INVALID_SOCKET (-1)
-#endif
+#include <unistd.h>
+#include <fcntl.h>               // FD_CLOEXEC on child-process pipes
 
 #ifdef __APPLE__
   #include <mach-o/dyld.h>      // _NSGetExecutablePath (locate our own exe)
-#endif
-
-#ifdef _WIN32
-  #define popen _popen
-  #define pclose _pclose
-  #define PIPE_WMODE "wb"        // binary: Windows text mode would mangle raw frames with CRLF
-  #define PIPE_RMODE "rb"
-#else
-  #define PIPE_WMODE "w"         // POSIX popen only takes "r"/"w"; no 'b' flag
-  #define PIPE_RMODE "r"
 #endif
 
 using json = nlohmann::json;
@@ -132,7 +105,7 @@ using namespace std;
 using namespace cv;
 namespace fs = std::filesystem;
 
-static int runShell(string cmd);   // forward decl (defined near main); the encoder helpers below use it
+static int runShell(const string &cmd);   // forward decl (defined near main); the encoder helpers below use it
 
 // ---- video-encoder selection (set from CLI in main) ---------------------
 // The stitch always re-encodes, so we hand raw frames to ffmpeg and let it use a
@@ -174,8 +147,8 @@ struct CamModel
 };
 
 // The full cylindrical canvas: its geometry (so any canvas point can be re-projected
-// into either camera) plus float remap tables over the whole canvas, which the tuner's
-// live preview draws from.
+// into either camera) plus float remap tables over the whole canvas (used to find
+// where the two cameras overlap).
 struct StitchMaps
 {
     Mat mapLx, mapLy, mapRx, mapRy;
@@ -218,16 +191,6 @@ struct Align
     bool exposure = false; // match right image brightness/color to left (per channel)
     bool smartSeam = false; // route the seam around moving objects (min-difference path)
 };
-
-// Shared progress state for the --tune server (stitch runs on a worker thread).
-static std::atomic<int> g_percent{0};
-static std::atomic<bool> g_busy{false};
-static std::atomic<bool> g_done{false};
-static std::mutex g_mu;
-static string g_result;
-// The exact equivalent CLI command for the last/active stitch (shown in the tuner UI
-// and console) so you can reproduce a tuned render manually.
-static string g_cmd;
 
 // The rig's CIL391 lenses (110 deg, -16% barrel) are fisheyes and only fit the
 // equidistant model - a pinhole+polynomial fit leaves a uniform ~2.6px residual.
@@ -418,7 +381,7 @@ static ViewBox clampBox(const StitchMaps &m, ViewBox b)
 // The seam's home column is a vertical line on the canvas: it belongs to the cameras
 // (where their views overlap), not to the output. It is carried through the same
 // rotation, so in the output it tilts with the picture and the seam stays on the same
-// camera-relative line at any angle - exactly what the tuner preview draws.
+// camera-relative line at any angle - exactly what Studio's stitch preview draws.
 static RenderMaps buildRenderMaps(const StitchMaps &m, ViewBox b, const Align &a)
 {
     b = clampBox(m, b);
@@ -489,18 +452,10 @@ static RenderMaps buildRenderMaps(const StitchMaps &m, ViewBox b, const Align &a
     return r;
 }
 
-// Tuner preview: each camera warped onto the full (un-rotated, un-sheared) canvas; the
-// browser applies shear/rotation/crop live on top.
-static void warpPreview(const Mat &fL, const Mat &fR, const StitchMaps &m, Mat &wL, Mat &wR)
-{
-    remap(fL, wL, m.mapLx, m.mapLy, INTER_LINEAR, BORDER_CONSTANT);
-    remap(fR, wR, m.mapRx, m.mapRy, INTER_LINEAR, BORDER_CONSTANT);
-}
-
 // Seam path for this frame: per row, the output column where the cut sits (left of it
 // = left camera). Smart seam: min-cost top-to-bottom path through the KNOWN overlap so
 // the cut weaves AROUND moving objects. Cost = image difference + a pull toward the
-// home line (the tuner's draggable bar, else the overlap centre - tilted with any
+// home line (--seam, else the overlap centre - tilted with any
 // rotation) + a temporal term (stick to the previous frame's seam) so wind/noise
 // doesn't make the seam jitter frame-to-frame - it only moves when a player forces it.
 // The home pull only sets where the seam sits through flat regions. L/R are the
@@ -907,7 +862,7 @@ private:
 // and hands back the LEFT and RIGHT frames of each pair as they decode - separately,
 // so each remap reads straight from its own camera's frame with no copies between.
 //
-// Pairing is driven by the FILENAME so that the CLI and the tuner
+// Pairing is driven by the FILENAME so that the CLI and Studio
 // share it with no extra plumbing:
 //     --source take_..._cam0.mkv       ->  also opens take_..._cam1.mkv (either half works;
 //                                          so do the /calib page's cam0_NNN / cam1_NNN)
@@ -925,7 +880,7 @@ static bool g_pairResolved = false;
 
 // Which camera is the LEFT image is decided by the calibration, not the file
 // names: if the extrinsic yaw puts cam1 to the LEFT of cam0 (as it does once the
-// rig saves its upside-down sensors rotated 180 - see calibration/rotate180.py),
+// rig saves its upside-down sensors rotated 180),
 // main() sets this and the whole pipeline runs with cam1 as left, cam0 as right.
 // File names, --pair-offset and printed offsets stay in cam0/cam1 terms.
 static bool g_swapLR = false;
@@ -1000,7 +955,7 @@ static bool resolvePairPaths(const string &src, string &L, string &R)
 // whatever fits the analysed window, but the true offset drifts across a take,
 // so no single number stays right. With XVS genlock the offset is a genuine
 // constant and this is exact.
-// EXACT offset for takes from the shared-clock recorder. veery_server.py records
+// EXACT offset for takes from the shared-clock recorder. The recorder (server.py) records
 // both cameras in ONE GStreamer pipeline (one clock, one base time), starts each
 // file at its camera's first real frame and keeps that frame's real timestamp,
 // and tags both files SHARED_CLOCK_TAG. With genlock the two start times differ
@@ -1009,7 +964,8 @@ static bool resolvePairPaths(const string &src, string &L, string &R)
 // false and fall back to estimatePairOffset below. Result is in cam0/cam1 terms.
 // (matroskamux stores taginject's comment on the video TRACK - "COMMENTS" in the
 // stream tags - so both tag levels are searched.)
-static const char *SHARED_CLOCK_TAG = "veery-shared-clock";
+// Matched anywhere in the tag, so takes recorded under its older, longer name count too.
+static const char *SHARED_CLOCK_TAG = "shared-clock";
 static string runCmd(const string &cmd);
 
 static bool sharedClockOffset(const string &cam0, const string &cam1, int &offset)
@@ -1120,11 +1076,7 @@ static int estimatePairOffset(const string &lp, const string &rp,
 // never sees its reader go away and never exits (a hang at the end of a render).
 static void noInherit(FILE *f)
 {
-#ifndef _WIN32
     if (f) fcntl(fileno(f), F_SETFD, FD_CLOEXEC);
-#else
-    (void)f;
-#endif
 }
 
 class FfmpegVideo
@@ -1217,7 +1169,7 @@ private:
         // bottleneck), converted to BGR here with the file's own range and matrix
         c << " -ss " << std::fixed << std::setprecision(6) << t << " -i \"" << path_ << "\" -map 0:v:0"
           << " -f rawvideo -pix_fmt yuv420p -";
-        pipe_ = popen(c.str().c_str(), PIPE_RMODE);
+        pipe_ = popen(c.str().c_str(), "r");
         noInherit(pipe_);
         return pipe_ != nullptr;
     }
@@ -1477,11 +1429,7 @@ static string stitchImageFile(const string &source, const RenderMaps &rm,
 // Quiet, side-effect-free test that ffmpeg exists and that a given encoder actually
 // initializes on THIS machine (a hardware encoder can be listed yet fail to open).
 static string devNull() {
-#ifdef _WIN32
-    return "> NUL 2>&1";
-#else
     return "> /dev/null 2>&1";
-#endif
 }
 static bool ffmpegAvailable() { return runShell("ffmpeg -version " + devNull()) == 0; }
 static bool encoderInitializes(const string &name, int w = 64, int h = 64)
@@ -1566,8 +1514,7 @@ static string buildEncodeCmd(const string &venc, int W, int H, double fps, const
 
 static string stitchVideoFile(const string &source, const RenderMaps &rm,
                               const Align &a, int startFrame, int endFrame, int totalFrames,
-                              const string &outDir, const string &outFile = "",
-                              std::atomic<int> *prog = nullptr)
+                              const string &outDir, const string &outFile = "")
 {
     PairCapture cap(source);
     if (!cap.isOpened()) return "ERROR: cannot open video";
@@ -1593,7 +1540,7 @@ static string stitchVideoFile(const string &source, const RenderMaps &rm,
         cout << "encoder: " << venc << " (ffmpeg pipe, "
              << resolveBitrate(venc, osz.width, osz.height, fps)
              << (g_vbitrate == "auto" ? " auto" : "") << ")\n";
-        pipe = popen(buildEncodeCmd(venc, osz.width, osz.height, fps, out).c_str(), PIPE_WMODE);
+        pipe = popen(buildEncodeCmd(venc, osz.width, osz.height, fps, out).c_str(), "w");
         noInherit(pipe);
         if (!pipe) useFfmpeg = false;   // couldn't spawn - fall back below
     }
@@ -1629,7 +1576,6 @@ static string stitchVideoFile(const string &source, const RenderMaps &rm,
         if (bounded)
         {
             int pct = (int)(100.0 * written / total);
-            if (prog) prog->store(pct);
             if (written % 30 == 0 || i == e) cout << "  " << pct << "%  (frame " << i << ")\n";
         }
         else if (written % 30 == 0) cout << "  frame " << i << "\n";
@@ -1646,422 +1592,6 @@ static string stitchVideoFile(const string &source, const RenderMaps &rm,
     else writer.release();
     if (!err.empty()) return err;
     return out + "  (" + to_string(written) + " frames)";
-}
-
-static string base64(const vector<uchar> &data)
-{
-    static const char *t = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    string out;
-    int val = 0, bits = -6;
-    for (uchar c : data)
-    {
-        val = (val << 8) + c;
-        bits += 8;
-        while (bits >= 0) { out.push_back(t[(val >> bits) & 0x3F]); bits -= 6; }
-    }
-    if (bits > -6) out.push_back(t[((val << 8) >> (bits + 8)) & 0x3F]);
-    while (out.size() % 4) out.push_back('=');
-    return out;
-}
-
-// Defined later; needed by the tuner's on-demand source loader.
-static bool isVideoFile(const string &path);
-static int probeFrames(const string &source, double fps);
-
-// Escape a string for embedding in JSON (handles Windows backslashes + quotes).
-static string jsonEscape(const string &s)
-{
-    string o;
-    for (char c : s)
-    {
-        if (c == '\\' || c == '"') { o.push_back('\\'); o.push_back(c); }
-        else if (c == '\n') o += "\\n";
-        else o.push_back(c);
-    }
-    return o;
-}
-
-// The tuner page. Starts with no source loaded; the browser's "Import source"
-// button (and /state on load) fill in the preview dynamically.
-static string tunerHtml()
-{
-    ostringstream h;
-    h << "<!doctype html><html><head><meta charset='utf-8'><title>Stitch tuner</title>"
-      << R"HTML(<style>
- body{margin:0;font-family:system-ui,sans-serif;background:#111;color:#eee}
- #bar{padding:10px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;background:#1b1b1b;position:sticky;top:0;z-index:2}
- button{font-size:15px;padding:5px 10px;border:0;border-radius:6px;background:#2a6f9e;color:#fff;cursor:pointer}
- #stitch{background:#1f8a3b;font-weight:700} #quit{background:#8a3b1f} #finish{background:#555}
- .grp{display:flex;gap:6px;align-items:center;border:1px solid #333;padding:5px 9px;border-radius:8px;font-size:14px}
- .val{width:60px;text-align:center;font-variant-numeric:tabular-nums;font-size:15px;background:#222;color:#eee;border:1px solid #444;border-radius:5px;padding:3px}
- .path{width:230px;font-size:12px;background:#222;color:#9cf;border:1px solid #444;border-radius:5px;padding:3px}
- #import{background:#6a4fb3;font-weight:700} button:disabled{opacity:.45;cursor:not-allowed}
- #wrap{overflow:auto} canvas{display:block;max-width:100%;background:#000}
- #status{padding:6px 10px;color:#9cf} .hint{color:#888;font-size:12px}
-</style></head><body>
-<div id="bar">
-  <div class="grp"><button id="import">Import source…</button><input class="path" id="srcpath" type="text" readonly placeholder="no file loaded"></div>
-  <div class="grp">Output <input class="path" id="outpath" type="text" readonly placeholder="not chosen yet"><button id="chooseout">Choose…</button></div>
-  <div class="grp">Shift far (top) <button id="tl">&#9664;</button><input class="val" id="tv" type="number" value="0"><button id="tr">&#9654;</button></div>
-  <div class="grp">Shift near (bottom) <button id="bl">&#9664;</button><input class="val" id="bv" type="number" value="0"><button id="br">&#9654;</button></div>
-  <div class="grp">Rotate&deg; <button id="rl">&#9664;</button><input class="val" id="rot" type="number" value="0" step="0.5"><button id="rr">&#9654;</button></div>
-  <div class="grp"><label><input type="checkbox" id="showseam" checked> show seam line</label>
-                   <label><input type="checkbox" id="crop" checked> crop to box</label> <span class="hint" id="cropdim"></span></div>
-  <div class="grp"><label><input type="checkbox" id="blend"> overlap blend</label></div>
-  <!-- Fixed defaults, not exposed: shift-y 0, seam at the middle of the overlap,
-       smart seam (routes around moving objects), 6-band blend, exposure match. -->
-  <div class="grp" id="framegrp">Frame <button id="fprev">&#9664;</button><input type="range" id="frange" min="0" value="0" style="vertical-align:middle;width:140px"><input class="val" id="fval" type="number" value="0"><span id="ftot" style="color:#9cf">/ ?</span><button id="fnext">&#9654;</button></div>
-  <button id="stitch" disabled>Stitch all frames</button>
-  <button id="quit">Quit</button>
-  <span class="hint">&#8592;/&#8594; shift both</span>
-</div>
-<div id="status">Click "Import source…" to choose a video or image.</div>
-<div id="prog" style="padding:0 10px 10px;display:none">
-  <progress id="pb" max="100" value="0" style="width:280px;height:16px;vertical-align:middle"></progress>
-  <span id="pct" style="margin-left:8px">0%</span>
-  <button id="finish" style="display:none;margin-left:12px">Finish &amp; stop</button>
-</div>
-<div id="cmdwrap" style="display:none;padding:0 10px 10px">
-  <div style="font-size:.8em;color:#9cf;margin-bottom:4px">Equivalent CLI command for these settings (click to select, then copy):</div>
-  <textarea id="cmdbox" readonly onclick="this.select()" style="width:100%;height:64px;font-family:monospace;font-size:.78em;background:#111;color:#dfe;border:1px solid #444;border-radius:6px;padding:6px;box-sizing:border-box"></textarea>
-</div>
-<div id="wrap"><canvas id="c"></canvas></div>
-<script>
-// Dynamic state — filled in by /state (on load) or /import (button).
-let OW=0, OH=0, SEAM0=0, TOTAL=1, VIDEO=false, loaded=false;
-const cv=document.getElementById('c'), ctx=cv.getContext('2d');
-const stepv=()=>{ return 1; };   // arrows nudge by 1
-const st=t=>{ document.getElementById('status').textContent=t; };
-const tv=document.getElementById('tv'), bv=document.getElementById('bv');
-const stitchBtn=document.getElementById('stitch');
-let sTop=0, sBot=0, sY=0, seam=0, pending=0;   // sY fixed; seam fixed at the middle of the overlap
-let rot=0, showSeam=true;   // rot = whole-panorama rotation (deg); showSeam toggles the red line
-const clmp=(v,lo,hi)=>{ return Math.max(lo,Math.min(hi,v)); };
-// Crop box (in OW/OH panorama coords). cropOn toggles it; drag body to move,
-// drag the top-left / bottom-right handles to resize.
-let cropOn=true, cropX=0, cropY=0, cropW=0, cropH=0, dragMode=null, dragStart=null, cropStart=null;
-const imgL=new Image(), imgR=new Image();
-function both(){ if(--pending<=0){ pending=0; render(); } }
-imgL.onload=imgR.onload=both;
-function drawRight(){
-  const k=(OH>1)?(sBot-sTop)/(OH-1):0;         // per-row shear slope
-  ctx.save(); ctx.transform(1,0,k,1,sTop,sY); ctx.drawImage(imgR,0,0); ctx.restore();
-}
-function render(){
-  if(!loaded) return;
-  sTop=+tv.value||0; sBot=+bv.value||0;   // sY and the seam stay fixed
-  ctx.setTransform(1,0,0,1,0,0); ctx.globalAlpha=1; ctx.clearRect(0,0,OW,OH);
-  // Preview the whole-panorama rotation the same way the engine does: rotate about the
-  // canvas centre. The crop box stays axis-aligned (drawn after we restore).
-  ctx.save();
-  if(rot){ ctx.translate(OW/2,OH/2); ctx.rotate(rot*Math.PI/180); ctx.translate(-OW/2,-OH/2); }
-  if(document.getElementById('blend').checked){
-    ctx.globalAlpha=0.5; ctx.drawImage(imgL,0,0); drawRight(); ctx.globalAlpha=1;
-  } else {
-    ctx.drawImage(imgL,0,0);
-    ctx.save(); ctx.beginPath(); ctx.rect(seam,0,OW-seam,OH); ctx.clip(); drawRight(); ctx.restore();
-  }
-  if(showSeam){
-    ctx.strokeStyle='#f33'; ctx.lineWidth=2;
-    ctx.beginPath(); ctx.moveTo(seam,0); ctx.lineTo(seam,OH); ctx.stroke();
-  }
-  ctx.restore();
-  if(cropOn) drawCrop();
-}
-function drawCrop(){
-  if(cropW<=0){ cropX=Math.round(OW*0.05); cropY=Math.round(OH*0.05); cropW=Math.round(OW*0.9); cropH=Math.round(OH*0.9); }
-  cropX=clmp(cropX,0,OW-1); cropY=clmp(cropY,0,OH-1);
-  cropW=clmp(cropW,1,OW-cropX); cropH=clmp(cropH,1,OH-cropY);
-  ctx.save();
-  ctx.fillStyle='rgba(0,0,0,0.55)';                       // dim everything outside the box
-  ctx.fillRect(0,0,OW,cropY);
-  ctx.fillRect(0,cropY+cropH,OW,OH-(cropY+cropH));
-  ctx.fillRect(0,cropY,cropX,cropH);
-  ctx.fillRect(cropX+cropW,cropY,OW-(cropX+cropW),cropH);
-  ctx.strokeStyle='#ff0'; ctx.lineWidth=2; ctx.strokeRect(cropX,cropY,cropW,cropH);
-  const hs=Math.max(10,OW*0.01); ctx.fillStyle='#ff0';
-  ctx.fillRect(cropX-hs/2,cropY-hs/2,hs,hs);              // top-left handle
-  ctx.fillRect(cropX+cropW-hs/2,cropY+cropH-hs/2,hs,hs);  // bottom-right handle
-  ctx.restore();
-  document.getElementById('cropdim').textContent=Math.round(cropW)+'x'+Math.round(cropH);
-}
-const nudge=(el,d)=>{ el.value=(+el.value||0)+d; changed(); };
-tl.onclick=()=>{ nudge(tv,-stepv()); }; tr.onclick=()=>{ nudge(tv,stepv()); };
-bl.onclick=()=>{ nudge(bv,-stepv()); }; br.onclick=()=>{ nudge(bv,stepv()); };
-[tv,bv].forEach(el=>{ el.oninput=changed; });
-// Whole-panorama rotation (levels a tilted field) + show/hide the red seam line.
-const rotEl=document.getElementById('rot');
-const setRot=v=>{ rot=Math.round(v*10)/10; if(rotEl) rotEl.value=rot; changed(); };
-if(rotEl){ rotEl.oninput=()=>{ rot=+rotEl.value||0; changed(); }; }
-const rlb=document.getElementById('rl'), rrb=document.getElementById('rr');
-if(rlb){ rlb.onclick=()=>{ setRot((+rotEl.value||0)-0.5); }; }
-if(rrb){ rrb.onclick=()=>{ setRot((+rotEl.value||0)+0.5); }; }
-const ssEl=document.getElementById('showseam');
-if(ssEl){ ssEl.onchange=()=>{ showSeam=ssEl.checked; render(); }; }
-document.getElementById('blend').onchange=render;
-// Crop box: drag body to move, drag the yellow corner handles to resize.
-const toCanvas=(e)=>{ return { x: e.offsetX * OW / cv.clientWidth, y: e.offsetY * OH / cv.clientHeight }; };
-cv.onmousedown=(e)=>{
-  if(!loaded || !cropOn) return;
-  const p=toCanvas(e);
-  const hs=Math.max(14, OW*0.016);
-  const nBR=Math.abs(p.x-(cropX+cropW))<hs && Math.abs(p.y-(cropY+cropH))<hs;
-  const nTL=Math.abs(p.x-cropX)<hs && Math.abs(p.y-cropY)<hs;
-  if(nBR) dragMode='br'; else if(nTL) dragMode='tl';
-  else if(p.x>cropX && p.x<cropX+cropW && p.y>cropY && p.y<cropY+cropH) dragMode='move';
-  else dragMode=null;
-  if(dragMode){ dragStart=p; cropStart={x:cropX,y:cropY,w:cropW,h:cropH}; e.preventDefault(); }
-};
-cv.onmousemove=(e)=>{
-  if(!dragMode) return;
-  const p=toCanvas(e);
-  const dx=p.x-dragStart.x, dy=p.y-dragStart.y;
-  if(dragMode==='move'){ cropX=clmp(cropStart.x+dx,0,OW-cropW); cropY=clmp(cropStart.y+dy,0,OH-cropH); }
-  else if(dragMode==='br'){ cropW=clmp(cropStart.w+dx,20,OW-cropX); cropH=clmp(cropStart.h+dy,20,OH-cropY); }
-  else if(dragMode==='tl'){
-    const nx=clmp(cropStart.x+dx,0,cropStart.x+cropStart.w-20), ny=clmp(cropStart.y+dy,0,cropStart.y+cropStart.h-20);
-    cropW=cropStart.w+(cropStart.x-nx); cropH=cropStart.h+(cropStart.y-ny); cropX=nx; cropY=ny;
-  }
-  render();
-};
-addEventListener('mouseup',()=>{ if(dragMode){ dragMode=null; showCmd(); } });
-document.getElementById('crop').onchange=(e)=>{
-  cropOn=e.target.checked;
-  if(!cropOn) document.getElementById('cropdim').textContent='';
-  changed();
-};
-addEventListener('keydown',e=>{
-  if(e.target.tagName==='INPUT') return;      // let typing in the boxes work normally
-  const d=stepv();
-  if(e.key==='ArrowLeft'){tv.value=(+tv.value||0)-d; bv.value=(+bv.value||0)-d; changed(); e.preventDefault();}
-  else if(e.key==='ArrowRight'){tv.value=(+tv.value||0)+d; bv.value=(+bv.value||0)+d; changed(); e.preventDefault();}
-});
-// frame scrubbing (video only)
-const frange=document.getElementById('frange'), fval=document.getElementById('fval');
-const ftxt=n=>{ return 'Frame '+n+(TOTAL>1?(' / '+TOTAL):''); };
-function loadFrame(n){
-  if(!loaded) return;
-  const FMAX = TOTAL>1 ? TOTAL-1 : 100000;
-  n=Math.max(0,Math.min(FMAX,parseInt(n)||0)); frange.value=n; fval.value=n;
-  st('Loading '+ftxt(n)+'…');
-  fetch('/frame?n='+n).then(r=>{return r.json();}).then(d=>{
-    if(d.error){ st('frame error: '+d.error); return; }
-    pending=2; imgL.src=d.left; imgR.src=d.right; st(ftxt(n));
-  }).catch(e=>{ st('frame load error: '+e); });
-}
-document.getElementById('fprev').onclick=()=>{ loadFrame((+frange.value||0)-1); };
-document.getElementById('fnext').onclick=()=>{ loadFrame((+frange.value||0)+1); };
-frange.onchange=()=>{ loadFrame(frange.value); };
-fval.onchange=()=>{ loadFrame(fval.value); };
-
-// Apply a loaded source (from /state or /import): size the canvas, wire the
-// frame slider, show the first frame, and enable stitching.
-function applyLoad(d){
-  loaded=true; OW=d.ow; OH=d.oh; SEAM0=d.seam; TOTAL=d.total; VIDEO=d.video; seam=SEAM0;
-  // this take's measured shear (studio/refine_extrinsics.py --align), if it has one
-  if(d.align){ tv.value=d.align.shiftTop; bv.value=d.align.shiftBottom; }
-  rot=0; { const r=document.getElementById('rot'); if(r) r.value=0; }   // reset rotation for a new source
-  cropW=0;   // re-initialise the crop box to the new frame size on next draw
-  cv.width=OW; cv.height=OH;
-  document.getElementById('srcpath').value=d.source||'';
-  document.getElementById('outpath').value=d.output||'';
-  const known=TOTAL>1, FMAX=known?TOTAL-1:100000;
-  frange.max=FMAX; frange.value=0; fval.value=0; fval.max=FMAX;
-  document.getElementById('ftot').textContent = known ? ('/ '+TOTAL) : '/ ?';
-  document.getElementById('framegrp').style.display = VIDEO ? '' : 'none';
-  stitchBtn.disabled=false;
-  pending=2; imgL.src=d.left; imgR.src=d.right;
-  st('Loaded. Align the far (top) and near (bottom) edges, then Stitch.');
-  showCmd();
-}
-document.getElementById('import').onclick=async()=>{
-  st('Choose an input file…');
-  try{
-    const d=await (await fetch('/import')).json();
-    if(d.cancelled){ st('Import cancelled.'); return; }
-    if(d.error){ st('Import error: '+d.error); return; }
-    applyLoad(d);
-  }catch(e){ st('Import failed: '+e); }
-};
-// On page load, adopt a source that was preloaded via --source (if any).
-(async()=>{
-  try{ const d=await (await fetch('/state')).json(); if(d.loaded) applyLoad(d); }catch(e){}
-})();
-
-let polling=null;
-const pb=document.getElementById('pb'), pct=document.getElementById('pct');
-// fixed defaults: shift-y 0, seam at the middle of the overlap, smart seam, 6-band blend, exposure match
-const params=()=>{
-  let p='shifttop='+(+tv.value||0)+'&shiftbottom='+(+bv.value||0)+'&shifty=0&degrees='+rot+'&bands=6&exposure=1&smartseam=1';
-  if(cropOn && cropW>0) p+='&cropx='+Math.round(cropX)+'&cropy='+Math.round(cropY)+'&cropw='+Math.round(cropW)+'&croph='+Math.round(cropH);
-  return p;
-};
-// Show the equivalent CLI command as soon as an output is chosen, and keep it in
-// step with every change - so a command can be copied without starting a stitch.
-const outEl=document.getElementById('outpath'), cmdWrap=document.getElementById('cmdwrap'), cmdBox=document.getElementById('cmdbox');
-let cmdTimer=null;
-function showCmd(){
-  if(!loaded || !outEl.value){ if(!polling) cmdWrap.style.display='none'; return; }
-  clearTimeout(cmdTimer);
-  cmdTimer=setTimeout(async()=>{
-    try{ const d=await (await fetch('/command?'+params())).json();
-         if(d.cmd){ cmdBox.value=d.cmd; cmdWrap.style.display='block'; } }catch(e){}
-  },250);
-}
-function changed(){ render(); showCmd(); }
-async function chooseOutput(){
-  st('Choose where to save the output…');
-  let out='';
-  try{ out=(await (await fetch('/chooseoutput')).json()).path||''; }
-  catch(e){ st('Could not open save dialog: '+e); return ''; }
-  if(!out){ st('Save cancelled.'); return ''; }
-  outEl.value=out; st('Output: '+out); showCmd();
-  return out;
-}
-document.getElementById('chooseout').onclick=()=>{ chooseOutput(); };
-stitchBtn.onclick=async()=>{
-  if(polling || !loaded) return;
-  // use the chosen output, or pop the "save as" dialog now if none was chosen yet
-  const out=outEl.value || await chooseOutput();
-  if(!out) return;
-  stitchBtn.disabled=true;
-  document.getElementById('prog').style.display='block';
-  document.getElementById('finish').style.display='none';
-  pb.value=0; pct.textContent='0%';
-  st('Stitching all frames → '+out+' …');
-  try{ const r=await fetch('/stitch?'+params());
-       const t=await r.text();
-       if(t==='busy'){ st('Already stitching…'); return; }
-       if(t==='notloaded'){ st('Import a source first.'); stitchBtn.disabled=false; return; } }
-  catch(e){ st('Error starting: '+e); stitchBtn.disabled=false; return; }
-  polling=setInterval(async()=>{
-    try{
-      const p=await (await fetch('/progress')).json();
-      pb.value=p.percent; pct.textContent=p.percent+'%';
-      if(p.cmd){ document.getElementById('cmdwrap').style.display='block';
-                 document.getElementById('cmdbox').value=p.cmd; }
-      if(p.done){
-        clearInterval(polling); polling=null;
-        stitchBtn.disabled=false;
-        pb.value=100; pct.textContent='100%';
-        st('✅ Done — saved to '+p.result);
-        document.getElementById('finish').style.display='inline-block';
-      }
-    }catch(e){}
-  },400);
-};
-document.getElementById('finish').onclick=async()=>{
-  try{await fetch('/quit');}catch(e){}
-  st('Finished — server stopped. You can close this tab.'); try{window.close();}catch(e){}
-};
-document.getElementById('quit').onclick=async()=>{ try{await fetch('/quit');}catch(e){} st('Stopped. You can close this tab.'); };
-</script></body></html>)HTML";
-    return h.str();
-}
-
-// Value of `key` in a query string, "" if absent. Matches WHOLE keys only: a
-// plain find("seam=") also hits "smartseam=1" and would read the seam as 1.
-static string qparam(const string &query, const string &key)
-{
-    string k = key + "=";
-    for (size_t p = query.find(k); p != string::npos; p = query.find(k, p + 1))
-    {
-        if (p != 0 && query[p - 1] != '&') continue;
-        size_t s = p + k.size(), e = query.find('&', s);
-        return query.substr(s, e == string::npos ? string::npos : e - s);
-    }
-    return "";
-}
-
-// Run a command and capture its stdout (trimmed). Used to drive the OS's
-// native file dialogs so the binary is self-contained (no wrapper script).
-static string runCapture(const string &cmd)
-{
-    string out;
-    FILE *p = popen(cmd.c_str(), "r");
-    if (!p) return "";
-    char buf[4096]; size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), p)) > 0) out.append(buf, n);
-    pclose(p);
-    while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
-    return out;
-}
-
-// Native "open file" dialog. Returns the chosen path, or "" if cancelled/unavailable.
-static string pickInputFile()
-{
-#ifdef _WIN32
-    // A TopMost owner form forces the dialog to the foreground (otherwise it
-    // opens behind the browser and you have to Alt+Tab to find it).
-    return runCapture("powershell -NoProfile -Command \"Add-Type -AssemblyName System.Windows.Forms;"
-                      "$o=New-Object System.Windows.Forms.Form -Property @{TopMost=$true};"
-                      "$d=New-Object System.Windows.Forms.OpenFileDialog;"
-                      "$d.Title='Select the input video or image';"
-                      "if($d.ShowDialog($o) -eq 'OK'){$d.FileName}\" 2>NUL");
-#elif __APPLE__
-    return runCapture("osascript -e 'POSIX path of (choose file with prompt "
-                      "\"Select the input video or image\")' 2>/dev/null");
-#else
-    return runCapture("zenity --file-selection --title=\"Select the input video or image\" 2>/dev/null");
-#endif
-}
-
-// Native "save file" dialog. Returns the chosen path, or "" if cancelled/unavailable.
-static string pickSaveFile(const string &defName)
-{
-#ifdef _WIN32
-    return runCapture("powershell -NoProfile -Command \"Add-Type -AssemblyName System.Windows.Forms;"
-                      "$o=New-Object System.Windows.Forms.Form -Property @{TopMost=$true};"
-                      "$d=New-Object System.Windows.Forms.SaveFileDialog;"
-                      "$d.Title='Save the stitched output as'; $d.FileName='" + defName + "';"
-                      "if($d.ShowDialog($o) -eq 'OK'){$d.FileName}\" 2>NUL");
-#elif __APPLE__
-    return runCapture("osascript -e 'POSIX path of (choose file name with prompt "
-                      "\"Save the stitched output as\" default name \"" + defName + "\")' 2>/dev/null");
-#else
-    return runCapture("zenity --file-selection --save --confirm-overwrite --filename=\"" + defName + "\" 2>/dev/null");
-#endif
-}
-
-static void openBrowser(const string &url)
-{
-#ifdef _WIN32
-    system(("start \"\" \"" + url + "\"").c_str());
-#elif __APPLE__
-    system(("open \"" + url + "\"").c_str());
-#else
-    system(("xdg-open \"" + url + "\" >/dev/null 2>&1 &").c_str());
-#endif
-}
-
-static string exePath();   // forward decl (defined below, near main)
-
-// Build the exact, copy-pasteable CLI command that reproduces a stitch with these
-// settings. Shown in the tuner UI + console so a tuned render (shifts, crop, etc.)
-// can be re-run by hand. Only emits non-default flags to keep it readable.
-static string buildCliCommand(const string &source, const string &calibDir,
-                              double degrees, int seamArg, const Align &a,
-                              const string &cropArg, int startFrame, int endFrame,
-                              const string &outFile)
-{
-    auto q = [](const string &s) { return "\"" + s + "\""; };
-    string exe = exePath(); if (exe.empty()) exe = "StitchPipeline";
-    string c = q(exe) + " --source " + q(source);
-    c += " --pair-offset " + to_string(g_pairOffset);   // resolved value, not "auto"
-    if (g_scale != 1.0) c += " --scale " + to_string(g_scale);
-    if (!calibDir.empty())    c += " --calib-dir " + q(calibDir);
-    if (degrees != 0.0)       c += " --degrees " + to_string(degrees);
-    if (seamArg >= 0)         c += " --seam " + to_string(seamArg);
-    c += " --shift-top " + to_string(a.shiftTop) + " --shift-bottom " + to_string(a.shiftBottom);
-    if (a.shiftY != 0.0)      c += " --shift-y " + to_string(a.shiftY);
-    c += " --bands " + to_string(a.bands);
-    if (!a.exposure)          c += " --no-exposure";
-    if (!a.smartSeam)         c += " --no-smart-seam";
-    if (!cropArg.empty())     c += " --crop " + q(cropArg);
-    if (startFrame > 0)       c += " --start " + to_string(startFrame);
-    if (endFrame >= 0)        c += " --end " + to_string(endFrame);
-    c += " --out-file " + q(outFile);
-    return c;
 }
 
 // Per-take alignment, written by studio/refine_extrinsics.py --align as
@@ -2102,302 +1632,6 @@ static TakeAlign loadTakeAlign(const string &source)
     }
     catch (...) { cerr << "warning: could not read " << p << " - using the base calibration\n"; }
     return t;
-}
-
-static void runTuneServer(const Mat &KL, const vector<double> &DL,
-                          const Mat &KR, const vector<double> &DR, const Mat &R,
-                          double degrees, int startFrame, int endFrame,
-                          const string &outDir, const string &initSource,
-                          const string &initOutFile, int port,
-                          const string &calibDir)
-{
-#ifdef _WIN32
-    WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
-#endif
-    string html = tunerHtml();
-
-    // Mutable server state: a source can be loaded (or replaced) at any time
-    // via the browser's Import button, so none of this is fixed up front.
-    string source = initSource, outFile = initOutFile;
-    bool video = false, loaded = false;
-    int totalFrames = 1;
-    StitchMaps m;
-    string curLeft, curRight;            // first-frame preview (data: URIs)
-    TakeAlign align;                     // the loaded take's .align.json, if any
-    PairCapture frameCap;                // persistent for /frame scrubbing
-    int frameCapPos = -1;
-
-    // Open a file: build the stitch maps and the first-frame preview. Returns
-    // "" on success or an error message.
-    auto loadSource = [&](const string &path) -> string {
-        bool isVid = isVideoFile(path);
-        Mat fL, fR; int tf = 1;
-        if (!isVid) { readPairedImage(path, fL, fR); }
-        else
-        {
-            PairCapture cap(path);
-            if (!cap.isOpened()) return "cannot open video";
-            tf = (int)cap.get(CAP_PROP_FRAME_COUNT);
-            if (tf < 1 || tf > 100000000) { double fps = cap.get(CAP_PROP_FPS); tf = probeFrames(path, fps > 0 ? fps : 30.0); }
-            cap.read(fL, fR); cap.release();
-        }
-        if (fL.empty() || fR.empty()) return "cannot read source";
-        TakeAlign ta = loadTakeAlign(path);
-        Mat Ruse = R;                                   // R here is already in left->right terms
-        if (ta.ok)
-        {
-            Ruse = g_swapLR ? Mat(ta.R.t()) : ta.R;
-            cout << "alignment: " << ta.path << " (shear " << ta.shiftTop << " / " << ta.shiftBottom << ")\n";
-        }
-        StitchMaps mm = buildStitchMaps(KL, DL, KR, DR, Ruse, fL.cols, fL.rows, -1);
-        Mat mL, mR; warpPreview(fL, fR, mm, mL, mR);
-        vector<uchar> bL, bR; vector<int> q = {IMWRITE_JPEG_QUALITY, 85};
-        imencode(".jpg", mL, bL, q); imencode(".jpg", mR, bR, q);
-        m = mm; video = isVid; totalFrames = tf; source = path; loaded = true; align = ta;
-        curLeft = "data:image/jpeg;base64," + base64(bL);
-        curRight = "data:image/jpeg;base64," + base64(bR);
-        frameCap.release(); frameCapPos = -1;
-        return "";
-    };
-
-    auto stateJson = [&]() -> string {
-        if (!loaded) return "{\"loaded\":false}";
-        ostringstream j;
-        string alignJson = align.ok
-            ? ("{\"file\":\"" + jsonEscape(align.path) + "\",\"shiftTop\":" + to_string(align.shiftTop) +
-               ",\"shiftBottom\":" + to_string(align.shiftBottom) + "}")
-            : string("null");
-        j << "{\"loaded\":true,\"ow\":" << m.OW << ",\"oh\":" << m.OH << ",\"seam\":" << m.seam
-          << ",\"ox0\":" << m.ox0 << ",\"ox1\":" << m.ox1
-          << ",\"total\":" << totalFrames << ",\"video\":" << (video ? "true" : "false")
-          << ",\"source\":\"" << jsonEscape(source) << "\",\"output\":\"" << jsonEscape(outFile) << "\""
-          << ",\"align\":" << alignJson
-          << ",\"left\":\"" << curLeft << "\",\"right\":\"" << curRight << "\"}";
-        return j.str();
-    };
-
-    // Stitch settings from a /stitch or /command query. One parser for both, so the
-    // command shown before a stitch is exactly the one the stitch runs.
-    auto parseStitch = [&](const string &query, Align &a, StitchMaps &mm, ViewBox &vb,
-                           string &cropStr, int &seamVal, double &dg) {
-        a.shiftTop = !qparam(query, "shifttop").empty() ? stod(qparam(query, "shifttop")) : 0;
-        a.shiftBottom = !qparam(query, "shiftbottom").empty() ? stod(qparam(query, "shiftbottom")) : 0;
-        a.shiftY = !qparam(query, "shifty").empty() ? stod(qparam(query, "shifty")) : 0;
-        a.bands = !qparam(query, "bands").empty() ? stoi(qparam(query, "bands")) : 0;
-        a.exposure = qparam(query, "exposure") == "1";
-        a.smartSeam = qparam(query, "smartseam") == "1";
-        string ss = qparam(query, "seam");
-        mm = m;
-        if (!ss.empty()) mm.seam = stoi(ss);
-        seamVal = ss.empty() ? -1 : stoi(ss);
-        // Optional crop (full-canvas coords): restrict all work to this region.
-        int cw = !qparam(query, "cropw").empty() ? stoi(qparam(query, "cropw")) : 0;
-        int chh = !qparam(query, "croph").empty() ? stoi(qparam(query, "croph")) : 0;
-        int cx = !qparam(query, "cropx").empty() ? stoi(qparam(query, "cropx")) : 0;
-        int cy = !qparam(query, "cropy").empty() ? stoi(qparam(query, "cropy")) : 0;
-        // Crop rect as a --crop string (parallel children re-apply it themselves).
-        cropStr = (cw > 0 && chh > 0)
-            ? (to_string(cx) + "," + to_string(cy) + "," + to_string(cw) + "," + to_string(chh)) : "";
-        // Rotation of the finished panorama (tuner's Rotate control -> --degrees);
-        // falls back to whatever was passed on the command line when the param is absent.
-        dg = !qparam(query, "degrees").empty() ? stod(qparam(query, "degrees")) : degrees;
-        vb = clampBox(mm, ViewBox{cx, cy, cw, chh, dg});   // rotate, then crop
-    };
-
-    // Preload a source passed on the command line (`--source x --tune`).
-    if (!source.empty()) { string err = loadSource(source); if (!err.empty()) cerr << "preload: " << err << "\n"; }
-
-    socket_t srv = socket(AF_INET, SOCK_STREAM, 0);
-    if (srv == INVALID_SOCKET) { cerr << "socket() failed\n"; return; }
-    int yes = 1;
-    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    int bound = -1;
-    for (int p = port; p < port + 10; ++p)
-    {
-        addr.sin_port = htons((unsigned short)p);
-        if (::bind(srv, (sockaddr *)&addr, sizeof(addr)) == 0) { bound = p; break; }
-    }
-    if (bound < 0 || listen(srv, 8) != 0) { cerr << "Could not bind a port\n"; CLOSESOCK(srv); return; }
-
-    string url = "http://127.0.0.1:" + to_string(bound) + "/";
-    cout << "\nTuner running at " << url << "  (opening browser; Ctrl+C or Quit to stop)\n";
-    openBrowser(url);
-
-    bool running = true;
-    while (running)
-    {
-        socket_t cl = accept(srv, nullptr, nullptr);
-        if (cl == INVALID_SOCKET) continue;
-        // One connection at a time, so an idle one must not block the rest: browsers
-        // open speculative connections that never send a request, and the tuner sat
-        // waiting on those (the page looked frozen). Give each 2 s to send its request.
-        {
-#ifdef _WIN32
-            DWORD ms = 2000;
-            setsockopt(cl, SOL_SOCKET, SO_RCVTIMEO, (const char *)&ms, sizeof(ms));
-#else
-            timeval tv{2, 0};
-            setsockopt(cl, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-#endif
-        }
-
-        string req; char buf[4096];
-        for (;;)
-        {
-            int n = recv(cl, buf, sizeof(buf), 0);
-            if (n <= 0) break;
-            req.append(buf, n);
-            if (req.find("\r\n\r\n") != string::npos) break;
-        }
-        size_t sp1 = req.find(' '), sp2 = req.find(' ', sp1 + 1);
-        string target = (sp1 != string::npos && sp2 != string::npos) ? req.substr(sp1 + 1, sp2 - sp1 - 1) : "/";
-        string path = target, query;
-        size_t qm = target.find('?');
-        if (qm != string::npos) { path = target.substr(0, qm); query = target.substr(qm + 1); }
-
-        string status = "200 OK", ctype = "text/plain", body;
-        if (path == "/")
-        {
-            ctype = "text/html; charset=utf-8";
-            body = html;
-        }
-        else if (path == "/state")
-        {
-            ctype = "application/json";
-            body = stateJson();
-        }
-        else if (path == "/import")
-        {
-            ctype = "application/json";
-            string p = pickInputFile();
-            if (p.empty()) body = "{\"cancelled\":true}";
-            else { string err = loadSource(p); body = err.empty() ? stateJson() : ("{\"error\":\"" + jsonEscape(err) + "\"}"); }
-        }
-        else if (path == "/chooseoutput")
-        {
-            ctype = "application/json";
-            string def = video ? "stitched.mp4" : "stitched.jpg";
-            string p = pickSaveFile(def);
-            if (!p.empty()) outFile = p;
-            body = "{\"path\":\"" + jsonEscape(p) + "\"}";
-        }
-        else if (path == "/stitch")
-        {
-            if (!loaded) { body = "notloaded"; }
-            else if (g_busy) { body = "busy"; }
-            else
-            {
-                Align a; StitchMaps mm; ViewBox vb; string cropStr; int seamVal; double dg;
-                parseStitch(query, a, mm, vb, cropStr, seamVal, dg);
-                if (!cropStr.empty()) cout << "[stitch] crop " << cropStr << "\n";
-                g_busy = true; g_done = false; g_percent = 0;
-                { lock_guard<mutex> lk(g_mu); g_result.clear(); }
-                cout << "[stitch] top=" << a.shiftTop << " bottom=" << a.shiftBottom
-                     << " y=" << a.shiftY << " seam=" << mm.seam << " -> " << outFile << " ...\n";
-                int tf = totalFrames;
-                string src = source, of = outFile; bool vid = video;
-                int endRes = endFrame >= 0 ? endFrame : (tf > 0 ? tf - 1 : -1);
-                string calib = calibDir;
-                // Build + record the exact equivalent CLI command (shown in UI + console).
-                {
-                    string fo = of.empty() ? (outDir + "/stitched_video.mp4") : of;
-                    string cmd = buildCliCommand(src, calib, dg, seamVal, a, cropStr,
-                                                 startFrame, (vid ? endRes : -1), fo);
-                    { lock_guard<mutex> lk(g_mu); g_cmd = cmd; }
-                    cout << "[stitch] equivalent CLI command:\n  " << cmd << "\n";
-                }
-                std::thread([mm, vb, a, src, vid, startFrame, endFrame, tf, outDir, of]() {
-                    RenderMaps rm = buildRenderMaps(mm, vb, a);
-                    string res = vid
-                        ? stitchVideoFile(src, rm, a, startFrame, endFrame, tf, outDir, of, &g_percent)
-                        : stitchImageFile(src, rm, a, outDir, of);
-                    { lock_guard<mutex> lk(g_mu); g_result = res; }
-                    g_percent = 100; g_done = true; g_busy = false;
-                    cout << "[stitch] done -> " << res << "\n";
-                }).detach();
-                body = "started";
-            }
-        }
-        else if (path == "/command")
-        {
-            // The CLI command for the current settings WITHOUT stitching - shown as
-            // soon as an output is chosen. Empty until a source and an output exist.
-            ctype = "application/json";
-            string cmd;
-            if (loaded && !outFile.empty())
-            {
-                Align a; StitchMaps mm; ViewBox vb; string cropStr; int seamVal; double dg;
-                parseStitch(query, a, mm, vb, cropStr, seamVal, dg);
-                int endRes = endFrame >= 0 ? endFrame : (totalFrames > 0 ? totalFrames - 1 : -1);
-                cmd = buildCliCommand(source, calibDir, dg, seamVal, a, cropStr, startFrame,
-                                      (video ? endRes : -1), outFile);
-            }
-            body = "{\"cmd\":\"" + jsonEscape(cmd) + "\"}";
-        }
-        else if (path == "/frame")
-        {
-            ctype = "application/json";
-            if (!loaded) { body = "{\"error\":\"no source loaded\"}"; }
-            else
-            {
-                int n = 0; string ns = qparam(query, "n");
-                if (!ns.empty()) n = stoi(ns);
-                if (n < 0) n = 0;
-                Mat fL, fR;
-                // sequential positioning (seeking is unreliable). Grab forward from the
-                // current position; only re-open when scrubbing backward.
-                if (!frameCap.isOpened() || n < frameCapPos)
-                { frameCap.release(); frameCap.open(source); frameCapPos = -1; }
-                while (frameCapPos < n) { if (!frameCap.grab()) break; frameCapPos++; }
-                if (frameCapPos == n) frameCap.retrieve(fL, fR);
-                if (fL.empty() || fR.empty()) { body = "{\"error\":\"cannot read frame\"}"; }
-                else
-                {
-                    Mat mL, mR; warpPreview(fL, fR, m, mL, mR);
-                    vector<uchar> bL, bR; vector<int> q = {IMWRITE_JPEG_QUALITY, 85};
-                    imencode(".jpg", mL, bL, q);
-                    imencode(".jpg", mR, bR, q);
-                    ostringstream j;
-                    j << "{\"left\":\"data:image/jpeg;base64," << base64(bL)
-                      << "\",\"right\":\"data:image/jpeg;base64," << base64(bR) << "\"}";
-                    body = j.str();
-                }
-            }
-        }
-        else if (path == "/progress")
-        {
-            ctype = "application/json";
-            string res, cmd; { lock_guard<mutex> lk(g_mu); res = g_result; cmd = g_cmd; }
-            ostringstream j;
-            j << "{\"busy\":" << (g_busy ? "true" : "false")
-              << ",\"done\":" << (g_done ? "true" : "false")
-              << ",\"percent\":" << g_percent.load()
-              << ",\"cmd\":\"" << jsonEscape(cmd) << "\""
-              << ",\"result\":\"" << jsonEscape(res) << "\"}";
-            body = j.str();
-        }
-        else if (path == "/quit")
-        {
-            body = "bye";
-            running = false;
-        }
-        else { status = "404 Not Found"; body = "not found"; }
-
-        string resp = "HTTP/1.1 " + status + "\r\nContent-Type: " + ctype +
-                      "\r\nContent-Length: " + to_string(body.size()) +
-                      "\r\nConnection: close\r\n\r\n" + body;
-        send(cl, resp.data(), (int)resp.size(), 0);
-        CLOSESOCK(cl);
-    }
-    frameCap.release();
-    CLOSESOCK(srv);
-#ifdef _WIN32
-    WSACleanup();
-#endif
-    cout << "Tuner stopped.\n";
 }
 
 static string argVal(int argc, char **argv, const string &key, const string &def)
@@ -2450,11 +1684,7 @@ static int probeFrames(const string &source, double fps)
 // of the current working directory, so double-clicking the binary works).
 static string exePath()
 {
-#ifdef _WIN32
-    char buf[MAX_PATH];
-    DWORD n = GetModuleFileNameA(NULL, buf, MAX_PATH);
-    return n > 0 ? string(buf, n) : string();
-#elif __APPLE__
+#ifdef __APPLE__
     char buf[4096]; uint32_t size = sizeof(buf);
     return _NSGetExecutablePath(buf, &size) == 0 ? string(buf) : string();
 #else
@@ -2478,9 +1708,9 @@ static bool hasCalib(const fs::path &dir)
 
 // Resolve the calibration directory. Priority:
 //   1. the requested path if it already has the JSONs (explicit --calib-dir,
-//      or the default when run from the stitching/ folder);
+//      or the default when run from a folder next to calibration/);
 //   2. a calibration/ folder found by walking UP from the executable's location
-//      (depth-independent: handles Mac's build/ and Windows' build/Release/);
+//      (depth-independent: handles any build/ folder depth);
 //   3. the same upward search from the current working directory;
 //   4. the requested path unchanged (caller then reports the missing files).
 static string resolveCalibDir(const string &requested)
@@ -2500,24 +1730,27 @@ static string resolveCalibDir(const string &requested)
     return requested;
 }
 
-// Run a shell command, blocking until it exits. On Windows a command that begins
-// with a quoted path needs the WHOLE string wrapped again or cmd.exe mis-parses it.
-static int runShell(string cmd)
+// Run a shell command, blocking until it exits.
+static int runShell(const string &cmd)
 {
-#ifdef _WIN32
-    cmd = "\"" + cmd + "\"";
-#endif
     return std::system(cmd.c_str());
 }
 
 int main(int argc, char **argv)
 {
-#ifndef _WIN32
     // If the ffmpeg encoder pipe dies, we want fwrite to fail (handled) rather than a
-    // SIGPIPE killing us silently. (Windows has no SIGPIPE.)
+    // SIGPIPE killing us silently.
     signal(SIGPIPE, SIG_IGN);
-#endif
     string source = argVal(argc, argv, "--source", argVal(argc, argv, "--image", ""));
+    if (source.empty())
+    {
+        cerr << "usage: StitchPipeline --source take_TS_cam0.mkv --out-file out.mp4 [--crop x,y,w,h]\n"
+             << "       [--degrees D] [--shift-top T --shift-bottom B] [--start N --end M] ...\n"
+             << "       (Studio runs this for you - see studio/README.md; flags in the header\n"
+             << "       of stitch_pipeline.cpp)\n";
+        return 2;
+    }
+
     string calibDir = resolveCalibDir(argVal(argc, argv, "--calib-dir", "../calibration"));
     string outDir = argVal(argc, argv, "--out", "pipeline_out");
     string outFile = argVal(argc, argv, "--out-file", "");   // full path incl. filename (overrides --out)
@@ -2533,8 +1766,6 @@ int main(int argc, char **argv)
     a.bands = stoi(argVal(argc, argv, "--bands", "6"));   // 0 = hard seam
     a.exposure = !hasArg(argc, argv, "--no-exposure");     // on by default
     a.smartSeam = !hasArg(argc, argv, "--no-smart-seam");  // on by default
-    int port = stoi(argVal(argc, argv, "--port", "8090"));
-    bool tune = hasArg(argc, argv, "--tune");
     string cropArg = argVal(argc, argv, "--crop", "");
     {   // --pair-offset N pins the offset; "auto" (the default) estimates it
         string po = argVal(argc, argv, "--pair-offset", "auto");
@@ -2569,7 +1800,7 @@ int main(int argc, char **argv)
     cout << "calibration model: fisheye (equidistant)\n";
     R = loadRotation(calibDir + "/stereo_extrinsics.json");
     g_noAlign = hasArg(argc, argv, "--no-align");
-    if (!source.empty() && !tune)
+    if (!source.empty())
     {
         TakeAlign ta = loadTakeAlign(source);
         if (ta.ok)
@@ -2596,16 +1827,7 @@ int main(int argc, char **argv)
              << "stitching cam1|cam0\n";
     }
 
-    // Interactive tuner — the default when no --source is given, and whenever
-    // --tune is passed. The browser's Import button loads the source on demand,
-    // so `source` may be empty here (empty page until the user imports).
-    if (source.empty() || tune)
-    {
-        runTuneServer(KL, DL, KR, DR, R, degrees, startFrame, endFrame, outDir, source, outFile, port, calibDir);
-        return 0;
-    }
-
-    // Headless batch stitch of a source given on the command line.
+    // Stitch the source given on the command line.
     bool video = isVideoFile(source);
     Mat fL, fR;
     int totalFrames = 1;
@@ -2644,7 +1866,7 @@ int main(int argc, char **argv)
     if (degrees != 0.0)
         cout << "rotate " << degrees << " deg (clockwise), then crop -> " << rm.OW << "x" << rm.OH << "\n";
 
-    string result = video ? stitchVideoFile(source, rm, a, startFrame, endFrame, totalFrames, outDir, outFile, nullptr)
+    string result = video ? stitchVideoFile(source, rm, a, startFrame, endFrame, totalFrames, outDir, outFile)
                           : stitchImageFile(source, rm, a, outDir, outFile);
     cout << (video ? "video -> " : "image -> ") << result << "\n";
     return 0;
