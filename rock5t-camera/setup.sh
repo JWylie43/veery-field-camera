@@ -110,7 +110,9 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
       curl -fsSL -o "$tmp/$f" "https://github.com/$slug/releases/download/kernel-$KREV/$f" \
         || die "download failed: https://github.com/$slug/releases/download/kernel-$KREV/$f"
     done
-    sudo dpkg -i "$tmp"/linux-image-*.deb "$tmp"/linux-headers-*.deb || die "kernel install failed"
+    # --force-hold: the kernel packages are held (below, and on the image) - that stops
+    # apt replacing them, and this is the one place meant to update them
+    sudo dpkg -i --force-hold "$tmp"/linux-image-*.deb "$tmp"/linux-headers-*.deb || die "kernel install failed"
     rm -rf "$tmp"
     did "installed ${have:+(was $have) }- active after the reboot"
     REBOOT=1
