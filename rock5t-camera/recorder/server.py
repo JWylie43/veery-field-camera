@@ -107,6 +107,45 @@ def sh(cmd, timeout=30):
     return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
 
 
+# ----------------------------------------------------------------- clock
+# The Rock has no clock battery: powered off, it forgets the time and at boot restarts
+# from the last time it saved (systemd-timesyncd: last internet sync or clean shutdown),
+# so in the field - no internet - takes would be named with that stale time. The panel
+# page sends the viewing device's clock (a phone is always right) to /api/clock, and
+# if the Rock has NOT synced from the internet, isn't recording, and is off by more than
+# a couple of seconds, the Rock takes that time. Internet time always wins: once
+# timesyncd has synced, devices are ignored. (This runs as root, so no sudo needed.)
+TIMESYNC_SAVED = "/var/lib/systemd/timesync/clock"
+
+
+def set_clock_from_device(ms, who):
+    try:
+        t = float(ms) / 1000.0
+    except (TypeError, ValueError):
+        return {"ok": False, "msg": "bad time"}
+    if not 1704067200 < t < 4102444800:                  # 2024 .. 2100: not a real clock
+        return {"ok": False, "msg": "implausible time"}
+    if sh("timedatectl show -p NTPSynchronized --value").stdout.strip() == "yes":
+        return {"ok": True, "changed": False, "why": "synced from the internet"}
+    if _state["rec"]:
+        return {"ok": True, "changed": False, "why": "recording"}
+    diff = t - time.time()
+    if abs(diff) < 2:
+        return {"ok": True, "changed": False, "why": "already right"}
+    before = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    try:
+        time.clock_settime(time.CLOCK_REALTIME, t)
+    except (OSError, AttributeError) as e:
+        return {"ok": False, "msg": f"could not set the clock: {e}"}
+    after = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    try:
+        os.utime(TIMESYNC_SAVED)              # the saved time too: the next boot starts here
+    except OSError:
+        pass
+    print(f"clock set from {who}: {before} -> {after} ({diff:+.0f} s)", flush=True)
+    return {"ok": True, "changed": True, "from": before, "to": after}
+
+
 def human(n):
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if n < 1024 or unit == "TB":
@@ -714,6 +753,16 @@ async function poweroff(){
     b.disabled = false; b.innerHTML = '&#9211; Shut Down'; b.style.background='';
   }
 }
+// The Rock has no clock battery: offline (in the field) it boots with a stale time. Give
+// it this device's clock; it only takes it when it has no internet time of its own.
+async function syncClock(){
+  try{
+    const r = await (await fetch('/api/clock?now=' + Date.now())).json();
+    if(r.changed){ $('msg').textContent = 'Rock clock set from this device: ' + r.to; }
+  }catch(e){ /* not important enough to show */ }
+  return;
+}
+syncClock();
 setInterval(refresh, 1500); refresh();
 </script></body></html>""".replace("%CSS%", CSS)
 
@@ -953,6 +1002,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/snap":
             with _state["lock"]:
                 self._json(take_snapshot_pair())
+        elif path == "/api/clock":
+            with _state["lock"]:
+                self._json(set_clock_from_device(q.get("now"), self.client_address[0]))
         elif path == "/status":
             self._json({
                 "recording": bool(_state["rec"]),

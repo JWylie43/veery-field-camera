@@ -176,6 +176,15 @@ a take; Stop sends SIGINT → GStreamer EOS → a finalized, seekable file.
 The sensor mode and bitrate are **fixed** - 4K30 (3840×2160), HEVC CBR, 28 Mbit/s per
 camera (~25 GB/hr for the pair, ~32 GB for a 75-minute game). No audio, by design.
 
+**The clock.** The Rock has no clock battery: powered off it forgets the time, and at
+boot it restarts from the last time it saved (its last internet sync or clean shutdown).
+At home it then corrects itself from the internet. In the field there is none, so the
+recorder panel fixes it: opening the panel on a phone (or any device) sends that
+device's time, and the Rock takes it - only when it hasn't synced from the internet,
+isn't recording, and is more than 2 s off. The panel then shows "Rock clock set from this
+device". So: **open the panel before the first take** and the take names get the right
+date and time.
+
 Only one process can hold a camera node: to run anything else against the cameras, stop
 the recorder first - `sudo systemctl stop recorder` (`start` to bring it back; logs:
 `journalctl -u recorder -f`). By hand: `sudo python3 rock5t-camera/recorder/server.py`.
