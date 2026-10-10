@@ -5,6 +5,14 @@ A field camera for filming a whole game from the sideline: two cameras on a
 wide panorama and cuts it into a normal 16:9 video you "film" afterwards with a virtual
 camera.
 
+It's a **hardware project as much as a software one**:
+
+- **Hardware** - the board, two Raspberry Pi HQ (Sony IMX477) cameras with 110° fisheye
+  lenses, the genlock wire, a 3D-printed housing: parts list, design choices and
+  assembly in **[hardware/](hardware/README.md)**.
+- **Software** - this repo's other half: the Rock's camera support and recorder, and
+  **Studio** on the Mac (below).
+
 ```
   ROCK 5T (on the rig)                       Mac
   ──────────────────────                     ──────────────────────────────────────────
@@ -13,9 +21,6 @@ camera.
   → take_TS_cam0.mkv + _cam1.mkv   ──SSD──►    Stitch → one panorama (.mp4)
                                                Edit   → points + virtual camera → 16:9 video
 ```
-
-Two Raspberry Pi HQ (**Sony IMX477**) sensors with 110° fisheye lenses in a 3D-printed
-housing, each recorded at **4K30** by the RK3588's hardware HEVC encoder.
 
 > **Platforms:** the Rock runs Radxa's Debian. The Mac side (Studio, calibration) is
 > **macOS / Linux only** (tested on macOS); Windows is not supported.
@@ -26,12 +31,22 @@ housing, each recorded at **4K30** by the RK3588's hardware HEVC encoder.
 
 ## 1. Set up the Rock
 
+The Rock runs our **image**: Radxa's own stock Debian image for the ROCK 5T, with
+three things added - the **camera kernel** (Radxa's kernel with an IMX477 driver built
+in; theirs has none), the camera **overlay and tuning**, and a few **helper services**
+(the recorder panel, Wi-Fi/hotspot setup, a fix for Radxa's camera daemon). Nothing
+else is changed.
+
 1. Download **`rock5t-camera-image-N.img.xz`** from the newest `image-N`
    [release](https://github.com/JWylie43/veery-field-camera/releases) and flash it to
    an SD card or NVMe drive (**16 GB+**) with balenaEtcher or Raspberry Pi Imager.
-2. On the card's **`config`** drive (it appears on the Mac after flashing), fill in
-   **`camera-network.txt`**: your Wi-Fi, and the password for the Rock's own hotspot
-   (`VeeryCam` by default - change its default password).
+2. *Optional - lets you set it up with no monitor, keyboard or mouse:* on the card's
+   **`config`** drive (it appears on the Mac after flashing), fill in
+   **`camera-network.txt`** with your Wi-Fi, so the Rock joins it on first boot and you
+   can reach it from your computer. Skip it and the Rock instead starts its own hotspot,
+   `VeeryCam` (password `changeme123` - join it from a phone or laptop), or plug in
+   Ethernet. Either way, change the hotspot's default password: in this file, or later
+   on the Rock.
 3. Connect the cameras and power on. The first boot takes a few minutes.
 
 The recorder is then at `http://veery.local:8080` at home, or - when your Wi-Fi isn't in
@@ -72,6 +87,7 @@ and works on the takes folder `~/Desktop/takes` (`--takes DIR` for another).
 
 | | |
 |---|---|
+| [hardware/](hardware/README.md) | the physical rig: parts list, design choices, assembly, housing files |
 | [docs/rock.md](docs/rock.md) | the Rock: image setup, Wi-Fi and hotspot, `setup.sh`, tested versions, recording, offload |
 | [docs/calibration.md](docs/calibration.md) | the base calibration and per-take alignment |
 | [docs/stitching.md](docs/stitching.md) | the stitch page, checking a take, the stitcher's command line, how it works |
@@ -108,7 +124,7 @@ veery-field-camera/
 ├── studio/               runs ON THE MAC - Studio (server.py, static/ pages, native/ C++ tools)
 ├── calibration/          the base calibration (calibrate.py, the board, the JSONs)
 ├── docs/                 the detailed guides
-├── 3d-housing-model/     the printable enclosure
+├── hardware/             the physical rig: parts list, design, assembly, housing/ (printable enclosure)
 ├── setup.sh              Mac setup (.venv + Studio's C++ tools)
 └── requirements.txt      the Mac's Python packages
 ```

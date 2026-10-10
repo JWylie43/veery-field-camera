@@ -78,6 +78,9 @@ it starts the hotspot **right away** - in the field a phone can join ~20 s after
 power-on. With no Wi-Fi set up it starts the hotspot straight away (or use Ethernet,
 which configures itself).
 
+- **Change the hotspot password** on a running Rock (e.g. if you kept `changeme123`):
+  `sudo nmcli connection modify VeeryCam wifi-sec.psk "<new password>"` - it applies the
+  next time the hotspot starts.
 - The Rock never joins other networks on its own, open or not.
 - Networks added later with `sudo nmtui` count as known Wi-Fi too (priority 0 unless
   you set otherwise: `sudo nmcli connection modify "<name>" connection.autoconnect-priority <n>`).
