@@ -24,8 +24,8 @@ It's a **hardware project as much as a software one**:
 
 > **Platforms:** the Rock runs Radxa's Debian. The Mac side (Studio, calibration) is
 > **macOS / Linux only** (tested on macOS); Windows is not supported.
-> This is the `radxa-rock-5t` branch; the earlier Jetson Orin Nano rig is on
-> [`nvidia-orin-jetson-nano`](../../tree/nvidia-orin-jetson-nano).
+> The earlier Jetson Orin Nano rig is on the
+> [`nvidia-orin-jetson-nano`](../../tree/nvidia-orin-jetson-nano) branch.
 
 ---
 
